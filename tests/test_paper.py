@@ -1,5 +1,6 @@
 """Fixture and regression tests for the offline paper replay."""
 
+import hashlib
 import json
 import unittest
 import zipfile
@@ -7,7 +8,7 @@ from datetime import datetime, timezone
 from decimal import Decimal
 from pathlib import Path
 
-from paper.execution import SUB_CENT, WHOLE_CENT, Fill, buy_fees, walk_buy
+from paper.execution import SUB_CENT, WHOLE_CENT, Fill, buy_fees, walk_buy, whole_cent_worst_case
 from paper.replay import replay_capture
 from tests.test_recorder import CUTOFF_DIR, World
 
@@ -30,9 +31,11 @@ class BookWalkTests(unittest.TestCase):
         ))
         self.assertEqual(walk.notional, Decimal("0.3599"))
         whole = buy_fees(walk.fills, multiplier=Decimal(1), balance_precision=WHOLE_CENT)
+        worst = whole_cent_worst_case(walk.fills, multiplier=Decimal(1))
         sub = buy_fees(walk.fills, multiplier=Decimal(1), balance_precision=SUB_CENT)
         self.assertEqual(whole.total_debit, Decimal("0.38"))
         self.assertEqual(whole.per_fill[1].rebate, Decimal("0.01"))
+        self.assertEqual(worst.total_debit, Decimal("1.00"))
         self.assertEqual(sub.total_debit, Decimal("0.3761"))
 
     def test_limit_excludes_worse_levels_and_skips_partial_depth(self):
@@ -63,6 +66,23 @@ class BookWalkTests(unittest.TestCase):
 
 
 class FeeTests(unittest.TestCase):
+    def test_five_cent_order_can_cost_one_dollar_with_minimum_size_fills(self):
+        fills = [Fill(Decimal("0.05"), Decimal(1))]
+        best = buy_fees(fills, multiplier=Decimal(1), balance_precision=WHOLE_CENT)
+        worst = whole_cent_worst_case(fills, multiplier=Decimal(1))
+        sub = buy_fees(fills, multiplier=Decimal(1), balance_precision=SUB_CENT)
+        self.assertEqual(best.total_debit, Decimal("0.06"))
+        self.assertEqual(sub.total_debit, Decimal("0.0534"))
+        self.assertEqual(len(worst.per_fill), 100)
+        self.assertTrue(all(fill.rebate == 0 for fill in worst.per_fill))
+        self.assertEqual(worst.net_fee, Decimal("0.95"))
+        self.assertEqual(worst.total_debit, Decimal("1.00"))
+
+    def test_fragmentation_keeps_rebates_when_the_cap_allows_them(self):
+        worst = whole_cent_worst_case([Fill(Decimal("0.80"), Decimal(1))], multiplier=Decimal(20))
+        self.assertEqual(sum(fill.rebate for fill in worst.per_fill), Decimal("0.97"))
+        self.assertEqual(worst.total_debit, Decimal("1.03"))
+
     def test_one_contract_at_35_cents_under_both_precisions(self):
         fills = [Fill(Decimal("0.35"), Decimal(1))]
         for precision, total in ((WHOLE_CENT, "0.37"), (SUB_CENT, "0.3660")):
@@ -129,8 +149,21 @@ class ReplayTests(unittest.TestCase):
     def replay(self, recorder, city="NY", ticker="KXHIGHNY-26NOV11-B61.5", limit="1"):
         return replay_capture(
             self.data_dir, Path(recorder.base) / "run.json",
-            city=city, ticker=ticker, side="yes", limit=Decimal(limit), fee_multiplier=Decimal(1),
+            city=city, ticker=ticker, side="yes", limit=Decimal(limit),
         )
+
+    def replace_recorded_json(self, recorder, name, edit):
+        relative = f"{recorder.base}/{CUTOFF_DIR}/{name}"
+        path = self.data_dir / relative
+        payload = json.loads(path.read_bytes())
+        edit(payload)
+        data = json.dumps(payload).encode()
+        path.write_bytes(data)
+        run_path = self.data_dir / recorder.base / "run.json"
+        run = json.loads(run_path.read_bytes())
+        run["files"][relative] = {"bytes": len(data), "sha256": hashlib.sha256(data).hexdigest()}
+        run_path.write_text(json.dumps(run), encoding="utf-8")
+        return run["files"][relative]["sha256"]
 
     def test_replays_an_eligible_city_from_the_recorders_raw_first_book(self):
         recorder, _ = self.world.run_at()
@@ -140,10 +173,58 @@ class ReplayTests(unittest.TestCase):
         self.assertEqual(result["first_book_path"], f"{recorder.base}/{CUTOFF_DIR}/books_1.json")
         self.assertEqual(result["first_book_sha256"], recorder.run["files"][result["first_book_path"]]["sha256"])
         self.assertEqual(sum(fill["quantity"] for fill in result["fills"]), Decimal(1))
+        self.assertEqual(result["fee_multiplier"], Decimal(1))
+        self.assertEqual(result["primary_fee_scenario"], "whole_cent_worst_case")
         self.assertEqual(
-            result["primary_whole_cent"]["total_debit"],
-            result["notional"] + result["primary_whole_cent"]["net_fee"],
+            result["whole_cent_best_case"]["total_debit"],
+            result["notional"] + result["whole_cent_best_case"]["net_fee"],
         )
+        self.assertEqual(result["whole_cent_worst_case"]["total_debit"], Decimal("1.00"))
+
+    def test_replay_prices_the_recorded_fractional_multiplier(self):
+        recorder, _ = self.world.run_at()
+        source_hash = self.replace_recorded_json(
+            recorder, "NY/kalshi_series.json", lambda payload: payload["series"].update(fee_multiplier=0.5),
+        )
+        result = self.replay(recorder)
+        self.assertEqual(result["fee_type"], "quadratic")
+        self.assertEqual(result["fee_multiplier"], Decimal("0.5"))
+        self.assertEqual(result["fee_series_sha256"], source_hash)
+        self.assertEqual(result["secondary_sub_cent"]["total_debit"], Decimal("0.6382"))
+
+    def test_missing_series_metadata_skips_pricing(self):
+        recorder, _ = self.world.run_at()
+        (self.data_dir / recorder.base / CUTOFF_DIR / "NY/kalshi_series.json").unlink()
+        result = self.replay(recorder)
+        self.assertEqual((result["status"], result["reason_code"]), ("skipped", "fee_metadata_unavailable"))
+        self.assertNotIn("whole_cent_worst_case", result)
+
+    def test_unsupported_fee_type_or_invalid_multiplier_skips_pricing(self):
+        recorder, _ = self.world.run_at()
+        for fee_type, multiplier, reason in (
+            ("flat", 1, "fee_type_unsupported"),
+            ("quadratic", True, "fee_multiplier_invalid"),
+            ("quadratic", -1, "fee_multiplier_invalid"),
+        ):
+            with self.subTest(fee_type=fee_type, multiplier=multiplier):
+                self.replace_recorded_json(
+                    recorder, "NY/kalshi_series.json",
+                    lambda payload: payload["series"].update(fee_type=fee_type, fee_multiplier=multiplier),
+                )
+                result = self.replay(recorder)
+                self.assertEqual((result["status"], result["reason_code"]), ("skipped", reason))
+
+    def test_manifest_valid_book_with_malformed_level_skips_pricing(self):
+        recorder, _ = self.world.run_at()
+
+        def break_level(payload):
+            book = next(row for row in payload["orderbooks"] if row["ticker"] == "KXHIGHNY-26NOV11-B61.5")
+            book["orderbook_fp"]["no_dollars"].append(["invalid_price", "1.00"])
+
+        source_hash = self.replace_recorded_json(recorder, "books_1.json", break_level)
+        result = self.replay(recorder)
+        self.assertEqual((result["status"], result["reason_code"]), ("skipped", "book_unparseable"))
+        self.assertEqual(result["first_book_sha256"], source_hash)
 
     def test_on_time_batch_does_not_override_an_ineligible_city(self):
         self.world.replay.drop_books.add("KXHIGHMIA-")
@@ -159,7 +240,7 @@ class ReplayTests(unittest.TestCase):
         result = self.replay(recorder, limit="0")
         self.assertEqual((result["status"], result["reason_code"]), ("skipped", "insufficient_depth"))
         self.assertEqual(result["quantity_at_limit"], Decimal(0))
-        self.assertNotIn("primary_whole_cent", result)
+        self.assertNotIn("whole_cent_worst_case", result)
 
     def test_modified_book_fails_manifest_validation(self):
         recorder, _ = self.world.run_at()

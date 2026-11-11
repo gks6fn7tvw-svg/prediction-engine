@@ -16,7 +16,6 @@ def main() -> None:
     parser.add_argument("--ticker", required=True, help="market ticker within the selected event")
     parser.add_argument("--side", choices=("yes", "no"), required=True)
     parser.add_argument("--limit", required=True, help="maximum buy price in dollars")
-    parser.add_argument("--fee-multiplier", required=True, help="effective taker multiplier for this market")
     args = parser.parse_args()
     try:
         result = replay_capture(
@@ -26,7 +25,6 @@ def main() -> None:
             ticker=args.ticker,
             side=args.side,
             limit=Decimal(args.limit),
-            fee_multiplier=Decimal(args.fee_multiplier),
         )
     except (OSError, ValueError, KeyError, TypeError, DecimalException) as exc:
         parser.error(str(exc))

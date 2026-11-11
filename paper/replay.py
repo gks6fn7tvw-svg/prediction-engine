@@ -7,7 +7,16 @@ from datetime import datetime, timezone
 from decimal import Decimal
 from pathlib import Path
 
-from .execution import FEE_SCHEDULE_EFFECTIVE_DATE, ONE, SUB_CENT, WHOLE_CENT, buy_fees, walk_buy
+from .execution import (
+    FEE_SCHEDULE_EFFECTIVE_DATE,
+    MIN_FILL_QUANTITY,
+    ONE,
+    SUB_CENT,
+    WHOLE_CENT,
+    buy_fees,
+    walk_buy,
+    whole_cent_worst_case,
+)
 
 
 def _timestamp(value: str) -> datetime:
@@ -21,8 +30,8 @@ def _timestamp(value: str) -> datetime:
     return parsed.astimezone(timezone.utc)
 
 
-def _json_object(data: bytes, path: Path) -> dict:
-    value = json.loads(data)
+def _json_object(data: bytes, path: Path, *, parse_float=None) -> dict:
+    value = json.loads(data, parse_float=parse_float)
     if not isinstance(value, dict):
         raise ValueError(f"{path.name} must contain a JSON object")
     return value
@@ -38,7 +47,7 @@ def _recorded_json(root: Path, manifest: dict, path: Path) -> dict:
     data = path.read_bytes()
     if len(data) != entry.get("bytes") or hashlib.sha256(data).hexdigest() != entry.get("sha256"):
         raise ValueError(f"{relative} does not match the capture manifest")
-    return _json_object(data, path)
+    return _json_object(data, path, parse_float=Decimal)
 
 
 def _find_ticker(rows: object, ticker: str) -> dict | None:
@@ -56,15 +65,12 @@ def replay_capture(
     ticker: str,
     side: str,
     limit: Decimal,
-    fee_multiplier: Decimal,
 ) -> dict:
     """Estimate a one-contract buy against the city's first eligible book."""
     if side not in {"yes", "no"}:
         raise ValueError("side must be yes or no")
     if not limit.is_finite() or not 0 <= limit <= ONE:
         raise ValueError("limit must be a dollar price from 0 to 1")
-    if not fee_multiplier.is_finite() or fee_multiplier < 0:
-        raise ValueError("fee multiplier must be finite and nonnegative")
     if not city.isascii() or not city.isalpha():
         raise ValueError("city must be a recorder city code")
 
@@ -81,7 +87,6 @@ def replay_capture(
         "limit_price": limit,
         "requested_quantity": ONE,
         "fee_schedule_effective_date": FEE_SCHEDULE_EFFECTIVE_DATE,
-        "fee_multiplier": fee_multiplier,
     }
 
     cutoffs = [cutoff for cutoff in run["cutoffs"] if city in cutoff["cities"]]
@@ -118,31 +123,65 @@ def replay_capture(
         return {**result, "status": "skipped", "reason_code": "market_not_active"}
 
     book_path = capture_dir / "books_1.json"
-    batch = _recorded_json(root, manifest, book_path)
-    book = _find_ticker(batch.get("orderbooks"), ticker)
-    if book is None or not isinstance(book.get("orderbook_fp"), dict):
-        return {**result, "status": "skipped", "reason_code": "first_book_unavailable"}
-    walk = walk_buy(book["orderbook_fp"], side=side, limit=limit)
     book_source = book_path.relative_to(root).as_posix()
+    batch = _recorded_json(root, manifest, book_path)
     result.update(
         first_book_received_at=books["first_received_at"],
         receipt_lateness_seconds=books["receipt_lateness_seconds"],
         recheck_gap_seconds=books.get("recheck_gap_seconds"),
         first_book_path=book_source,
         first_book_sha256=manifest[book_source]["sha256"],
-        best_ask=walk.best_ask,
-        quantity_at_limit=walk.quantity_at_limit,
     )
+    book = _find_ticker(batch.get("orderbooks"), ticker)
+    if book is None or not isinstance(book.get("orderbook_fp"), dict):
+        return {**result, "status": "skipped", "reason_code": "first_book_unavailable"}
+    try:
+        walk = walk_buy(book["orderbook_fp"], side=side, limit=limit)
+    except ValueError as exc:
+        return {**result, "status": "skipped", "reason_code": "book_unparseable", "detail": str(exc)}
+    result.update(best_ask=walk.best_ask, quantity_at_limit=walk.quantity_at_limit)
     if not walk.fills:
         return {**result, "status": "skipped", "reason_code": "insufficient_depth"}
 
+    series_path = capture_dir / city / "kalshi_series.json"
+    series_source = series_path.relative_to(root).as_posix()
+    try:
+        series = _recorded_json(root, manifest, series_path).get("series")
+    except (OSError, ValueError) as exc:
+        return {**result, "status": "skipped", "reason_code": "fee_metadata_unavailable", "detail": str(exc)}
+    if not isinstance(series, dict) or series.get("ticker") != capture["series"]:
+        return {**result, "status": "skipped", "reason_code": "fee_series_unverified"}
+    result.update(
+        fee_series_path=series_source,
+        fee_series_sha256=manifest[series_source]["sha256"],
+        fee_type=series.get("fee_type"),
+    )
+    if result["fee_type"] != "quadratic":
+        return {**result, "status": "skipped", "reason_code": "fee_type_unsupported"}
+    captured_multiplier = series.get("fee_multiplier")
+    if type(captured_multiplier) not in (int, Decimal):
+        return {**result, "status": "skipped", "reason_code": "fee_multiplier_invalid"}
+    multiplier = Decimal(captured_multiplier)
+    if not multiplier.is_finite() or multiplier < 0:
+        return {**result, "status": "skipped", "reason_code": "fee_multiplier_invalid"}
+
+    worst = whole_cent_worst_case(walk.fills, multiplier=multiplier)
     return {
         **result,
         "status": "simulated_fill",
         "fills": [asdict(fill) for fill in walk.fills],
         "notional": walk.notional,
-        "primary_whole_cent": asdict(buy_fees(
-            walk.fills, multiplier=fee_multiplier, balance_precision=WHOLE_CENT)),
+        "fee_multiplier": multiplier,
+        "primary_fee_scenario": "whole_cent_worst_case",
+        "whole_cent_best_case": asdict(buy_fees(
+            walk.fills, multiplier=multiplier, balance_precision=WHOLE_CENT)),
+        "whole_cent_worst_case": {
+            "balance_precision": worst.balance_precision,
+            "fill_quantity": MIN_FILL_QUANTITY,
+            "fill_count": len(worst.per_fill),
+            "net_fee": worst.net_fee,
+            "total_debit": worst.total_debit,
+        },
         "secondary_sub_cent": asdict(buy_fees(
-            walk.fills, multiplier=fee_multiplier, balance_precision=SUB_CENT)),
+            walk.fills, multiplier=multiplier, balance_precision=SUB_CENT)),
     }

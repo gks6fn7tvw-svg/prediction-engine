@@ -9,6 +9,7 @@ ONE = Decimal("1")
 WHOLE_CENT = Decimal("0.01")
 SUB_CENT = Decimal("0.0001")
 FEE_UNIT = Decimal("0.000001")
+MIN_FILL_QUANTITY = Decimal("0.01")
 TAKER_RATE = Decimal("0.07")
 FEE_SCHEDULE_EFFECTIVE_DATE = "2026-07-07"
 
@@ -78,7 +79,7 @@ def walk_buy(
         raise ValueError("side must be yes or no")
     if not limit.is_finite() or not ZERO <= limit <= ONE:
         raise ValueError("limit must be a dollar price from 0 to 1")
-    if not quantity.is_finite() or quantity <= ZERO or quantity != quantity.quantize(WHOLE_CENT):
+    if not quantity.is_finite() or quantity <= ZERO or quantity != quantity.quantize(MIN_FILL_QUANTITY):
         raise ValueError("quantity must be positive in hundredths of a contract")
 
     opposite = "no_dollars" if side == "yes" else "yes_dollars"
@@ -93,7 +94,7 @@ def walk_buy(
         if not isinstance(level, list) or len(level) != 2:
             raise ValueError("book level must contain a price and a quantity")
         bid = _book_number(level[0], SUB_CENT)
-        size = _book_number(level[1], WHOLE_CENT)
+        size = _book_number(level[1], MIN_FILL_QUANTITY)
         if not ZERO <= bid <= ONE or size < ZERO:
             raise ValueError("book price or quantity is outside its supported range")
         if size > ZERO:
@@ -157,3 +158,17 @@ def buy_fees(
         sum((fill.net_fee for fill in fees), ZERO),
         sum((fill.total_debit for fill in fees), ZERO),
     )
+
+
+def whole_cent_worst_case(fills: Sequence[Fill], *, multiplier: Decimal) -> BuyFees:
+    """Maximize the debit over fill splits along a fixed price ladder."""
+    # Splitting a fill can only increase the sum of rounded trade fees and the
+    # sum of grid-rounded notionals. Those two amounts determine the cumulative
+    # debit with the rebate cap, so the smallest fills attain the worst case.
+    fragments = []
+    for fill in fills:
+        units = fill.quantity / MIN_FILL_QUANTITY
+        if not units.is_finite() or units <= ZERO or units != units.to_integral_value():
+            raise ValueError("fill quantity must be positive in hundredths of a contract")
+        fragments.extend([Fill(fill.price, MIN_FILL_QUANTITY)] * int(units))
+    return buy_fees(fragments, multiplier=multiplier, balance_precision=WHOLE_CENT)

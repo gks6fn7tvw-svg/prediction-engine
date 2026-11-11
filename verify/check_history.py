@@ -53,6 +53,12 @@ def pick_quote(candles: list, cutoff: datetime, lookback_s: int):
         ask = (c.get("yes_ask") or {}).get("close_dollars")
         if not bid or not ask:
             continue
+        try:
+            b, a = Decimal(bid), Decimal(ask)
+        except ArithmeticError:
+            continue
+        if not (0 <= b <= a <= 1):  # crossed or out-of-range quote: fall back to an earlier candle
+            continue
         if best is None or c["end_period_ts"] > best["end_period_ts"]:
             best = c
     return best
@@ -94,12 +100,22 @@ def check_batch(data_root: Path, batch_rel: str) -> Report:
     r.check((h.get("start_target_date"), h.get("end_target_date_inclusive")) == ("2026-10-01", "2026-11-11"),
             "manifest holdout bounds differ from the registered split")
 
+    # Every registered city needs an entry, so a dropped city can't shrink the denominator.
+    # A city whose inputs were unavailable stays in, as {"status": "missing", "reason": "..."}.
+    r.check(set(manifest["cities"]) == set(BY_KEY),
+            f"city entries {sorted(manifest['cities'])} != registered {sorted(BY_KEY)}")
     for key, info in manifest["cities"].items():
         city = BY_KEY.get(key)
         r.check(city is not None, f"{key}: unknown city")
         if city is None:
             continue
         p = f"{key}:"
+        if info.get("status") == "missing":
+            r.check(isinstance(info.get("reason"), str) and info["reason"].strip() != "",
+                    f"{p} missing-city record without a reason")
+            r.check(not any(rel.startswith(f"{key}/") for rel in listed), f"{p} marked missing but has files")
+            r.note(f"{p} missing ({info.get('reason')}); counts against coverage")
+            continue
         # 3. Cutoff and climate day, recomputed with the recorder's own schedule code.
         cut = cutoff_utc(city, target - timedelta(days=1))
         start, end = climate_day_utc(city, target)
@@ -117,6 +133,15 @@ def check_batch(data_root: Path, batch_rel: str) -> Report:
         yes = [m["ticker"] for m in markets if m.get("result") == "yes"]
         r.check(len(yes) == 1 and yes[0] == info["yes_winner_ticker"], f"{p} Yes winners {yes}")
         r.check(all(m.get("result") in ("yes", "no") for m in markets), f"{p} result outside yes/no")
+        # The payout itself, not just the label: a Yes pays $1 per contract, a No pays $0.
+        for m in markets:
+            paid = m.get("settlement_value_dollars")
+            want = {"yes": Decimal(1), "no": Decimal(0)}.get(m.get("result"))
+            try:
+                ok = paid is not None and want is not None and Decimal(paid) == want
+            except ArithmeticError:
+                ok = False
+            r.check(ok, f"{p} {m['ticker']}: settlement_value_dollars {paid!r} does not match result {m.get('result')!r}")
         values = {m.get("expiration_value") for m in markets}
         r.check(len(values) == 1, f"{p} markets disagree on expiration_value {values}")
         if len(values) == 1 and None not in values and "" not in values:
@@ -150,6 +175,9 @@ def check_batch(data_root: Path, batch_rel: str) -> Report:
                 for q in info["quotes"].values() if q]
         if len(mids) == len(markets):
             r.note(f"{p} midpoints sum to {sum(mids)}; oldest quote {max(q['age_seconds'] for q in info['quotes'].values())} s")
+        zero_bid = sorted(t for t, q in info["quotes"].items() if q and Decimal(q["yes_bid_close_dollars"]) == 0)
+        if zero_bid:
+            r.note(f"{p} quotes with a $0 bid (no buyers) counted as two-sided: {zero_bid}")
 
         # 6. Forecast: every object public before the cutoff, hours cover the climate day.
         nbm = json.loads((batch / key / "nbm.json").read_bytes())

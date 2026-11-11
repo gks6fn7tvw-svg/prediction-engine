@@ -203,7 +203,9 @@ def check_batch(data_root: Path, batch_rel: str) -> Report:
         r.check(not late, f"{p} objects published after the cutoff: {late[:3]}")
         r.check(nbm.get("units") == "C", f"{p} units {nbm.get('units')}")
         hourly_max_f = max(hr["temperature_c"] for hr in nbm["hours"]) * 9 / 5 + 32
-        if len(values) <= 1:
+        # Never note forecast-vs-outcome on holdout dates: that would leak model performance
+        # to whoever builds the model before the holdout is scored.
+        if len(values) <= 1 and not in_holdout:
             r.note(f"{p} NBM hourly max {hourly_max_f:.1f}F vs settled {markets[0].get('expiration_value')}F")
     return r
 

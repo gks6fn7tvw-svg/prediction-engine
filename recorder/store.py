@@ -29,6 +29,15 @@ class LocalSink:
         with open(full, "rb") as fh:
             return fh.read()
 
+    def list_files(self, prefix: str = "") -> list[str]:
+        out = []
+        for base, _, names in os.walk(self.root):
+            for name in names:
+                rel = os.path.relpath(os.path.join(base, name), self.root).replace(os.sep, "/")
+                if rel.startswith(prefix) and not rel.startswith(".git/"):
+                    out.append(rel)
+        return sorted(out)
+
     def commit(self, files: dict[str, bytes], message: str) -> str:
         for path, data in files.items():
             full = os.path.join(self.root, path)
@@ -83,6 +92,17 @@ class GitHubSink:
         if status == 404:
             return None
         self._fail(f"read {path}", status, data)
+
+    def list_files(self, prefix: str = "") -> list[str]:
+        """Paths of all files on the branch that start with prefix."""
+        status, data = self._call("GET", f"/git/trees/{quote(self.branch)}?recursive=1")
+        if status != 200:
+            self._fail("list files", status, data)
+        tree = json.loads(data)
+        if tree.get("truncated"):
+            raise StoreError("repository tree listing was truncated")
+        return sorted(e["path"] for e in tree.get("tree", [])
+                      if e.get("type") == "blob" and e["path"].startswith(prefix))
 
     def _head(self) -> str:
         status, data = self._call("GET", f"/git/ref/heads/{quote(self.branch)}")

@@ -174,12 +174,13 @@ class ReplayTests(unittest.TestCase):
         self.assertEqual(result["first_book_sha256"], recorder.run["files"][result["first_book_path"]]["sha256"])
         self.assertEqual(sum(fill["quantity"] for fill in result["fills"]), Decimal(1))
         self.assertEqual(result["fee_multiplier"], Decimal(1))
-        self.assertEqual(result["primary_fee_scenario"], "whole_cent_worst_case")
+        self.assertIsNone(result["primary_fee_scenario"])
         self.assertEqual(
             result["whole_cent_best_case"]["total_debit"],
             result["notional"] + result["whole_cent_best_case"]["net_fee"],
         )
         self.assertEqual(result["whole_cent_worst_case"]["total_debit"], Decimal("1.00"))
+        self.assertEqual(result["sub_cent_best_case"]["total_debit"], Decimal("0.6464"))
 
     def test_replay_prices_the_recorded_fractional_multiplier(self):
         recorder, _ = self.world.run_at()
@@ -190,7 +191,7 @@ class ReplayTests(unittest.TestCase):
         self.assertEqual(result["fee_type"], "quadratic")
         self.assertEqual(result["fee_multiplier"], Decimal("0.5"))
         self.assertEqual(result["fee_series_sha256"], source_hash)
-        self.assertEqual(result["secondary_sub_cent"]["total_debit"], Decimal("0.6382"))
+        self.assertEqual(result["sub_cent_best_case"]["total_debit"], Decimal("0.6382"))
 
     def test_missing_series_metadata_skips_pricing(self):
         recorder, _ = self.world.run_at()

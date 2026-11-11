@@ -17,13 +17,14 @@ The buy walks the asks implied by the opposite-side bids, from the lowest price 
 
 ## Fee scenarios
 
-- `whole_cent_best_case` groups each consumed price level into one fill.
-- `whole_cent_worst_case` uses 0.01-contract fills along the same price ladder and reports their combined debit. It is the primary scenario while account precision is unconfirmed. [Kalshi quantity precision](https://docs.kalshi.com/getting_started/fixed_point_migration#fractional-contracts)
-- `secondary_sub_cent` groups each consumed price level into one fill and aligns the balance to $0.0001.
+- `whole_cent_best_case` and `sub_cent_best_case` each use one fill per consumed price level, with $0.01 and $0.0001 balance alignment respectively.
+- `whole_cent_worst_case` is an upper bound using 0.01-contract fills along the same price ladder. [Kalshi quantity precision](https://docs.kalshi.com/getting_started/fixed_point_migration#fractional-contracts)
+
+The replay reports the grouped estimates side by side and leaves `primary_fee_scenario` as `null` while account precision is unconfirmed. The v0.3 forecast-skill comparison uses forecast probabilities and market midpoints independently of this fee accounting.
 
 With the rebate cap, the cumulative debit after each fill is the greater of two amounts. One is the cumulative notional plus rounded trade fees, rounded up together to the balance grid. The other is the previous debit plus this fill's notional rounded up to that grid. Splitting a price level into minimum-size fills can only increase the cumulative rounded trade fees and the sum of rounded notionals, so it maximizes the debit for that price ladder.
 
-For one 5¢ contract at a multiplier of 1, the whole-cent debit is 6¢ as one fill or $1.00 as 100 minimum-size fills. The sub-cent price-level estimate is 5.34¢.
+At a multiplier of 1, the upper bound is $1.00 per contract at every whole-cent price from 1¢ to 99¢. Each 0.01-contract fill costs a cent under whole-cent balance alignment, and its fee cap prevents a rebate. Even a full $1 payout at this bound only breaks even before operating costs. At 5¢, the grouped estimates are 6¢ with whole-cent alignment and 5.34¢ with sub-cent alignment.
 
 This is a first-snapshot estimate for one candidate. The v0.3 trading experiment also requires an entry policy, a recorded recheck and settlement accounting.
 

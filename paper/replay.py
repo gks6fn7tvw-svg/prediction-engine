@@ -172,9 +172,11 @@ def replay_capture(
         "fills": [asdict(fill) for fill in walk.fills],
         "notional": walk.notional,
         "fee_multiplier": multiplier,
-        "primary_fee_scenario": "whole_cent_worst_case",
+        "primary_fee_scenario": None,
         "whole_cent_best_case": asdict(buy_fees(
             walk.fills, multiplier=multiplier, balance_precision=WHOLE_CENT)),
+        "sub_cent_best_case": asdict(buy_fees(
+            walk.fills, multiplier=multiplier, balance_precision=SUB_CENT)),
         "whole_cent_worst_case": {
             "balance_precision": worst.balance_precision,
             "fill_quantity": MIN_FILL_QUANTITY,
@@ -182,6 +184,4 @@ def replay_capture(
             "net_fee": worst.net_fee,
             "total_debit": worst.total_debit,
         },
-        "secondary_sub_cent": asdict(buy_fees(
-            walk.fills, multiplier=multiplier, balance_precision=SUB_CENT)),
     }

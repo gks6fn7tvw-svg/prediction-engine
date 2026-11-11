@@ -25,10 +25,11 @@ class World:
         self.tmp = tempfile.TemporaryDirectory()
         self.sink = LocalSink(self.tmp.name)
 
-    def run_at(self, when=None, cities=TWO):
+    def run_at(self, when=None, cities=TWO, live_check=False):
         if when:
             self.clock.t = when
-        rec = Recorder(self.clock, self.replay, self.sink, cities=cities)
+        rec = Recorder(self.clock, self.replay, self.sink, cities=cities,
+                       live_check_on_first_run=live_check)
         return rec, rec.execute()
 
     def read(self, path):
@@ -243,6 +244,63 @@ class CutoffRuleTests(unittest.TestCase):
         self.assertLess(books["request_lateness_seconds"], 0.01)
         self.assertGreaterEqual(books["recheck_gap_seconds"], 1.0)        # a full measured second
         self.assertTrue(books["eligible"])
+
+
+class LiveCheckTests(unittest.TestCase):
+    """The one-time check that runs on the first run against an empty data repository."""
+
+    QUIET = datetime(2026, 11, 11, 3, 52, tzinfo=UTC)  # no cutoff due at this hour
+
+    def test_first_run_checks_every_source_once_and_saves_it_apart(self):
+        w = World(self.QUIET)
+        self.addCleanup(w.tmp.cleanup)
+        rec, summary = w.run_at(live_check=True)
+        self.assertTrue(summary["ok"], summary)
+        self.assertTrue(summary["live_check_ok"])
+        self.assertEqual(summary["live_check_problems"], [])
+        self.assertEqual(summary["cutoffs"], 0)
+        check = rec.run["live_check"]
+        ny = check["cities"]["NY"]
+        self.assertEqual((ny["fee_type"], ny["fee_multiplier"]), ("quadratic", 1))
+        self.assertEqual(ny["settlement_sources"], ["The Weather Company"])
+        self.assertEqual(ny["checked_event"], "KXHIGHNY-26NOV11")
+        self.assertEqual(check["books"], {"ok": True, "requested": 12, "returned": 12})
+        base = f"checks/{rec.run_id}"
+        for path in ("books.json", "NY/kalshi_markets.json", "NY/nws_hourly.json",
+                     "NY/nws_gridpoint.json.gz", "MIA/nws_cli.html"):
+            self.assertIsNotNone(w.read(f"{base}/{path}"), path)
+        # Kept apart from real captures: no cutoffs, no events to follow.
+        state = w.state()
+        self.assertEqual((state["cutoffs"], state["events"]), ({}, {}))
+        self.assertEqual(state["live_check"]["run_id"], rec.run_id)
+
+    def test_it_runs_only_once(self):
+        w = World(self.QUIET)
+        self.addCleanup(w.tmp.cleanup)
+        w.run_at(live_check=True)
+        rec, summary = w.run_at(self.QUIET + timedelta(hours=1), live_check=True)
+        self.assertNotIn("live_check", rec.run)
+        self.assertEqual((summary["files"], summary["commit"]), (0, None))
+
+    def test_a_broken_source_fails_the_run_with_the_reason(self):
+        w = World(self.QUIET)
+        self.addCleanup(w.tmp.cleanup)
+        w.replay.broken.add("forecast/hourly")
+        _, summary = w.run_at(live_check=True)
+        self.assertFalse(summary["ok"])
+        self.assertIn("NY:hourly_forecast_unavailable", summary["live_check_problems"])
+
+    def test_an_unreadable_data_repo_fails_the_run(self):
+        class BrokenSink(LocalSink):
+            def read(self, path):
+                raise RuntimeError("HTTP 401 Bad credentials")
+        w = World(self.QUIET)
+        self.addCleanup(w.tmp.cleanup)
+        w.sink = BrokenSink(w.tmp.name)
+        rec, summary = w.run_at(live_check=True)
+        self.assertFalse(summary["ok"])
+        self.assertEqual(rec.run["errors"][0]["phase"], "load_state")
+        self.assertNotIn("live_check", rec.run)  # never check against a state we couldn't read
 
 
 class SettlementTests(unittest.TestCase):

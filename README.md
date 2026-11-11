@@ -65,6 +65,16 @@ only. The raw files are the record.
   `failed`, with every attempt listed.
 - **Nothing is overwritten.** Every run writes to a new folder.
 
+### First-run live check
+
+The first run against an empty data repository also fetches every source once
+(Kalshi series, markets and order books, NWS forecasts, climate reports) and
+saves the results under `checks/`. If anything fails, the run reports
+`"ok": false` with the reasons, so a broken connection shows up hours before
+the first real cutoff. The check never counts as a capture and is never used
+for scoring. It runs once; delete `live_check` from `state/state.json` to run
+it again.
+
 ### Not built yet
 
 - The weather.com page Kalshi names as its settlement source is not captured.

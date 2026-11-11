@@ -25,6 +25,7 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from urllib.parse import quote
+from zoneinfo import ZoneInfo
 
 from .config import CITIES, KALSHI_BASE, NWS_BASE
 from .net import RealClock, fetch, iso, urllib_transport
@@ -107,8 +108,10 @@ def cli_text(body: bytes) -> bytes:
 
 
 class Recorder:
-    def __init__(self, clock, transport, sink, cities=CITIES, code_version=None):
+    def __init__(self, clock, transport, sink, cities=CITIES, code_version=None,
+                 live_check_on_first_run=True):
         self.clock, self.transport, self.sink, self.cities = clock, transport, sink, cities
+        self.live_check_on_first_run = live_check_on_first_run
         start = clock.now()
         self.run_id = f"{start:%Y%m%dT%H%M%SZ}-{uuid.uuid4().hex[:6]}"
         self.base = f"runs/{start:%Y/%m/%d}/{self.run_id}"
@@ -392,6 +395,69 @@ class Recorder:
                 self.state["cli"][city.key] = {"last_sha256": digest, "saved_at": iso(f.received)}
             self.run["cli"].append({"city": city.key, "changed": changed})
 
+    # ---------- one-time live check ----------
+
+    def live_check(self):
+        """Fetch every source once on the first run against a new data repository.
+
+        This exists so a broken connection shows up hours before the first real cutoff,
+        not at it. Results go under checks/, are never treated as a cutoff capture, and
+        are never used for scoring. It runs once; delete "live_check" from the state file
+        to run it again.
+        """
+        now = self.clock.now()
+        cdir = f"checks/{self.run_id}"
+        rec = {"note": "connectivity check only; not a cutoff capture; never used for scoring",
+               "cities": {}, "problems": []}
+        self.run["live_check"] = rec
+        self.state["live_check"] = {"run_id": self.run_id, "at": iso(now)}
+        tickers = []
+        for city in self.cities:
+            info = {"problems": []}
+            rec["cities"][city.key] = info
+            s, _ = self.get(f"{KALSHI_BASE}/series/{city.series}", "check_kalshi_series",
+                            f"{cdir}/{city.key}/kalshi_series.json", attempts=2)
+            series = ((_json(s.body) or {}).get("series") or {}) if s.ok else {}
+            info["fee_type"], info["fee_multiplier"] = series.get("fee_type"), series.get("fee_multiplier")
+            info["settlement_sources"] = [x.get("name") for x in series.get("settlement_sources") or []]
+            if not s.ok:
+                info["problems"].append("series_unavailable")
+            m, _ = self.get(
+                f"{KALSHI_BASE}/markets?series_ticker={city.series}&status=open&limit=200",
+                "check_kalshi_markets", f"{cdir}/{city.key}/kalshi_markets.json", attempts=2)
+            payload = _json(m.body) if m.ok else None
+            markets = payload.get("markets") if isinstance(payload, dict) else None
+            if markets is None:
+                info["problems"].append("markets_unavailable")
+            else:
+                events = sorted({x.get("event_ticker") for x in markets if x.get("event_ticker")})
+                info["open_events"] = events
+                if events:
+                    picked = sorted(x["ticker"] for x in markets if x.get("event_ticker") == events[-1])
+                    info["checked_event"], info["tickers"] = events[-1], picked
+                    tickers += picked
+                else:
+                    info["problems"].append("no_open_events")
+            target = now.astimezone(ZoneInfo(city.tz)).date() + timedelta(days=1)
+            self.capture_weather(cdir, city, target, info, now)
+            c, _ = self.get(city.cli_url, "check_nws_cli", f"{cdir}/{city.key}/nws_cli.html", attempts=2)
+            if not c.ok:
+                info["problems"].append("cli_unavailable")
+        if tickers:
+            url = f"{KALSHI_BASE}/markets/orderbooks?" + "&".join(
+                "tickers=" + quote(t, safe="") for t in tickers)
+            b, _ = self.get(url, "check_kalshi_books", f"{cdir}/books.json")
+            books = (_json(b.body) or {}).get("orderbooks") if b.ok else None
+            rec["books"] = {"ok": b.ok, "requested": len(tickers),
+                            "returned": len(books) if isinstance(books, list) else None}
+            if not b.ok or not isinstance(books, list) or len(books) != len(tickers):
+                rec["problems"].append("books_incomplete")
+        else:
+            rec["problems"].append("no_tickers_to_check_books")
+        problems = rec["problems"] + [f"{k}:{p}" for k, i in rec["cities"].items() for p in i["problems"]]
+        rec["ok"] = not problems
+        rec["all_problems"] = problems
+
     # ---------- run ----------
 
     def execute(self) -> dict:
@@ -406,6 +472,8 @@ class Recorder:
         self.guard("missed", self.record_missed)
         self.guard("settlement", self.poll_settlements)
         self.guard("cli", self.capture_cli)
+        if self.live_check_on_first_run and self.state_ok and "live_check" not in self.state:
+            self.guard("live_check", self.live_check)
         return self.finish()
 
     def finish(self) -> dict:
@@ -437,7 +505,14 @@ class Recorder:
                 summary["commit"] = self.sink.commit(self.files, f"recorder run {self.run_id}")
             except Exception as exc:
                 summary["commit_error"] = f"{type(exc).__name__}: {exc}"
-        summary["ok"] = "commit_error" not in summary and not failed
+        check = self.run.get("live_check")
+        if check is not None:
+            summary["live_check_ok"] = check.get("ok", False)
+            summary["live_check_problems"] = check.get("all_problems")
+        # Any error (including an unreadable state file or a bad token) fails the run, so it
+        # shows up in Render's logs on the hour rather than at the next cutoff.
+        summary["ok"] = ("commit_error" not in summary and not failed and not self.run["errors"]
+                         and (check is None or check.get("ok", False)))
         return summary
 
     def prune_state(self):

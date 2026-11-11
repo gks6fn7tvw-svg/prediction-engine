@@ -31,6 +31,7 @@ def _utc(s: str) -> datetime:
 class Report:
     def __init__(self):
         self.failures, self.notes, self.passed = [], [], 0
+        self.primary = {}  # city -> complete for primary scoring (every range has an interior quote)
 
     def check(self, ok: bool, what: str):
         if ok:
@@ -56,6 +57,8 @@ def pick_quote(candles: list, cutoff: datetime, lookback_s: int):
         try:
             b, a = Decimal(bid), Decimal(ask)
         except ArithmeticError:
+            continue
+        if not (b.is_finite() and a.is_finite()):  # NaN or Infinity: unusable, fall back
             continue
         if not (0 <= b <= a <= 1):  # crossed or out-of-range quote: fall back to an earlier candle
             continue
@@ -175,9 +178,15 @@ def check_batch(data_root: Path, batch_rel: str) -> Report:
                 for q in info["quotes"].values() if q]
         if len(mids) == len(markets):
             r.note(f"{p} midpoints sum to {sum(mids)}; oldest quote {max(q['age_seconds'] for q in info['quotes'].values())} s")
-        zero_bid = sorted(t for t, q in info["quotes"].items() if q and Decimal(q["yes_bid_close_dollars"]) == 0)
-        if zero_bid:
-            r.note(f"{p} quotes with a $0 bid (no buyers) counted as two-sided: {zero_bid}")
+        # Scoring convention (ChatGPT #8): primary Brier needs 0 < bid <= ask < 1 on EVERY range.
+        # A boundary quote is kept for audit, never replaced by an older interior one, and makes
+        # the city-day incomplete for primary scoring while staying in the coverage denominator.
+        boundary = sorted(t for t, q in info["quotes"].items() if q and (
+            Decimal(q["yes_bid_close_dollars"]) <= 0 or Decimal(q["yes_ask_close_dollars"]) >= 1))
+        missing = sorted(t for t, q in info["quotes"].items() if not q)
+        r.primary[key] = not boundary and not missing
+        if boundary:
+            r.note(f"{p} boundary quotes ($0 bid or $1 ask), city-day incomplete for primary scoring: {boundary}")
 
         # 6. Forecast: every object public before the cutoff, hours cover the climate day.
         nbm = json.loads((batch / key / "nbm.json").read_bytes())
@@ -216,7 +225,7 @@ def main() -> int:
         return 2
     rep = check_batch(Path(sys.argv[1]), sys.argv[2])
     print(json.dumps({"batch": sys.argv[2], "passed_checks": rep.passed, "failures": rep.failures,
-                      "notes": rep.notes}, indent=1))
+                      "primary_complete": rep.primary, "notes": rep.notes}, indent=1))
     return 0 if not rep.failures else 1
 
 

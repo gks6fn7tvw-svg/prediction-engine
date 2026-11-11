@@ -148,6 +148,26 @@ class HistoryCheckTests(unittest.TestCase):
         self.edit("manifest.json", fall_back)
         self.assertEqual([f for f in self.failures() if ticker in f], [])
 
+    def test_nan_candle_falls_back_instead_of_crashing(self):
+        ticker = "KXHIGHNY-26SEP11-B79.5"
+        chosen = json.loads((self.batch / "manifest.json").read_bytes())["cities"]["NY"]["quotes"][ticker]
+
+        def poison(d):
+            for x in d["markets"]:
+                if x["market_ticker"] == ticker:
+                    for c in x["candlesticks"]:
+                        if c["end_period_ts"] == chosen["candle_end_unix"]:
+                            c["yes_ask"]["close_dollars"] = "NaN"
+        self.edit("NY/candles.json", poison)
+        failures = self.failures()  # must not raise
+        self.assertTrue(any(ticker in f and "chosen candle" in f for f in failures))
+
+    def test_boundary_quotes_make_the_city_day_incomplete_for_primary_scoring(self):
+        report = check_batch(self.root, BATCH)
+        self.assertEqual(report.primary, {"NY": False, "MIA": False, "CHI": True, "DEN": True, "LAX": False})
+        self.assertTrue(any("NY: boundary quotes" in n and "T86" in n for n in report.notes))
+        self.assertEqual(report.failures, [])  # a convention, not an integrity failure
+
     def test_holdout_date_labelled_development_is_caught(self):
         self.edit("manifest.json", lambda m: m.update(target_date="2026-10-02"))
         self.assertTrue(any("partition" in f for f in self.failures()))

@@ -176,7 +176,7 @@ class Verifier:
             self.download(batch, root)
             offline = check_batch(root, batch)
             report["offline"] = {"passed_checks": offline.passed, "failures": offline.failures,
-                                 "notes": offline.notes}
+                                 "primary_complete": offline.primary, "notes": offline.notes}
             for f in offline.failures:
                 fail(f"offline: {f}")
             manifest = json.loads((root / batch / "manifest.json").read_bytes())

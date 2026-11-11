@@ -22,12 +22,24 @@ class LocalSink:
     def __init__(self, root: str):
         self.root = root
 
-    def read(self, path: str) -> bytes | None:
+    def head(self) -> str:
+        return "local"
+
+    def read(self, path: str, ref: str | None = None) -> bytes | None:
         full = os.path.join(self.root, path)
         if not os.path.exists(full):
             return None
         with open(full, "rb") as fh:
             return fh.read()
+
+    def list_files(self, prefix: str = "", ref: str | None = None) -> list[str]:
+        out = []
+        for base, _, names in os.walk(self.root):
+            for name in names:
+                rel = os.path.relpath(os.path.join(base, name), self.root).replace(os.sep, "/")
+                if rel.startswith(prefix) and not rel.startswith(".git/"):
+                    out.append(rel)
+        return sorted(out)
 
     def commit(self, files: dict[str, bytes], message: str) -> str:
         for path, data in files.items():
@@ -74,15 +86,30 @@ class GitHubSink:
     def _fail(what, status, data):
         raise StoreError(f"{what}: HTTP {status} {data[:200].decode('utf-8', 'replace')}")
 
-    def read(self, path: str) -> bytes | None:
+    def head(self) -> str:
+        """Current commit SHA of the branch; pass it as `ref` to read a fixed snapshot."""
+        return self._head()
+
+    def read(self, path: str, ref: str | None = None) -> bytes | None:
         status, data = self._call(
-            "GET", f"/contents/{quote(path)}?ref={quote(self.branch)}",
+            "GET", f"/contents/{quote(path)}?ref={quote(ref or self.branch)}",
             accept="application/vnd.github.raw+json")
         if status == 200:
             return data
         if status == 404:
             return None
         self._fail(f"read {path}", status, data)
+
+    def list_files(self, prefix: str = "", ref: str | None = None) -> list[str]:
+        """Paths of all files at `ref` (default: the branch) that start with prefix."""
+        status, data = self._call("GET", f"/git/trees/{quote(ref or self.branch)}?recursive=1")
+        if status != 200:
+            self._fail("list files", status, data)
+        tree = json.loads(data)
+        if tree.get("truncated"):
+            raise StoreError("repository tree listing was truncated")
+        return sorted(e["path"] for e in tree.get("tree", [])
+                      if e.get("type") == "blob" and e["path"].startswith(prefix))
 
     def _head(self) -> str:
         status, data = self._call("GET", f"/git/ref/heads/{quote(self.branch)}")

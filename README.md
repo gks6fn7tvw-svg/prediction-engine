@@ -83,6 +83,21 @@ it again.
   Kalshi's own settled result is saved instead, with the NWS report as a check.
 - No forecasting model, no fee or paper-trading calculations.
 
+## Independent checks of historical data: `verify/`
+
+ChatGPT collects past data into `history/` in the data repository. Claude checks
+it independently, without trusting the collector's own manifest.
+
+- `python -m verify.check_history <data dir> <batch>`: offline checks of one
+  batch (hashes, the date split, cutoffs and climate days recomputed with the
+  recorder's own code, payouts, quote selection, forecast provenance).
+- `python -m verify.refetch`: runs hourly at minute 25 as a second Render job.
+  For every batch without a report, it re-downloads the Kalshi data and a sample
+  of the NOAA forecast files, compares them with what was saved, checks that no
+  later forecast cycle was complete before the cutoff, decodes the samples with
+  pygrib if installed, and writes a report under `verification/` in the data
+  repository. Holdout reports never compare forecasts with outcomes.
+
 ## Setting it up on Render
 
 This has not been run on Render yet. The steps below are the intended path.

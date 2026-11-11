@@ -1,0 +1,17 @@
+# Render Blueprint: one scheduled job that runs the recorder every hour.
+# Cron schedules on Render are in UTC. Minute 52 gives the recorder 8 minutes
+# to prepare before any city's 6 p.m. cutoff, which always falls on the hour.
+services:
+  - type: cron
+    name: prediction-engine-recorder
+    runtime: python
+    schedule: "52 * * * *"
+    buildCommand: pip install -r requirements.txt
+    startCommand: python -m recorder.run
+    envVars:
+      - key: DATA_REPO
+        value: gks6fn7tvw-svg/prediction-engine-data
+      - key: DATA_BRANCH
+        value: main
+      - key: GITHUB_TOKEN
+        sync: false

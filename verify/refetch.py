@@ -61,15 +61,44 @@ def retryable(status) -> bool:
     return status == 429 or (isinstance(status, int) and 500 <= status <= 599)
 
 
+# Minimum seconds between requests to a host. Kalshi rate-limits (HTTP 429), and Render's
+# outbound addresses are shared, so pace politely rather than burst.
+MIN_INTERVAL = {"external-api.kalshi.com": float(os.environ.get("VERIFY_KALSHI_INTERVAL", "1.0"))}
+BACKOFF = (5, 15, 45)  # seconds before retries 2, 3 and 4, unless Retry-After says otherwise
+MAX_RETRY_AFTER = 120
+
+
+def retry_after_seconds(headers) -> float | None:
+    for k, v in (headers or {}).items():
+        if k.lower() == "retry-after":
+            try:
+                return max(0.0, min(float(v), MAX_RETRY_AFTER))
+            except (TypeError, ValueError):
+                return None  # an HTTP-date form: fall back to our own backoff
+    return None
+
+
 class Net:
-    """GET with retries through an injectable transport (tests replay saved responses)."""
+    """GET with pacing and retries through an injectable transport (tests replay saved responses)."""
 
     def __init__(self, transport, clock):
         self.transport, self.clock = transport, clock
+        self.last_request = {}  # host -> monotonic time of the previous request
 
-    def get(self, url, headers=None, tries=3, ok=(200,)):
+    def _pace(self, url):
+        host = url.split("/")[2] if "://" in url else ""
+        gap = MIN_INTERVAL.get(host, 0.0)
+        if gap and host in self.last_request:
+            wait = self.last_request[host] + gap - self.clock.monotonic()
+            if wait > 0:
+                self.clock.sleep(wait)
+        self.last_request[host] = self.clock.monotonic()
+
+    def get(self, url, headers=None, tries=4, ok=(200,)):
         last = None
         for attempt in range(1, tries + 1):
+            self._pace(url)
+            wait = None
             try:
                 status, hdrs, body = self.transport(
                     "GET", url, {"User-Agent": USER_AGENT, **(headers or {})}, None, 60)
@@ -81,8 +110,9 @@ class Net:
                 last = f"HTTP {status}"
                 if not retryable(status):
                     raise SourceError(f"GET {url} failed: {last}")
+                wait = retry_after_seconds(hdrs)
             if attempt < tries:
-                self.clock.sleep(2 * attempt)
+                self.clock.sleep(wait if wait is not None else BACKOFF[min(attempt, len(BACKOFF)) - 1])
         raise TransientError(f"GET {url} failed after {tries} tries: {last}")
 
 

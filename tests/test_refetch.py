@@ -242,7 +242,7 @@ class RefetchTests(unittest.TestCase):
         self.assertNotEqual(v.pending()[0][1], digest)
 
     def test_outage_then_recovery_keeps_the_batch_pending_until_verified(self):
-        self.world.kalshi_503s = 3  # every try of the first Kalshi request fails
+        self.world.kalshi_503s = 4  # every try (4) of the first Kalshi request fails
         first = run_once(self.v, self.sink, "run1")
         self.assertEqual([r["status"] for r in first], ["retry"])
         self.assertTrue(first[0]["report"].startswith("verification/attempts/development/2026-09-11/"))
@@ -333,6 +333,50 @@ class RetryClassificationTests(unittest.TestCase):
             raise OSError("connection reset")
         with self.assertRaises(TransientError):
             Net(boom, clock).get("https://example.test/x")
+
+
+class PacingTests(unittest.TestCase):
+    """Kalshi answered 429 on the first real multi-batch run (19:25 UTC Nov 11)."""
+
+    def setUp(self):
+        self.clock = FakeClock(datetime(2026, 11, 11, tzinfo=timezone.utc))
+        self.calls = []
+
+    def net(self, answers):
+        answers = list(answers)
+
+        def transport(method, url, headers, body, timeout):
+            self.calls.append(self.clock.monotonic())
+            return answers.pop(0) if answers else (200, {}, b"ok")
+        return Net(transport, self.clock)
+
+    def test_kalshi_requests_are_spaced_at_least_a_second_apart(self):
+        net = self.net([])
+        for _ in range(3):
+            net.get("https://external-api.kalshi.com/trade-api/v2/markets?x=1")
+        gaps = [b - a for a, b in zip(self.calls, self.calls[1:])]
+        self.assertTrue(all(g >= 1.0 for g in gaps), gaps)
+
+    def test_other_hosts_are_not_paced(self):
+        net = self.net([])
+        net.get("https://noaa-nbm-grib2-pds.s3.amazonaws.com/a")
+        net.get("https://noaa-nbm-grib2-pds.s3.amazonaws.com/b")
+        self.assertEqual(self.clock.sleeps, [])
+
+    def test_retry_after_is_honoured(self):
+        net = self.net([(429, {"Retry-After": "7"}, b""), (200, {}, b"ok")])
+        self.assertEqual(net.get("https://external-api.kalshi.com/x")[2], b"ok")
+        self.assertIn(7.0, self.clock.sleeps)
+
+    def test_without_retry_after_backoff_grows(self):
+        net = self.net([(429, {}, b"")] * 3 + [(200, {}, b"ok")])
+        self.assertEqual(net.get("https://external-api.kalshi.com/x")[2], b"ok")
+        self.assertEqual([s for s in self.clock.sleeps if s >= 5], [5, 15, 45])
+
+    def test_absurd_retry_after_is_capped(self):
+        net = self.net([(429, {"retry-after": "100000"}, b""), (200, {}, b"ok")])
+        net.get("https://external-api.kalshi.com/x")
+        self.assertIn(120.0, self.clock.sleeps)
 
 
 class HelperTests(unittest.TestCase):

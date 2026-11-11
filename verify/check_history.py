@@ -31,7 +31,8 @@ def _utc(s: str) -> datetime:
 class Report:
     def __init__(self):
         self.failures, self.notes, self.passed = [], [], 0
-        self.primary = {}  # city -> complete for primary scoring (every range has an interior quote)
+        self.primary = {}    # strict: every range has an interior quote, 0 < bid <= ask < 1
+        self.inclusive = {}  # inclusive candidate: every range has a valid quote, boundaries allowed
 
     def check(self, ok: bool, what: str):
         if ok:
@@ -185,6 +186,7 @@ def check_batch(data_root: Path, batch_rel: str) -> Report:
             Decimal(q["yes_bid_close_dollars"]) <= 0 or Decimal(q["yes_ask_close_dollars"]) >= 1))
         missing = sorted(t for t, q in info["quotes"].items() if not q)
         r.primary[key] = not boundary and not missing
+        r.inclusive[key] = not missing  # boundary quotes allowed, scored at their raw midpoint
         if boundary:
             r.note(f"{p} boundary quotes ($0 bid or $1 ask), city-day incomplete for primary scoring: {boundary}")
 
@@ -225,7 +227,8 @@ def main() -> int:
         return 2
     rep = check_batch(Path(sys.argv[1]), sys.argv[2])
     print(json.dumps({"batch": sys.argv[2], "passed_checks": rep.passed, "failures": rep.failures,
-                      "primary_complete": rep.primary, "notes": rep.notes}, indent=1))
+                      "primary_complete": rep.primary, "inclusive_complete": rep.inclusive,
+                      "notes": rep.notes}, indent=1))
     return 0 if not rep.failures else 1
 
 

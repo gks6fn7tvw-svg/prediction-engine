@@ -165,6 +165,7 @@ class HistoryCheckTests(unittest.TestCase):
     def test_boundary_quotes_make_the_city_day_incomplete_for_primary_scoring(self):
         report = check_batch(self.root, BATCH)
         self.assertEqual(report.primary, {"NY": False, "MIA": False, "CHI": True, "DEN": True, "LAX": False})
+        self.assertEqual(report.inclusive, {k: True for k in ("NY", "MIA", "CHI", "DEN", "LAX")})
         self.assertTrue(any("NY: boundary quotes" in n and "T86" in n for n in report.notes))
         self.assertEqual(report.failures, [])  # a convention, not an integrity failure
 

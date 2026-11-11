@@ -48,6 +48,17 @@ def _utc(s: str) -> datetime:
     return datetime.fromisoformat(s.replace("Z", "+00:00")).astimezone(timezone.utc)
 
 
+class TransientError(Exception):
+    """A retryable problem (network failure, timeout, 429/5xx, moved branch): try again next run."""
+
+
+class SourceError(Exception):
+    """A non-retryable answer from a source (for example HTTP 404): a confirmed result."""
+
+
+RETRYABLE = (429, 500, 502, 503, 504)
+
+
 class Net:
     """GET with retries through an injectable transport (tests replay saved responses)."""
 
@@ -66,11 +77,11 @@ class Net:
                 if status in ok:
                     return status, hdrs, body
                 last = f"HTTP {status}"
-                if status not in (429, 500, 502, 503, 504):
-                    break
+                if status not in RETRYABLE:
+                    raise SourceError(f"GET {url} failed: {last}")
             if attempt < tries:
                 self.clock.sleep(2 * attempt)
-        raise RuntimeError(f"GET {url} failed: {last}")
+        raise TransientError(f"GET {url} failed after {tries} tries: {last}")
 
 
 class S3Listing:
@@ -147,36 +158,48 @@ class Verifier:
         self.rng_seed = rng_seed
 
     def pending(self):
-        paths = self.sink.list_files("history/")
-        done = set(self.sink.list_files("verification/"))
+        """Batches without a canonical report, all read at ONE pinned data-repo commit."""
+        ref = self.sink.head()
+        paths = self.sink.list_files("history/", ref=ref)
+        done = set(self.sink.list_files("verification/", ref=ref))
         todo = []
         for path in paths:
             m = BATCH_RE.match(path)
             if not m:
                 continue
-            raw = self.sink.read(path)
+            raw = self.sink.read(path, ref=ref)
             digest = hashlib.sha256(raw).hexdigest()
             report = f"verification/{m.group(1)}/{m.group(2)}/{digest}.json"
             if report not in done:
-                todo.append((path.rsplit("/", 1)[0], digest, report))
+                todo.append((path.rsplit("/", 1)[0], digest, report, ref))
         return todo[:MAX_BATCHES]
 
-    def download(self, batch: str, dest: Path):
-        for path in self.sink.list_files(batch + "/"):
+    def download(self, batch: str, dest: Path, ref: str):
+        for path in self.sink.list_files(batch + "/", ref=ref):
             target = dest / path
             target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_bytes(self.sink.read(path))
+            target.write_bytes(self.sink.read(path, ref=ref))
 
-    def verify(self, batch: str, digest: str) -> dict:
-        report = {"batch": batch, "manifest_sha256": digest, "started_at": iso(self.clock.now()),
-                  "failures": [], "notes": [], "cities": {}}
+    def verify(self, batch: str, digest: str, ref: str) -> dict:
+        report = {"batch": batch, "manifest_sha256": digest, "data_commit": ref,
+                  "started_at": iso(self.clock.now()), "failures": [], "notes": [], "cities": {},
+                  "transient_errors": []}
         fail = report["failures"].append
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            self.download(batch, root)
+            try:
+                self.download(batch, root, ref)
+            except Exception as exc:
+                report["transient_errors"].append(f"download: {type(exc).__name__}: {exc}")
+                return self._finish(report)
+            got = hashlib.sha256((root / batch / "manifest.json").read_bytes()).hexdigest()
+            if got != digest:  # never certify a manifest other than the one discovered
+                report["transient_errors"].append(f"manifest at {ref} hashes to {got}, expected {digest}")
+                return self._finish(report)
             offline = check_batch(root, batch)
             report["offline"] = {"passed_checks": offline.passed, "failures": offline.failures,
-                                 "primary_complete": offline.primary, "notes": offline.notes}
+                                 "primary_complete": offline.primary,
+                                 "inclusive_complete": offline.inclusive, "notes": offline.notes}
             for f in offline.failures:
                 fail(f"offline: {f}")
             manifest = json.loads((root / batch / "manifest.json").read_bytes())
@@ -189,16 +212,24 @@ class Verifier:
                     report["cities"][key] = {"status": "missing"}
                     continue
                 city = report["cities"][key] = {}
-                try:
-                    self.check_kalshi(root / batch, key, info, city, fail)
-                except Exception as exc:
-                    fail(f"{key}: Kalshi re-fetch error {type(exc).__name__}: {exc}")
-                try:
-                    self.check_nbm(root / batch, key, info, city, fail, listing, rng, holdout)
-                except Exception as exc:
-                    fail(f"{key}: NOAA re-fetch error {type(exc).__name__}: {exc}")
+                for name, step in (("Kalshi", lambda: self.check_kalshi(root / batch, key, info, city, fail)),
+                                   ("NOAA", lambda: self.check_nbm(root / batch, key, info, city, fail,
+                                                                   listing, rng, holdout))):
+                    try:
+                        step()
+                    except TransientError as exc:
+                        report["transient_errors"].append(f"{key}: {name}: {exc}")
+                    except Exception as exc:
+                        fail(f"{key}: {name} re-fetch error {type(exc).__name__}: {exc}")
+        return self._finish(report)
+
+    def _finish(self, report: dict) -> dict:
         report["finished_at"] = iso(self.clock.now())
-        report["ok"] = not report["failures"]
+        # "retry": something could not be checked for a retryable reason. No canonical report
+        # is written, so the batch stays pending; the attempt is logged instead.
+        report["status"] = ("retry" if report["transient_errors"]
+                            else "ok" if not report["failures"] else "failed")
+        report["ok"] = report["status"] == "ok"
         return report
 
     # ---- Kalshi ----
@@ -313,6 +344,25 @@ class Verifier:
             city["note"] = "holdout: no forecast-vs-outcome comparison"
 
 
+def run_once(v: Verifier, sink, run_id: str, code_version=None) -> list[dict]:
+    """Verify pending batches. Canonical reports only for completed checks; retries are logged."""
+    results = []
+    for batch, digest, report_path, ref in v.pending():
+        report = v.verify(batch, digest, ref)
+        report["code_version"] = code_version
+        if report["status"] == "retry":
+            path = report_path.replace("verification/", "verification/attempts/", 1)
+            path = path[: -len(".json")] + f"/{run_id}.json"
+            message = f"verify {batch}: retry later ({len(report['transient_errors'])} transient errors)"
+        else:
+            path = report_path
+            message = f"verify {batch} ({'ok' if report['ok'] else 'FAILED'})"
+        sink.commit({path: json.dumps(report, indent=1, default=str).encode()}, message)
+        results.append({"batch": batch, "status": report["status"], "failures": len(report["failures"]),
+                        "transient_errors": len(report["transient_errors"]), "report": path})
+    return results
+
+
 def main() -> int:
     local = os.environ.get("VERIFY_LOCAL_DIR")
     repo, token = os.environ.get("DATA_REPO"), os.environ.get("GITHUB_TOKEN")
@@ -325,16 +375,15 @@ def main() -> int:
         return 2
     clock = RealClock()
     v = Verifier(sink, Net(urllib_transport, clock), clock)
-    todo = v.pending()
-    results = []
-    for batch, digest, report_path in todo:
-        report = v.verify(batch, digest)
-        report["code_version"] = os.environ.get("RENDER_GIT_COMMIT")
-        sink.commit({report_path: json.dumps(report, indent=1, default=str).encode()},
-                    f"verify {batch} ({'ok' if report['ok'] else 'FAILED'})")
-        results.append({"batch": batch, "ok": report["ok"], "failures": len(report["failures"])})
-    print(json.dumps({"checked": results, "pending_seen": len(todo)}))
-    return 0 if all(r["ok"] for r in results) else 1
+    run_id = f"{clock.now():%Y%m%dT%H%M%SZ}"
+    try:
+        results = run_once(v, sink, run_id, os.environ.get("RENDER_GIT_COMMIT"))
+    except Exception as exc:  # e.g. GitHub unreachable during discovery: nothing written, retry next hour
+        print(json.dumps({"error": f"{type(exc).__name__}: {exc}"}))
+        return 1
+    print(json.dumps({"checked": results}))
+    # Confirmed failures and retries both exit nonzero so they show in Render's history.
+    return 0 if all(r["status"] == "ok" for r in results) else 1
 
 
 if __name__ == "__main__":

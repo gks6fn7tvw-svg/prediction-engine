@@ -18,7 +18,7 @@ import numpy as np
 from recorder.store import LocalSink
 from tests.helpers import FakeClock
 from verify.check_history import check_batch
-from verify.refetch import Net, Verifier, idx_entry, nearest_value
+from verify.refetch import Net, Verifier, idx_entry, nearest_value, run_once
 
 FIXTURE = Path(__file__).parent / "fixtures"
 BATCH = "history/development/2026-09-11"
@@ -35,6 +35,7 @@ class FakeWorld:
         self.objects = {}   # s3 key -> {"bytes": b, "last_modified": dt, "etag": str}
         self.kalshi = {}    # url -> bytes
         self.calls = []
+        self.kalshi_503s = 0  # answer this many Kalshi requests with HTTP 503 first
         self._build()
 
     def _rewrite(self, rel, data):
@@ -88,6 +89,9 @@ class FakeWorld:
         self.calls.append(url)
         u = urlparse(url)
         if u.netloc == "external-api.kalshi.com":
+            if self.kalshi_503s > 0:
+                self.kalshi_503s -= 1
+                return 503, {}, b"unavailable"
             return (200, {}, self.kalshi[url]) if url in self.kalshi else (404, {}, b"")
         if u.netloc.endswith(".s3.amazonaws.com"):
             q = parse_qs(u.query)
@@ -127,8 +131,8 @@ class RefetchTests(unittest.TestCase):
     def run_one(self):
         todo = self.v.pending()
         self.assertEqual(len(todo), 1)
-        batch, digest, path = todo[0]
-        return self.v.verify(batch, digest), path
+        batch, digest, path, ref = todo[0]
+        return self.v.verify(batch, digest, ref), path
 
     def test_matching_sources_pass_and_report_is_keyed_by_manifest(self):
         self.assertEqual(check_batch(self.root, BATCH).failures, [])  # rewritten fixture is still valid
@@ -207,11 +211,81 @@ class RefetchTests(unittest.TestCase):
         report, _ = self.run_one()
         self.assertTrue(any(f.startswith("DEN") and "candles" in f for f in report["failures"]))
 
-    def test_unreachable_source_is_a_failure_not_a_crash(self):
-        self.world.kalshi.clear()
+    def test_missing_source_is_a_confirmed_failure_not_a_crash(self):
+        self.world.kalshi.clear()  # HTTP 404: the source answered, the data isn't there
         report, _ = self.run_one()
-        self.assertFalse(report["ok"])
+        self.assertEqual(report["status"], "failed")
         self.assertTrue(any("Kalshi re-fetch error" in f for f in report["failures"]))
+
+    # --- found in ChatGPT #9 ---
+
+    def test_branch_moving_after_discovery_is_never_certified(self):
+        """LocalSink can't pin a commit, which makes it the worst case: the guard must catch it."""
+        batch, digest, path, ref = self.v.pending()[0]
+        man = self.root / BATCH / "manifest.json"
+        man.write_bytes(man.read_bytes() + b"\n")  # the branch moves between discovery and download
+        report = self.v.verify(batch, digest, ref)
+        self.assertEqual(report["status"], "retry")
+        self.assertTrue(any("expected " + digest in e for e in report["transient_errors"]))
+        self.assertEqual(report["cities"], {})  # nothing was checked under the wrong manifest
+
+    def test_pinned_snapshot_is_verified_even_if_the_branch_moves(self):
+        sink = SnapshotSink(self.root)
+        v = Verifier(sink, Net(self.world, self.clock), self.clock, rng_seed=7)
+        batch, digest, path, ref = v.pending()[0]
+        sink.move_branch(lambda files: files.__setitem__(
+            f"{BATCH}/manifest.json", files[f"{BATCH}/manifest.json"] + b"\n"))
+        report = v.verify(batch, digest, ref)
+        self.assertEqual(report["status"], "ok")
+        self.assertEqual(report["data_commit"], ref)
+        # The moved manifest is a different batch version, so it is pending on its own.
+        self.assertNotEqual(v.pending()[0][1], digest)
+
+    def test_outage_then_recovery_keeps_the_batch_pending_until_verified(self):
+        self.world.kalshi_503s = 3  # every try of the first Kalshi request fails
+        first = run_once(self.v, self.sink, "run1")
+        self.assertEqual([r["status"] for r in first], ["retry"])
+        self.assertTrue(first[0]["report"].startswith("verification/attempts/development/2026-09-11/"))
+        self.assertIsNotNone(self.sink.read(first[0]["report"]))   # the outage is on record...
+        self.assertEqual(len(self.v.pending()), 1)                  # ...and the batch is still queued
+        self.assertFalse(any(p.startswith("verification/development/")
+                             for p in self.sink.list_files("verification/")))
+        second = run_once(self.v, self.sink, "run2")               # upstream recovered
+        self.assertEqual([r["status"] for r in second], ["ok"])
+        self.assertTrue(second[0]["report"].startswith("verification/development/2026-09-11/"))
+        self.assertEqual(self.v.pending(), [])
+
+
+class SnapshotSink:
+    """A data repo with real commit snapshots: reads at a ref see that commit only."""
+
+    def __init__(self, root: Path):
+        files = {p.relative_to(root).as_posix(): p.read_bytes() for p in root.rglob("*") if p.is_file()}
+        self.commits = {"c1": files}
+        self.branch = "c1"
+
+    def head(self):
+        return self.branch
+
+    def _files(self, ref):
+        return self.commits[ref or self.branch]
+
+    def read(self, path, ref=None):
+        return self._files(ref).get(path)
+
+    def list_files(self, prefix="", ref=None):
+        return sorted(p for p in self._files(ref) if p.startswith(prefix))
+
+    def move_branch(self, change):
+        files = dict(self.commits[self.branch])
+        change(files)
+        new = f"c{len(self.commits) + 1}"
+        self.commits[new] = files
+        self.branch = new
+
+    def commit(self, files, message):
+        self.move_branch(lambda f: f.update(files))
+        return self.branch
 
 
 class HoldoutNotesTests(unittest.TestCase):

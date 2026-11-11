@@ -109,18 +109,71 @@ def check_forecast(r: Report, city, target: date, nbm: dict, p: str):
 
 STAGED_RE = "staging/holdout/{date}"
 
+# Exact schema of a forecast file. Anything extra (e.g. an outcome field) is a failure.
+FORECAST_KEYS = {"city", "station", "latitude", "longitude", "cycle_utc", "cutoff_utc", "sampling", "units", "hours"}
+HOUR_KEYS = {"valid_time_utc", "temperature_c", "source"}
+SOURCE_KEYS = {"s3_key", "etag", "last_modified_utc", "s3_object_bytes", "range_start", "range_end_inclusive",
+               "message_bytes", "message_sha256", "index"}
+INDEX_KEYS = {"s3_key", "etag", "last_modified_utc", "bytes", "sha256"}
+STAGED_MANIFEST_KEYS = {"schema_version", "target_date", "nbm_bucket", "files", "missing"}
+
+
+def forecast_schema_problems(nbm) -> list[str]:
+    if not isinstance(nbm, dict):
+        return ["not a JSON object"]
+    out = []
+    if set(nbm) != FORECAST_KEYS:
+        out.append(f"top-level keys {sorted(set(nbm) ^ FORECAST_KEYS)} differ from the forecast schema")
+    hours = nbm.get("hours")
+    if not isinstance(hours, list):
+        return out + ["hours is not a list"]
+    for i, h in enumerate(hours):
+        if not isinstance(h, dict) or set(h) != HOUR_KEYS:
+            out.append(f"hour {i} keys differ from the schema")
+            continue
+        src = h["source"]
+        if not isinstance(src, dict) or set(src) != SOURCE_KEYS:
+            out.append(f"hour {i} source keys differ from the schema")
+        elif not isinstance(src["index"], dict) or set(src["index"]) != INDEX_KEYS:
+            out.append(f"hour {i} index keys differ from the schema")
+    return out
+
+
+def load_json(r: "Report", path: Path, what: str):
+    """Parse a JSON file, recording a failure (not raising) if it is missing or malformed."""
+    try:
+        return json.loads(path.read_bytes())
+    except FileNotFoundError:
+        r.check(False, f"{what}: file missing")
+    except (ValueError, UnicodeDecodeError) as exc:
+        r.check(False, f"{what}: malformed JSON ({exc})")
+    return None
+
 
 def check_staged(data_root: Path, batch_rel: str) -> Report:
     """A forecast-only holdout batch staged before registration: forecasts, nothing else."""
     r = Report()
     batch = data_root / batch_rel
-    manifest = json.loads((batch / "forecast-manifest.json").read_bytes())
-    target = date.fromisoformat(manifest["target_date"])
+    manifest = load_json(r, batch / "forecast-manifest.json", "forecast-manifest.json")
+    if not isinstance(manifest, dict):
+        r.check(manifest is None, "forecast-manifest.json is not a JSON object")
+        return r
+    r.check(set(manifest) <= STAGED_MANIFEST_KEYS, f"forecast-manifest has unexpected keys "
+            f"{sorted(set(manifest) - STAGED_MANIFEST_KEYS)}")
+    try:
+        target = date.fromisoformat(manifest["target_date"])
+    except (KeyError, TypeError, ValueError):
+        r.check(False, "forecast-manifest target_date missing or invalid")
+        return r
     r.check(batch_rel.rstrip("/") == STAGED_RE.format(date=target.isoformat()), "staged folder does not match its date")
     r.check(HOLDOUT_START <= target <= HOLDOUT_END, f"staged date {target} is outside the holdout")
     listed = manifest.get("files", {})
     for rel, meta in listed.items():
-        data = (batch / rel).read_bytes()
+        try:
+            data = (batch / rel).read_bytes()
+        except FileNotFoundError:
+            r.check(False, f"{rel}: listed in the manifest but missing")
+            continue
         r.check(len(data) == meta["bytes"] and hashlib.sha256(data).hexdigest() == meta["sha256"],
                 f"{rel}: bytes or sha256 differ from manifest")
     on_disk = {q.relative_to(batch).as_posix() for q in batch.rglob("*") if q.is_file()} - {"forecast-manifest.json"}
@@ -133,8 +186,19 @@ def check_staged(data_root: Path, batch_rel: str) -> Report:
         reason = (manifest.get("missing") or {}).get(rel.split("/")[0])
         r.check(bool(reason), f"{rel} missing without a reason")
     for key, city in BY_KEY.items():
-        if f"{key}/nbm.json" in listed:
-            check_forecast(r, city, target, json.loads((batch / key / "nbm.json").read_bytes()), f"{key}:")
+        if f"{key}/nbm.json" not in listed:
+            continue
+        nbm = load_json(r, batch / key / "nbm.json", f"{key}/nbm.json")
+        if nbm is None:
+            continue
+        problems = forecast_schema_problems(nbm)
+        r.check(not problems, f"{key}: not forecast-only: {problems[:3]}")
+        if problems:
+            continue
+        try:
+            check_forecast(r, city, target, nbm, f"{key}:")
+        except (KeyError, TypeError, ValueError) as exc:
+            r.check(False, f"{key}: malformed forecast ({type(exc).__name__}: {exc})")
     return r
 
 
@@ -256,9 +320,15 @@ def check_batch(data_root: Path, batch_rel: str) -> Report:
         if in_holdout:
             staged = data_root / "staging" / "holdout" / target.isoformat() / "forecast-manifest.json"
             if staged.exists():
-                want = json.loads(staged.read_bytes())["files"].get(f"{key}/nbm.json", {}).get("sha256")
-                got = hashlib.sha256((batch / key / "nbm.json").read_bytes()).hexdigest()
-                r.check(want == got, f"{p} holdout forecast differs from the staged forecast")
+                listed_sha = json.loads(staged.read_bytes())["files"].get(f"{key}/nbm.json", {}).get("sha256")
+                staged_file = staged.parent / key / "nbm.json"
+                staged_sha = hashlib.sha256(staged_file.read_bytes()).hexdigest() if staged_file.exists() else None
+                final_sha = hashlib.sha256((batch / key / "nbm.json").read_bytes()).hexdigest()
+                # The staged file must match its own manifest, and the final file must match those bytes.
+                r.check(staged_sha is not None and staged_sha == listed_sha,
+                        f"{p} staged forecast file does not match the staged manifest")
+                r.check(staged_sha is not None and final_sha == staged_sha,
+                        f"{p} holdout forecast differs from the staged forecast")
             else:
                 r.check(False, f"{p} no staged forecast for this holdout date")
         hourly_max_f = max(hr["temperature_c"] for hr in nbm["hours"]) * 9 / 5 + 32

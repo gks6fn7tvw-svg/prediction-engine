@@ -223,6 +223,55 @@ class StagedCheckTests(unittest.TestCase):
         self.assertTrue(any("DEN: objects published after the cutoff" in f
                             for f in check_staged(self.root, STAGED).failures))
 
+    # --- found in ChatGPT #14 ---
+
+    def rewrite(self, rel, fn):
+        path = self.batch / rel
+        n = json.loads(path.read_bytes())
+        fn(n)
+        raw = json.dumps(n).encode()
+        path.write_bytes(raw)
+        self.manifest(lambda m: m["files"].update({rel: {"bytes": len(raw), "sha256": hashlib.sha256(raw).hexdigest()}}))
+
+    def test_extra_outcome_field_inside_a_valid_forecast_is_rejected(self):
+        self.rewrite("NY/nbm.json", lambda n: n.update(settled_high_f=71))
+        self.assertTrue(any("NY: not forecast-only" in f for f in check_staged(self.root, STAGED).failures))
+
+    def test_extra_field_deep_inside_an_hour_is_rejected(self):
+        self.rewrite("MIA/nbm.json", lambda n: n["hours"][5]["source"]["index"].update(result="yes"))
+        self.assertTrue(any("MIA: not forecast-only" in f for f in check_staged(self.root, STAGED).failures))
+
+    def test_malformed_or_missing_forecast_is_a_failure_not_a_crash(self):
+        bad = b"{not json"
+        (self.batch / "CHI" / "nbm.json").write_bytes(bad)
+        self.manifest(lambda m: m["files"].update({"CHI/nbm.json": {
+            "bytes": len(bad), "sha256": hashlib.sha256(bad).hexdigest()}}))
+        (self.batch / "DEN" / "nbm.json").unlink()
+        fails = check_staged(self.root, STAGED).failures
+        self.assertTrue(any("CHI/nbm.json: malformed JSON" in f for f in fails))
+        self.assertTrue(any("DEN/nbm.json: listed in the manifest but missing" in f for f in fails))
+
+    def test_malformed_manifest_is_a_failure_not_a_crash(self):
+        (self.batch / "forecast-manifest.json").write_bytes(b"[]")
+        self.assertTrue(check_staged(self.root, STAGED).failures)
+
+    def test_final_reuse_checks_the_staged_bytes_not_just_the_manifest_digest(self):
+        final = self.root / "history/holdout/2026-10-01"
+        shutil.copytree(FIXTURE / BATCH, final)
+        man = json.loads((final / "manifest.json").read_bytes())
+        man.update(target_date="2026-10-01", partition="holdout")
+        (final / "manifest.json").write_bytes(json.dumps(man).encode())
+        for key in ("NY", "MIA", "CHI", "DEN", "LAX"):
+            shutil.copy(self.batch / key / "nbm.json", final / key / "nbm.json")
+        # Change the final NY forecast, then forge the staged MANIFEST digest to match it,
+        # leaving the staged FILE as it was (ChatGPT's reproduction).
+        (final / "NY" / "nbm.json").write_bytes((final / "NY" / "nbm.json").read_bytes() + b" ")
+        forged = hashlib.sha256((final / "NY" / "nbm.json").read_bytes()).hexdigest()
+        self.manifest(lambda m: m["files"]["NY/nbm.json"].update(sha256=forged))
+        fails = check_batch(self.root, "history/holdout/2026-10-01").failures
+        self.assertTrue(any("NY: staged forecast file does not match the staged manifest" in f for f in fails))
+        self.assertTrue(any("NY: holdout forecast differs from the staged forecast" in f for f in fails))
+
     def test_final_holdout_batch_must_reuse_the_staged_forecast_exactly(self):
         # A minimal stand-in for the final holdout batch: only the forecast matters here.
         final = self.root / "history/holdout/2026-10-01"

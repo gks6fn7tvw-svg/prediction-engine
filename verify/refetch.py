@@ -95,9 +95,15 @@ class Net:
     def __init__(self, transport, clock):
         self.transport, self.clock = transport, clock
         self.last_request = {}  # host -> monotonic time of the previous request
+        self.cooldown_until = {}  # host -> monotonic time before which it asked us not to call
 
     def _pace(self, url):
         host = url.split("/")[2] if "://" in url else ""
+        wait = self.cooldown_until.get(host, 0.0) - self.clock.monotonic()
+        if wait > MAX_RETRY_AFTER:
+            raise TransientError(f"GET {url}: {host} asked us to wait {wait:.0f}s more; leaving it pending")
+        if wait > 0:
+            self.clock.sleep(wait)
         gap = MIN_INTERVAL.get(host, 0.0)
         if gap and host in self.last_request:
             wait = self.last_request[host] + gap - self.clock.monotonic()
@@ -109,7 +115,7 @@ class Net:
         last = None
         for attempt in range(1, tries + 1):
             self._pace(url)
-            wait = None
+            cooled = False  # True when the server set a host cooldown that _pace will honour
             try:
                 status, hdrs, body = self.transport(
                     "GET", url, {"User-Agent": USER_AGENT, **(headers or {})}, None, 60)
@@ -122,12 +128,18 @@ class Net:
                 if not retryable(status):
                     raise SourceError(f"GET {url} failed: {last}")
                 wait = retry_after_seconds(hdrs, self.clock.now())
-                if wait is not None and wait > MAX_RETRY_AFTER:
-                    # Asked to wait longer than this run should: leave it pending for a later run.
-                    raise TransientError(f"GET {url}: {last}, Retry-After {wait:.0f}s exceeds the "
-                                         f"{MAX_RETRY_AFTER}s per-run budget")
-            if attempt < tries:
-                self.clock.sleep(wait if wait is not None else BACKOFF[min(attempt, len(BACKOFF)) - 1])
+                if wait is not None:  # the whole host is cooling down, not just this URL
+                    host = url.split("/")[2] if "://" in url else ""
+                    self.cooldown_until[host] = max(self.cooldown_until.get(host, 0.0),
+                                                    self.clock.monotonic() + wait)
+                    remaining = self.cooldown_until[host] - self.clock.monotonic()
+                    if remaining > MAX_RETRY_AFTER:
+                        # Asked to wait longer than this run should: leave it pending for a later run.
+                        raise TransientError(f"GET {url}: {last}, Retry-After {remaining:.0f}s exceeds the "
+                                             f"{MAX_RETRY_AFTER}s per-run budget")
+                    cooled = True
+            if attempt < tries and not cooled:
+                self.clock.sleep(BACKOFF[min(attempt, len(BACKOFF)) - 1])
         raise TransientError(f"GET {url} failed after {tries} tries: {last}")
 
 

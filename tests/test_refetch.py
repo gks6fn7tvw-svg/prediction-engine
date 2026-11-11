@@ -420,6 +420,25 @@ class PacingTests(unittest.TestCase):
         self.assertFalse(any(s >= 120 for s in self.clock.sleeps))
         self.assertEqual(len(self.calls), 1)  # no early retry
 
+    def test_cooldown_applies_to_other_paths_on_the_same_host(self):
+        """ChatGPT #14: a 429 asking for 180 s still let a different path go one second later."""
+        net = self.net([(429, {"Retry-After": "180"}, b"")])
+        with self.assertRaises(TransientError):
+            net.get("https://external-api.kalshi.com/trade-api/v2/markets?event_ticker=A")
+        with self.assertRaises(TransientError):  # different path, same host: no request at all
+            net.get("https://external-api.kalshi.com/trade-api/v2/markets/candlesticks?x=1")
+        self.assertEqual(len(self.calls), 1)
+        net.get("https://noaa-nbm-grib2-pds.s3.amazonaws.com/a")  # other hosts are unaffected
+        self.assertEqual(len(self.calls), 2)
+
+    def test_short_cooldown_is_waited_out_once(self):
+        net = self.net([(429, {"Retry-After": "20"}, b""), (200, {}, b"ok"), (200, {}, b"ok")])
+        net.get("https://external-api.kalshi.com/a")
+        net.get("https://external-api.kalshi.com/b")
+        self.assertEqual(len(self.calls), 3)
+        self.assertGreaterEqual(self.calls[1] - self.calls[0], 20)
+        self.assertEqual(sum(1 for s in self.clock.sleeps if s >= 19), 1)
+
     def test_retry_after_as_http_date(self):
         when = self.clock.now() + timedelta(seconds=30)
         net = self.net([(503, {"Retry-After": when.strftime("%a, %d %b %Y %H:%M:%S GMT")}, b""),

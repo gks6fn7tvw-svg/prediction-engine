@@ -79,6 +79,65 @@ def in_range(market: dict, value: Decimal) -> bool:
     raise ValueError(f"unknown strike_type {kind}")
 
 
+def check_forecast(r: Report, city, target: date, nbm: dict, p: str):
+    """Provenance checks for one city's forecast file, shared by full and staged batches."""
+    cut = cutoff_utc(city, target - timedelta(days=1))
+    start, _ = climate_day_utc(city, target)
+    r.check(nbm.get("city") == city.key and nbm.get("station") == city.station, f"{p} forecast is for another city")
+    cycle = _utc(nbm["cycle_utc"])
+    r.check(cycle < cut, f"{p} NBM cycle {cycle} not before cutoff")
+    r.check(_utc(nbm["cutoff_utc"]) == cut, f"{p} nbm.json cutoff differs")
+    r.check(abs(nbm["latitude"] - city.lat) < 1e-3 and abs(nbm["longitude"] - city.lon) < 1e-3,
+            f"{p} NBM point is not the station")
+    expected = [start + timedelta(hours=i) for i in range(24)]
+    got = [_utc(hr["valid_time_utc"]) for hr in nbm["hours"]]
+    r.check(got == expected, f"{p} forecast hours do not exactly cover the climate day")
+    late = []
+    for hr in nbm["hours"]:
+        s = hr["source"]
+        for when, label in ((s["last_modified_utc"], "grib"), (s["index"]["last_modified_utc"], "idx")):
+            if _utc(when) > cut:
+                late.append(f"{label} {s['s3_key']}")
+        fh = int((_utc(hr["valid_time_utc"]) - cycle).total_seconds() // 3600)
+        r.check(s["s3_key"] == f"blend.{cycle:%Y%m%d}/{cycle:%H}/core/blend.t{cycle:%H}z.core.f{fh:03d}.co.grib2",
+                f"{p} S3 key does not match cycle and forecast hour: {s['s3_key']}")
+        r.check(s["range_end_inclusive"] - s["range_start"] + 1 == s["message_bytes"], f"{p} byte range length")
+        r.check(-60 < hr["temperature_c"] < 60, f"{p} implausible temperature {hr['temperature_c']}")
+    r.check(not late, f"{p} objects published after the cutoff: {late[:3]}")
+    r.check(nbm.get("units") == "C", f"{p} units {nbm.get('units')}")
+
+
+STAGED_RE = "staging/holdout/{date}"
+
+
+def check_staged(data_root: Path, batch_rel: str) -> Report:
+    """A forecast-only holdout batch staged before registration: forecasts, nothing else."""
+    r = Report()
+    batch = data_root / batch_rel
+    manifest = json.loads((batch / "forecast-manifest.json").read_bytes())
+    target = date.fromisoformat(manifest["target_date"])
+    r.check(batch_rel.rstrip("/") == STAGED_RE.format(date=target.isoformat()), "staged folder does not match its date")
+    r.check(HOLDOUT_START <= target <= HOLDOUT_END, f"staged date {target} is outside the holdout")
+    listed = manifest.get("files", {})
+    for rel, meta in listed.items():
+        data = (batch / rel).read_bytes()
+        r.check(len(data) == meta["bytes"] and hashlib.sha256(data).hexdigest() == meta["sha256"],
+                f"{rel}: bytes or sha256 differ from manifest")
+    on_disk = {q.relative_to(batch).as_posix() for q in batch.rglob("*") if q.is_file()} - {"forecast-manifest.json"}
+    r.check(on_disk == set(listed), f"files on disk differ from manifest: {sorted(on_disk ^ set(listed))}")
+    # Sealed: forecasts only. No Kalshi data, prices or outcomes may be staged.
+    allowed = {f"{k}/nbm.json" for k in BY_KEY}
+    r.check(set(listed) <= allowed, f"staged batch holds more than forecasts: {sorted(set(listed) - allowed)}")
+    missing = allowed - set(listed)
+    for rel in sorted(missing):
+        reason = (manifest.get("missing") or {}).get(rel.split("/")[0])
+        r.check(bool(reason), f"{rel} missing without a reason")
+    for key, city in BY_KEY.items():
+        if f"{key}/nbm.json" in listed:
+            check_forecast(r, city, target, json.loads((batch / key / "nbm.json").read_bytes()), f"{key}:")
+    return r
+
+
 def check_batch(data_root: Path, batch_rel: str) -> Report:
     r = Report()
     batch = data_root / batch_rel
@@ -192,27 +251,16 @@ def check_batch(data_root: Path, batch_rel: str) -> Report:
 
         # 6. Forecast: every object public before the cutoff, hours cover the climate day.
         nbm = json.loads((batch / key / "nbm.json").read_bytes())
-        cycle = _utc(nbm["cycle_utc"])
-        r.check(cycle < cut, f"{p} NBM cycle {cycle} not before cutoff")
-        r.check(_utc(nbm["cutoff_utc"]) == cut, f"{p} nbm.json cutoff differs")
-        r.check(abs(nbm["latitude"] - city.lat) < 1e-3 and abs(nbm["longitude"] - city.lon) < 1e-3,
-                f"{p} NBM point is not the station")
-        expected = [start + timedelta(hours=i) for i in range(24)]
-        got = [_utc(hr["valid_time_utc"]) for hr in nbm["hours"]]
-        r.check(got == expected, f"{p} forecast hours do not exactly cover the climate day")
-        late = []
-        for hr in nbm["hours"]:
-            s = hr["source"]
-            for when, label in ((s["last_modified_utc"], "grib"), (s["index"]["last_modified_utc"], "idx")):
-                if _utc(when) > cut:
-                    late.append(f"{label} {s['s3_key']}")
-            fh = int((_utc(hr["valid_time_utc"]) - cycle).total_seconds() // 3600)
-            r.check(s["s3_key"] == f"blend.{cycle:%Y%m%d}/{cycle:%H}/core/blend.t{cycle:%H}z.core.f{fh:03d}.co.grib2",
-                    f"{p} S3 key does not match cycle and forecast hour: {s['s3_key']}")
-            r.check(s["range_end_inclusive"] - s["range_start"] + 1 == s["message_bytes"], f"{p} byte range length")
-            r.check(-60 < hr["temperature_c"] < 60, f"{p} implausible temperature {hr['temperature_c']}")
-        r.check(not late, f"{p} objects published after the cutoff: {late[:3]}")
-        r.check(nbm.get("units") == "C", f"{p} units {nbm.get('units')}")
+        check_forecast(r, city, target, nbm, p)
+        # Holdout: the forecast must be byte-identical to the version staged before registration.
+        if in_holdout:
+            staged = data_root / "staging" / "holdout" / target.isoformat() / "forecast-manifest.json"
+            if staged.exists():
+                want = json.loads(staged.read_bytes())["files"].get(f"{key}/nbm.json", {}).get("sha256")
+                got = hashlib.sha256((batch / key / "nbm.json").read_bytes()).hexdigest()
+                r.check(want == got, f"{p} holdout forecast differs from the staged forecast")
+            else:
+                r.check(False, f"{p} no staged forecast for this holdout date")
         hourly_max_f = max(hr["temperature_c"] for hr in nbm["hours"]) * 9 / 5 + 32
         # Never note forecast-vs-outcome on holdout dates: that would leak model performance
         # to whoever builds the model before the holdout is scored.
@@ -225,7 +273,8 @@ def main() -> int:
     if len(sys.argv) != 3:
         print(__doc__, file=sys.stderr)
         return 2
-    rep = check_batch(Path(sys.argv[1]), sys.argv[2])
+    staged = sys.argv[2].rstrip("/").startswith("staging/")
+    rep = (check_staged if staged else check_batch)(Path(sys.argv[1]), sys.argv[2])
     print(json.dumps({"batch": sys.argv[2], "passed_checks": rep.passed, "failures": rep.failures,
                       "primary_complete": rep.primary, "inclusive_complete": rep.inclusive,
                       "notes": rep.notes}, indent=1))

@@ -53,27 +53,31 @@ class FakeWorld:
                 self.kalshi[src["url"]] = (self.batch / src["path"]).read_bytes()
             nbm_rel = info["forecast_path"]
             nbm = json.loads((self.batch / nbm_rel).read_bytes())
-            for h in nbm["hours"]:
-                s = h["source"]
-                # One GRIB message holds the whole CONUS field, so cities sharing a cycle share it.
-                msg = f"GRIB-{s['s3_key']}@{s['range_start']}".encode()
-                start = s["range_start"]
-                s["range_end_inclusive"] = start + len(msg) - 1
-                s["message_bytes"] = len(msg)
-                s["message_sha256"] = hashlib.sha256(msg).hexdigest()
-                idx = (f"1:0:d=x:UGRD:10 m above ground:f:\n"
-                       f"2:{start}:d=x:TMP:2 m above ground:f:\n"
-                       f"3:{start + len(msg)}:d=x:DPT:2 m above ground:f:\n").encode()
-                s["index"]["bytes"], s["index"]["sha256"] = len(idx), hashlib.sha256(idx).hexdigest()
-                # The GRIB object is sparse: only the message at its byte range is stored.
-                obj = self.objects.setdefault(s["s3_key"], {
-                    "chunks": {}, "size": s["s3_object_bytes"],
-                    "last_modified": _utc(s["last_modified_utc"]), "etag": s["etag"]})
-                obj["chunks"][start] = msg
-                self.objects[s["index"]["s3_key"]] = {
-                    "bytes": idx, "size": len(idx), "last_modified": _utc(s["index"]["last_modified_utc"]),
-                    "etag": s["index"]["etag"]}
+            self.stage_hours(nbm)
             self._rewrite(nbm_rel, nbm)
+
+    def stage_hours(self, nbm):
+        """Give each forecast hour synthetic GRIB/index bytes and register them in fake S3."""
+        for h in nbm["hours"]:
+            s = h["source"]
+            # One GRIB message holds the whole CONUS field, so cities sharing a cycle share it.
+            msg = f"GRIB-{s['s3_key']}@{s['range_start']}".encode()
+            start = s["range_start"]
+            s["range_end_inclusive"] = start + len(msg) - 1
+            s["message_bytes"] = len(msg)
+            s["message_sha256"] = hashlib.sha256(msg).hexdigest()
+            idx = (f"1:0:d=x:UGRD:10 m above ground:f:\n"
+                   f"2:{start}:d=x:TMP:2 m above ground:f:\n"
+                   f"3:{start + len(msg)}:d=x:DPT:2 m above ground:f:\n").encode()
+            s["index"]["bytes"], s["index"]["sha256"] = len(idx), hashlib.sha256(idx).hexdigest()
+            # The GRIB object is sparse: only the message at its byte range is stored.
+            obj = self.objects.setdefault(s["s3_key"], {
+                "chunks": {}, "size": s["s3_object_bytes"],
+                "last_modified": _utc(s["last_modified_utc"]), "etag": s["etag"]})
+            obj["chunks"][start] = msg
+            self.objects[s["index"]["s3_key"]] = {
+                "bytes": idx, "size": len(idx), "last_modified": _utc(s["index"]["last_modified_utc"]),
+                "etag": s["index"]["etag"]}
 
     def add_later_cycle(self, key: str, published: datetime):
         """Publish a complete later cycle for one city, every file at `published`."""
@@ -288,6 +292,42 @@ class SnapshotSink:
         return self.branch
 
 
+class StagedRefetchTests(unittest.TestCase):
+    """Forecast-only holdout batches: NOAA re-fetch only, never a Kalshi request."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        shutil.copytree(FIXTURE / "staging", self.root / "staging")
+        self.world = FakeWorld.__new__(FakeWorld)
+        self.world.root, self.world.objects, self.world.kalshi, self.world.calls = self.root, {}, {}, []
+        self.world.kalshi_503s = 0
+        self.world.batch = self.root / "staging/holdout/2026-10-01"
+        man_path = self.world.batch / "forecast-manifest.json"
+        man = json.loads(man_path.read_bytes())
+        for rel in man["files"]:
+            nbm = json.loads((self.world.batch / rel).read_bytes())
+            self.world.stage_hours(nbm)
+            raw = json.dumps(nbm).encode()
+            (self.world.batch / rel).write_bytes(raw)
+            man["files"][rel] = {"bytes": len(raw), "sha256": hashlib.sha256(raw).hexdigest()}
+        man_path.write_bytes(json.dumps(man).encode())
+        self.clock = FakeClock(datetime(2026, 11, 11, 20, 25, tzinfo=timezone.utc))
+        self.sink = LocalSink(str(self.root))
+        self.v = Verifier(self.sink, Net(self.world, self.clock), self.clock, rng_seed=3)
+
+    def test_staged_batch_is_verified_without_touching_kalshi(self):
+        results = run_once(self.v, self.sink, "run1")
+        self.assertEqual([r["status"] for r in results], ["ok"])
+        self.assertTrue(results[0]["report"].startswith("verification/staging/holdout/2026-10-01/"))
+        report = json.loads(self.sink.read(results[0]["report"]))
+        self.assertEqual(sorted(report["cities"]), ["CHI", "DEN", "LAX", "MIA", "NY"])
+        self.assertTrue(all(h["sha256_match"] for c in report["cities"].values() for h in c["sampled_hours"]))
+        self.assertFalse(any("kalshi" in u for u in self.world.calls))
+        self.assertEqual(self.v.pending(), [])
+
+
 class HoldoutNotesTests(unittest.TestCase):
     def test_holdout_batches_never_compare_forecast_with_outcome(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -373,10 +413,25 @@ class PacingTests(unittest.TestCase):
         self.assertEqual(net.get("https://external-api.kalshi.com/x")[2], b"ok")
         self.assertEqual([s for s in self.clock.sleeps if s >= 5], [5, 15, 45])
 
-    def test_absurd_retry_after_is_capped(self):
+    def test_retry_after_beyond_the_budget_leaves_it_pending_without_waiting(self):
         net = self.net([(429, {"retry-after": "100000"}, b""), (200, {}, b"ok")])
+        with self.assertRaises(TransientError):
+            net.get("https://external-api.kalshi.com/x")
+        self.assertFalse(any(s >= 120 for s in self.clock.sleeps))
+        self.assertEqual(len(self.calls), 1)  # no early retry
+
+    def test_retry_after_as_http_date(self):
+        when = self.clock.now() + timedelta(seconds=30)
+        net = self.net([(503, {"Retry-After": when.strftime("%a, %d %b %Y %H:%M:%S GMT")}, b""),
+                        (200, {}, b"ok")])
         net.get("https://external-api.kalshi.com/x")
-        self.assertIn(120.0, self.clock.sleeps)
+        self.assertIn(30.0, self.clock.sleeps)
+
+    def test_far_http_date_leaves_it_pending(self):
+        when = self.clock.now() + timedelta(hours=2)
+        net = self.net([(429, {"Retry-After": when.strftime("%a, %d %b %Y %H:%M:%S GMT")}, b"")])
+        with self.assertRaises(TransientError):
+            net.get("https://external-api.kalshi.com/x")
 
 
 class HelperTests(unittest.TestCase):

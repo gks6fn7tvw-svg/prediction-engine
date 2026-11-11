@@ -41,6 +41,13 @@ class FakeClock:
             self.advance(seconds)
 
 
+class ShortSleepClock(FakeClock):
+    """A clock whose sleeps return early, to prove waits are re-checked rather than trusted."""
+
+    def sleep(self, seconds):
+        super().sleep(seconds / 2 if seconds > 0.001 else seconds)
+
+
 class Replay:
     """Answers Kalshi and NWS URLs from files captured on 2026-11-10."""
 
@@ -50,9 +57,10 @@ class Replay:
         self.settlement = {}   # event ticker -> list of market dicts to return
         self.cli_override = {}  # cli id -> bytes
         self.broken = set()    # substrings; any URL containing one fails with 503
+        self.latency_for = {}  # substring -> seconds this kind of request takes to answer
 
     def __call__(self, method, url, headers, body, timeout):
-        self.clock.advance(self.latency)
+        self.clock.advance(next((s for k, s in self.latency_for.items() if k in url), self.latency))
         self.calls.append((self.clock.now(), url))
         if any(b in url for b in self.broken):
             return 503, {}, b"unavailable"

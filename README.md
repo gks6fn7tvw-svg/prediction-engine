@@ -49,9 +49,14 @@ only. The raw files are the record.
 
 ### Rules it follows
 
-- **The cutoff is real.** The books are requested at 6 p.m. local time and the
-  number of seconds late is recorded. A cutoff more than 20 minutes gone is
-  recorded as `missed`, never captured late and passed off as on time.
+- **The cutoff is real.** The books are requested at 6 p.m. local time, never
+  before. A capture counts only if the first order book *arrives* from the
+  cutoff through 10 minutes after it, both ends included (design v0.3). It is
+  judged on arrival, so a slow response cannot qualify just because its
+  request went out in time. Anything else is still saved, marked
+  `eligible: false` with a reason code (`late_first_book`, `early_first_book`,
+  `first_book_failed`, `no_markets`), and excluded from scoring. A cutoff more
+  than 20 minutes gone is not captured at all and is recorded as `missed`.
 - **Two different clocks.** The 6 p.m. cutoff follows daylight saving. The day
   the contract measures does not: it is midnight to midnight local *standard*
   time, so 1 a.m. to 1 a.m. on the clock in summer. Both are written to

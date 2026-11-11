@@ -32,7 +32,8 @@ from .schedule import climate_day_utc, cutoffs_between, due_cutoffs, event_ticke
 from .store import GitHubSink, LocalSink
 
 LEAD = timedelta(minutes=10)            # start preparing this long before a cutoff
-MAX_LATE = timedelta(minutes=20)        # past this, a cutoff is recorded as missed
+LATENESS_LIMIT = timedelta(minutes=10)  # design v0.3: first book must be RECEIVED by then
+MAX_LATE = timedelta(minutes=20)        # still captured (and flagged) up to here; then "missed"
 PRE_FETCH_MARGIN = timedelta(seconds=45)  # weather fetches not started by then are deferred
 RECHECK_SECONDS = 1.0
 FINAL_STATUSES = {"finalized", "settled"}
@@ -67,6 +68,23 @@ def best_quotes(orderbook_fp: dict) -> dict:
         "yes_ask": str(Decimal(1) - no[0]) if no else None,
         "yes_ask_size": str(no[1]) if no else None,
     }
+
+
+def first_book_verdict(cutoff: datetime, ok: bool, received: datetime) -> tuple[bool, str]:
+    """Cutoff eligibility (design v0.3), judged on when the first order book ARRIVED.
+
+    Eligible only if it was received from the cutoff through LATENESS_LIMIT after it,
+    both ends included. Judging on receipt means a slow response cannot qualify just
+    because its request was sent in time. Ineligible captures are still saved; they
+    stay in the coverage count and are excluded from confirmatory scoring.
+    """
+    if not ok:
+        return False, "first_book_failed"
+    if received < cutoff:
+        return False, "early_first_book"
+    if received > cutoff + LATENESS_LIMIT:
+        return False, "late_first_book"
+    return True, "on_time"
 
 
 def settlement_signature(markets: list) -> tuple[str, bool]:
@@ -195,27 +213,33 @@ class Recorder:
                 deferred.append((city, target))
 
         tickers = [t for info in rec["cities"].values() for t in info["tickers"]]
-        wait = (cutoff - self.clock.now()).total_seconds()
-        if wait > 0:
+        # Never request the book before the cutoff, even if a sleep returns early.
+        while (wait := (cutoff - self.clock.now()).total_seconds()) > 0:
             self.clock.sleep(wait)
 
-        books_ok = False
+        books_ok, eligible, reason = False, False, "no_markets"
         if tickers:
             url = f"{KALSHI_BASE}/markets/orderbooks?" + "&".join(
                 "tickers=" + quote(t, safe="") for t in tickers)
             b1, _ = self.get(url, "kalshi_books_1", f"{cdir}/books_1.json")
-            gap = b1.monotonic_received + RECHECK_SECONDS - self.clock.monotonic()
-            if gap > 0:
+            # At least one MEASURED second after the first book arrived.
+            while (gap := b1.monotonic_received + RECHECK_SECONDS - self.clock.monotonic()) > 0:
                 self.clock.sleep(gap)
             b2, _ = self.get(url, "kalshi_books_2", f"{cdir}/books_2.json")
             books_ok = b1.ok
+            eligible, reason = first_book_verdict(cutoff, b1.ok, b1.received)
             rec["books"] = {
                 "tickers_requested": len(tickers),
                 "first_requested_at": iso(b1.requested),
-                "lateness_seconds": round((b1.requested - cutoff).total_seconds(), 3),
+                "first_received_at": iso(b1.received),
+                "request_lateness_seconds": round((b1.requested - cutoff).total_seconds(), 6),
+                "receipt_lateness_seconds": round((b1.received - cutoff).total_seconds(), 6),
+                "lateness_limit_seconds": LATENESS_LIMIT.total_seconds(),
+                "eligible": eligible, "reason_code": reason,
                 "recheck_gap_seconds": round(b2.monotonic_requested - b1.monotonic_received, 6),
                 "first_ok": b1.ok, "recheck_ok": b2.ok,
-                "note": "one batch request per snapshot; not proof of an atomic exchange-wide snapshot",
+                "note": "eligibility is judged on first-book receipt time; one batch request "
+                        "per snapshot is not proof of an atomic exchange-wide snapshot",
             }
             self.guard("quotes", lambda: rec["books"].update(
                 quotes_first=self.quotes(b1), quotes_recheck=self.quotes(b2)))
@@ -228,9 +252,14 @@ class Recorder:
             info = rec["cities"][city.key]
             captured = bool(info["tickers"]) and books_ok
             info["status"] = "captured" if captured else "failed"
+            # A city with no markets found has no book of its own, whatever the batch did.
+            info["eligible"] = eligible and bool(info["tickers"])
+            info["reason_code"] = reason if info["tickers"] else "no_markets"
             self.state["cutoffs"].setdefault(city.key, {})[target.isoformat()] = {
-                "status": info["status"], "run_id": self.run_id, "cutoff_utc": iso(cutoff),
-                "lateness_seconds": rec.get("books", {}).get("lateness_seconds"),
+                "status": info["status"], "eligible": info["eligible"],
+                "reason_code": info["reason_code"],
+                "run_id": self.run_id, "cutoff_utc": iso(cutoff),
+                "receipt_lateness_seconds": rec.get("books", {}).get("receipt_lateness_seconds"),
             }
             if info["tickers"]:
                 self.state["events"].setdefault(info["event_ticker"], {
@@ -386,9 +415,14 @@ class Recorder:
         worth_saving = bool(self.files or self.run["cutoffs"] or self.run["missed"] or state_changed)
         failed = [c for rec in self.run["cutoffs"] for c, i in rec["cities"].items()
                   if i.get("status") != "captured"]
+        # Saved, but outside the cutoff rule (for example a late first book): not scoreable.
+        ineligible = {c: i.get("reason_code") for rec in self.run["cutoffs"]
+                      for c, i in rec["cities"].items()
+                      if i.get("status") == "captured" and not i.get("eligible")}
         summary = {
             "run_id": self.run_id, "files": len(self.files), "cutoffs": len(self.run["cutoffs"]),
-            "failed_captures": failed, "missed": len(self.run["missed"]),
+            "failed_captures": failed, "ineligible_captures": ineligible,
+            "missed": len(self.run["missed"]),
             "errors": len(self.run["errors"]), "commit": None,
         }
         if worth_saving:

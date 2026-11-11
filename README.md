@@ -55,7 +55,9 @@ only. The raw files are the record.
   judged on arrival, so a slow response cannot qualify just because its
   request went out in time. Anything else is still saved, marked
   `eligible: false` with a reason code (`late_first_book`, `early_first_book`,
-  `first_book_failed`, `no_markets`), and excluded from scoring. A cutoff more
+  `first_book_failed`, `missing_books`, `no_markets`), and excluded from
+  scoring. Each city is judged on its own books: if an on-time response
+  leaves out any of a city's ranges, that city is `missing_books`. A cutoff more
   than 20 minutes gone is not captured at all and is recorded as `missed`.
 - **Two different clocks.** The 6 p.m. cutoff follows daylight saving. The day
   the contract measures does not: it is midnight to midnight local *standard*

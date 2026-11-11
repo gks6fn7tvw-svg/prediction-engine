@@ -69,7 +69,7 @@ class CutoffCaptureTests(unittest.TestCase):
         self.assertEqual(books["tickers_requested"], 12)
         self.assertEqual(books["request_lateness_seconds"], 0.0)
         self.assertEqual(books["receipt_lateness_seconds"], 0.2)
-        self.assertEqual((books["eligible"], books["reason_code"]), (True, "on_time"))
+        self.assertEqual((books["timing_eligible"], books["timing_reason_code"]), (True, "on_time"))
         self.assertGreaterEqual(books["recheck_gap_seconds"], 1.0)
         first = json.loads(self.w.read(f"{self.base}/books_1.json"))
         self.assertEqual(len(first["orderbooks"]), 12)
@@ -125,7 +125,7 @@ class LateAndFailedTests(unittest.TestCase):
         self.assertFalse(rec_cut["started_before_cutoff"])
         self.assertGreater(rec_cut["books"]["request_lateness_seconds"], 300)
         # Five minutes late is inside the ten-minute limit, so it still counts.
-        self.assertEqual((rec_cut["books"]["eligible"], rec_cut["books"]["reason_code"]), (True, "on_time"))
+        self.assertEqual((rec_cut["books"]["timing_eligible"], rec_cut["books"]["timing_reason_code"]), (True, "on_time"))
         self.assertFalse(rec_cut["cities"]["NY"]["forecast"]["fetched_before_cutoff"])
 
     def test_missing_markets_is_a_recorded_failure_not_a_crash(self):
@@ -178,7 +178,7 @@ class CutoffRuleTests(unittest.TestCase):
         self.assertEqual(books["request_lateness_seconds"], 599.0)
         self.assertEqual(books["receipt_lateness_seconds"], 600.0)
         self.assertEqual(books["lateness_limit_seconds"], 600.0)
-        self.assertEqual((books["eligible"], books["reason_code"]), (True, "on_time"))
+        self.assertEqual((books["timing_eligible"], books["timing_reason_code"]), (True, "on_time"))
         self.assertTrue(cut["cities"]["NY"]["eligible"])
         self.assertTrue(w.state()["cutoffs"]["NY"]["2026-11-11"]["eligible"])
         self.assertEqual(summary["ineligible_captures"], {})
@@ -188,7 +188,7 @@ class CutoffRuleTests(unittest.TestCase):
         books = cut["books"]
         self.assertEqual(books["request_lateness_seconds"], 599.0)   # sent at +9:59
         self.assertEqual(books["receipt_lateness_seconds"], 601.0)   # arrived at +10:01
-        self.assertEqual((books["eligible"], books["reason_code"]), (False, "late_first_book"))
+        self.assertEqual((books["timing_eligible"], books["timing_reason_code"]), (False, "late_first_book"))
         # Saved in full...
         base = f"{rec.base}/{CUTOFF_DIR}"
         self.assertEqual(len(json.loads(w.read(f"{base}/books_1.json"))["orderbooks"]), 6)
@@ -207,7 +207,7 @@ class CutoffRuleTests(unittest.TestCase):
     def test_one_microsecond_past_the_limit_is_late(self):
         _, _, _, cut = self.capture(request_offset=599, book_latency=1.000001)
         self.assertEqual(cut["books"]["receipt_lateness_seconds"], 600.000001)
-        self.assertEqual((cut["books"]["eligible"], cut["books"]["reason_code"]),
+        self.assertEqual((cut["books"]["timing_eligible"], cut["books"]["timing_reason_code"]),
                          (False, "late_first_book"))
 
     def test_a_late_capture_is_not_retried_or_double_counted(self):
@@ -243,7 +243,72 @@ class CutoffRuleTests(unittest.TestCase):
         self.assertGreaterEqual(books["request_lateness_seconds"], 0.0)  # never before the cutoff
         self.assertLess(books["request_lateness_seconds"], 0.01)
         self.assertGreaterEqual(books["recheck_gap_seconds"], 1.0)        # a full measured second
-        self.assertTrue(books["eligible"])
+        self.assertTrue(books["timing_eligible"])
+
+
+class MissingBooksTests(unittest.TestCase):
+    """Regression (found in review): an on-time HTTP 200 batch that omits one city's
+    books must not mark that city eligible."""
+
+    def setUp(self):
+        self.w = World(datetime(2026, 11, 10, 22, 52, tzinfo=UTC))
+        self.addCleanup(self.w.tmp.cleanup)
+
+    def test_200_response_with_ny_books_but_no_miami_books(self):
+        self.w.replay.drop_books.add("KXHIGHMIA-")
+        rec, summary = self.w.run_at()
+        cut = rec.run["cutoffs"][0]
+        ny, mia = cut["cities"]["NY"], cut["cities"]["MIA"]
+        # The response itself was on time and HTTP 200.
+        self.assertEqual((cut["books"]["first_ok"], cut["books"]["timing_eligible"]), (True, True))
+        self.assertEqual(cut["books"]["tickers_returned_first"], 6)
+        # New York is fine; Miami is not.
+        self.assertEqual((ny["status"], ny["eligible"], ny["reason_code"]), ("captured", True, "on_time"))
+        self.assertEqual((mia["status"], mia["eligible"], mia["reason_code"]),
+                         ("failed", False, "missing_books"))
+        self.assertEqual(mia["books_missing_first"], mia["tickers"])
+        self.assertEqual(len(mia["books_missing_first"]), 6)
+        self.assertEqual(ny["books_missing_first"], [])
+        # The raw response is kept exactly as received.
+        raw = json.loads(self.w.read(f"{rec.base}/{CUTOFF_DIR}/books_1.json"))
+        self.assertEqual(sorted(b["ticker"] for b in raw["orderbooks"]), ny["tickers"])
+        self.assertEqual(rec.run["files"][f"{rec.base}/{CUTOFF_DIR}/books_1.json"]["sha256"],
+                         hashlib.sha256(self.w.read(f"{rec.base}/{CUTOFF_DIR}/books_1.json")).hexdigest())
+        # Everywhere scoring would look agrees, and the run is flagged.
+        state = self.w.state()["cutoffs"]
+        self.assertEqual((state["MIA"]["2026-11-11"]["eligible"], state["MIA"]["2026-11-11"]["reason_code"]),
+                         (False, "missing_books"))
+        self.assertTrue(state["NY"]["2026-11-11"]["eligible"])
+        self.assertEqual(summary["failed_captures"], ["MIA"])
+        self.assertFalse(summary["ok"])
+        # Miami's event is still followed to settlement, for coverage accounting.
+        self.assertIn("KXHIGHMIA-26NOV11", self.w.state()["events"])
+
+    def test_one_missing_ticker_is_enough(self):
+        self.w.replay.drop_books.add("KXHIGHMIA-26NOV11-B83.5")
+        rec, _ = self.w.run_at()
+        mia = rec.run["cutoffs"][0]["cities"]["MIA"]
+        self.assertEqual((mia["eligible"], mia["reason_code"]), (False, "missing_books"))
+        self.assertEqual(mia["books_missing_first"], ["KXHIGHMIA-26NOV11-B83.5"])
+
+    def test_recheck_gaps_are_recorded_but_do_not_change_eligibility(self):
+        original = self.w.replay.__call__
+        calls = {"n": 0}
+
+        def second_snapshot_drops_miami(method, url, headers, body, timeout):
+            if "markets/orderbooks" in url:
+                calls["n"] += 1
+                if calls["n"] == 2:
+                    self.w.replay.drop_books.add("KXHIGHMIA-")
+            return original(method, url, headers, body, timeout)
+
+        rec = Recorder(self.w.clock, second_snapshot_drops_miami, self.w.sink, cities=TWO,
+                       live_check_on_first_run=False)
+        rec.execute()
+        mia = rec.run["cutoffs"][0]["cities"]["MIA"]
+        self.assertEqual((mia["eligible"], mia["reason_code"]), (True, "on_time"))
+        self.assertEqual(mia["books_missing_first"], [])
+        self.assertEqual(len(mia["books_missing_recheck"]), 6)
 
 
 class LiveCheckTests(unittest.TestCase):

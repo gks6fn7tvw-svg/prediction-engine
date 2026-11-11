@@ -58,6 +58,7 @@ class Replay:
         self.cli_override = {}  # cli id -> bytes
         self.broken = set()    # substrings; any URL containing one fails with 503
         self.latency_for = {}  # substring -> seconds this kind of request takes to answer
+        self.drop_books = set()  # ticker prefixes left out of an otherwise normal 200 response
 
     def __call__(self, method, url, headers, body, timeout):
         self.clock.advance(next((s for k, s in self.latency_for.items() if k in url), self.latency))
@@ -75,7 +76,8 @@ class Replay:
                     books = []
                     for series in sorted({t.split("-")[0] for t in q["tickers"]}):
                         books += json.loads(fixture(series + "_orderbooks.json"))["orderbooks"]
-                    wanted = set(q["tickers"])
+                    wanted = {t for t in q["tickers"]
+                              if not any(t.startswith(p) for p in self.drop_books)}
                     return ok(json.dumps({"orderbooks": [b for b in books if b["ticker"] in wanted]}).encode())
                 if u.path.endswith("/markets"):
                     if "event_ticker" in q:

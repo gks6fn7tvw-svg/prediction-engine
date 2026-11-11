@@ -88,6 +88,16 @@ def first_book_verdict(cutoff: datetime, ok: bool, received: datetime) -> tuple[
     return True, "on_time"
 
 
+def returned_tickers(f) -> set | None:
+    """Tickers present in an order-book response, or None if it is unusable."""
+    if not f.ok:
+        return None
+    books = (_json(f.body) or {}).get("orderbooks")
+    if not isinstance(books, list):
+        return None
+    return {b.get("ticker") for b in books if isinstance(b, dict) and b.get("ticker")}
+
+
 def settlement_signature(markets: list) -> tuple[str, bool]:
     """A fingerprint of the settlement-relevant fields, and whether all markets are final."""
     keep = ("status", "result", "settle", "expiration_value")
@@ -221,6 +231,7 @@ class Recorder:
             self.clock.sleep(wait)
 
         books_ok, eligible, reason = False, False, "no_markets"
+        got1 = got2 = None
         if tickers:
             url = f"{KALSHI_BASE}/markets/orderbooks?" + "&".join(
                 "tickers=" + quote(t, safe="") for t in tickers)
@@ -231,18 +242,22 @@ class Recorder:
             b2, _ = self.get(url, "kalshi_books_2", f"{cdir}/books_2.json")
             books_ok = b1.ok
             eligible, reason = first_book_verdict(cutoff, b1.ok, b1.received)
+            got1, got2 = returned_tickers(b1), returned_tickers(b2)
             rec["books"] = {
                 "tickers_requested": len(tickers),
+                "tickers_returned_first": len(got1) if got1 is not None else None,
+                "unexpected_tickers_first": sorted((got1 or set()) - set(tickers)),
                 "first_requested_at": iso(b1.requested),
                 "first_received_at": iso(b1.received),
                 "request_lateness_seconds": round((b1.requested - cutoff).total_seconds(), 6),
                 "receipt_lateness_seconds": round((b1.received - cutoff).total_seconds(), 6),
                 "lateness_limit_seconds": LATENESS_LIMIT.total_seconds(),
-                "eligible": eligible, "reason_code": reason,
+                "timing_eligible": eligible, "timing_reason_code": reason,
                 "recheck_gap_seconds": round(b2.monotonic_requested - b1.monotonic_received, 6),
                 "first_ok": b1.ok, "recheck_ok": b2.ok,
-                "note": "eligibility is judged on first-book receipt time; one batch request "
-                        "per snapshot is not proof of an atomic exchange-wide snapshot",
+                "note": "timing is judged on first-book receipt time; each city's eligible and "
+                        "reason_code are authoritative, since a batch can omit one city's books; "
+                        "one batch request per snapshot is not proof of an atomic snapshot",
             }
             self.guard("quotes", lambda: rec["books"].update(
                 quotes_first=self.quotes(b1), quotes_recheck=self.quotes(b2)))
@@ -253,11 +268,19 @@ class Recorder:
         now = iso(self.clock.now())
         for city, target in items:
             info = rec["cities"][city.key]
-            captured = bool(info["tickers"]) and books_ok
-            info["status"] = "captured" if captured else "failed"
-            # A city with no markets found has no book of its own, whatever the batch did.
-            info["eligible"] = eligible and bool(info["tickers"])
-            info["reason_code"] = reason if info["tickers"] else "no_markets"
+            # Judge each city on its OWN books: an on-time 200 response can still omit some.
+            wanted = set(info["tickers"])
+            info["books_missing_first"] = sorted(wanted - (got1 or set()))
+            info["books_missing_recheck"] = sorted(wanted - (got2 or set()))
+            if not info["tickers"]:
+                info["status"], info["eligible"], info["reason_code"] = "failed", False, "no_markets"
+            elif not books_ok:
+                info["status"], info["eligible"], info["reason_code"] = "failed", False, reason
+            elif info["books_missing_first"]:
+                # The raw response is kept as received; this city just has no complete book in it.
+                info["status"], info["eligible"], info["reason_code"] = "failed", False, "missing_books"
+            else:
+                info["status"], info["eligible"], info["reason_code"] = "captured", eligible, reason
             self.state["cutoffs"].setdefault(city.key, {})[target.isoformat()] = {
                 "status": info["status"], "eligible": info["eligible"],
                 "reason_code": info["reason_code"],

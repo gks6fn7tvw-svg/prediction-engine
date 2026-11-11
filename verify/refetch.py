@@ -56,7 +56,9 @@ class SourceError(Exception):
     """A non-retryable answer from a source (for example HTTP 404): a confirmed result."""
 
 
-RETRYABLE = (429, 500, 502, 503, 504)
+def retryable(status) -> bool:
+    """Rate limiting and every server-side (5xx) error is worth another try next run."""
+    return status == 429 or (isinstance(status, int) and 500 <= status <= 599)
 
 
 class Net:
@@ -77,7 +79,7 @@ class Net:
                 if status in ok:
                     return status, hdrs, body
                 last = f"HTTP {status}"
-                if status not in RETRYABLE:
+                if not retryable(status):
                     raise SourceError(f"GET {url} failed: {last}")
             if attempt < tries:
                 self.clock.sleep(2 * attempt)
@@ -381,7 +383,7 @@ def main() -> int:
     except Exception as exc:  # e.g. GitHub unreachable during discovery: nothing written, retry next hour
         print(json.dumps({"error": f"{type(exc).__name__}: {exc}"}))
         return 1
-    print(json.dumps({"checked": results}))
+    print(json.dumps({"checked": results, "code_version": os.environ.get("RENDER_GIT_COMMIT")}))
     # Confirmed failures and retries both exit nonzero so they show in Render's history.
     return 0 if all(r["status"] == "ok" for r in results) else 1
 

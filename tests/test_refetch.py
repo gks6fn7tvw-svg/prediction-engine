@@ -18,7 +18,7 @@ import numpy as np
 from recorder.store import LocalSink
 from tests.helpers import FakeClock
 from verify.check_history import check_batch
-from verify.refetch import Net, Verifier, idx_entry, nearest_value, run_once
+from verify.refetch import Net, SourceError, TransientError, Verifier, idx_entry, nearest_value, run_once
 
 FIXTURE = Path(__file__).parent / "fixtures"
 BATCH = "history/development/2026-09-11"
@@ -302,6 +302,37 @@ class HoldoutNotesTests(unittest.TestCase):
             self.assertFalse(any("vs settled" in n for n in report.notes))
             dev = check_batch(Path(FIXTURE), BATCH)
             self.assertTrue(any("vs settled" in n for n in dev.notes))
+
+
+class RetryClassificationTests(unittest.TestCase):
+    """Every 5xx and 429 is retryable; other answers are confirmed (ChatGPT #10)."""
+
+    def classify(self, status):
+        clock = FakeClock(datetime(2026, 11, 11, tzinfo=timezone.utc))
+        net = Net(lambda *a: (status, {}, b""), clock)
+        try:
+            net.get("https://example.test/x")
+        except TransientError:
+            return "retry"
+        except SourceError:
+            return "confirmed"
+        return "ok"
+
+    def test_all_server_errors_and_rate_limits_are_retried(self):
+        for status in (429, 500, 501, 502, 503, 504, 505, 507, 520, 529, 599):
+            self.assertEqual(self.classify(status), "retry", status)
+
+    def test_client_errors_are_confirmed(self):
+        for status in (400, 401, 403, 404, 410, 600):
+            self.assertEqual(self.classify(status), "confirmed", status)
+
+    def test_network_exception_is_retried(self):
+        clock = FakeClock(datetime(2026, 11, 11, tzinfo=timezone.utc))
+
+        def boom(*a):
+            raise OSError("connection reset")
+        with self.assertRaises(TransientError):
+            Net(boom, clock).get("https://example.test/x")
 
 
 class HelperTests(unittest.TestCase):

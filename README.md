@@ -12,16 +12,22 @@ forecasts and prices can be compared later against what actually happened.
 It covers five cities: New York (KNYC), Chicago Midway (KMDW), Miami (KMIA),
 Denver (KDEN) and Los Angeles (KLAX).
 
-It runs once an hour, at minute 52. On each run it does three things.
+It runs once an hour, at minute 52. On each run it does four things.
 
 1. **Cutoff capture.** If a city's 6 p.m. local time is 8 minutes away, it
    fetches that city's market rules and the National Weather Service forecast
    *before* 6 p.m., waits until exactly 6 p.m., takes a snapshot of the order
    books for tomorrow's temperature ranges, and takes a second snapshot at
    least one second later.
-2. **Settlement.** After a day's weather is over, it checks Kalshi each hour
+2. **Noon capture (same day).** If a city's noon local *standard* time is
+   8 minutes away (1 p.m. on the clock during daylight saving), it fetches the
+   markets, then the station's observations from the start of the climate day,
+   finishing before noon, waits until exactly noon and takes the same two
+   order-book snapshots for *today's* ranges. This feeds the same-day test
+   (H1). It saves inputs only, never outcomes.
+3. **Settlement.** After a day's weather is over, it checks Kalshi each hour
    until the result is final, saving every change along the way.
-3. **Climate reports.** It saves the NWS daily climate report for each city
+4. **Climate reports.** It saves the NWS daily climate report for each city
    whenever the report's text changes.
 
 Everything from one run is saved to the data repository
@@ -38,6 +44,11 @@ runs/.../cutoff_.../NY/kalshi_series.json    series details, including the fee t
 runs/.../cutoff_.../NY/nws_hourly.json       hourly forecast
 runs/.../cutoff_.../NY/nws_gridpoint.json.gz full forecast grid data (gzipped, it is large)
 runs/.../cutoff_.../NY/nws_points.json       station-to-grid lookup
+runs/.../noon_20261111T1700Z/books_1.json    order books at noon local standard time
+runs/.../noon_20261111T1700Z/books_2.json    order books at least one second later
+runs/.../noon_.../NY/kalshi_markets.json     open markets at noon
+runs/.../noon_.../NY/nws_observations.json   station observations received before noon
+runs/.../noon_.../NY/nws_observations_late.json  only if the above missed noon; audit only
 settlement/<event>/<run id>.json             each change in an event's settlement status
 cli/<city>/<run id>.html                     each new version of the NWS climate report
 state/state.json                             the recorder's own bookkeeping
@@ -59,6 +70,25 @@ only. The raw files are the record.
   scoring. Each city is judged on its own books: if an on-time response
   leaves out any of a city's ranges, that city is `missing_books`. A cutoff more
   than 20 minutes gone is not captured at all and is recorded as `missed`.
+- **Noon weather must arrive before noon.** Each station's observations are
+  fetched on its own background thread from 30 seconds before noon, with
+  retries stopping 3 seconds before it, so weather can never delay the books
+  (a socket timeout limits each read, not a whole response). Only a response
+  *received* by noon is the decision snapshot. A city without one is saved
+  but marked `weather_late` (no answer by noon, including a success that
+  finished after noon), `weather_failed` (the service answered with an error)
+  or `weather_empty` (no usable temperatures). Late data is kept as
+  `nws_observations_late.json`, labelled `audit_only`, and never scored.
+  Threads still running 60 seconds after the books are abandoned. Late books
+  outrank weather as the reason. Noon captures have their own bookkeeping, so
+  the day-before and noon snapshots for the same day both survive, and noon
+  misses are listed separately (`noon_missed`).
+- **Paper fills need a complete delayed book.** Paper fills are priced on the
+  second snapshot, so a city is `paper_fill_eligible` only if its first
+  snapshot is eligible and the second arrived on time with every range
+  (`complete_recheck`; otherwise `recheck_failed`, `missing_recheck_books`,
+  `late_recheck` or `first_snapshot_ineligible`). The first snapshot alone can
+  still support research. This applies to both capture kinds.
 - **Two different clocks.** The 6 p.m. cutoff follows daylight saving. The day
   the contract measures does not: it is midnight to midnight local *standard*
   time, so 1 a.m. to 1 a.m. on the clock in summer. Both are written to
@@ -81,7 +111,7 @@ it again.
 
 - The weather.com page Kalshi names as its settlement source is not captured.
   Kalshi's own settled result is saved instead, with the NWS report as a check.
-- No forecasting model, no fee or paper-trading calculations.
+- No forecasting model, no fee or paper-trading calculations in the recorder.
 
 ## Independent checks of historical data: `verify/`
 

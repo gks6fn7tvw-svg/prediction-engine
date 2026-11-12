@@ -1,7 +1,7 @@
 """Test doubles: a fake clock and a transport that replays saved real responses."""
 import json
 import os
-from datetime import timedelta
+from datetime import datetime, timedelta
 from urllib.parse import parse_qs, urlparse
 
 FIXTURES = os.path.join(os.path.dirname(__file__), "fixtures")
@@ -40,6 +40,35 @@ class FakeClock:
             self.sleeps.append(seconds)
             self.advance(seconds)
 
+    def background(self, fn):
+        """Simulates a background thread deterministically: fn runs now on its own branch of
+        time, then the clock goes back to where it was. join() later waits (advances the clock)
+        until the branch's finish time, or gives up after its timeout, like a real join."""
+        t0, m0 = self.t, self.m
+        job = FakeBackground(self)
+        try:
+            job.value = fn()
+        except Exception as exc:
+            job.error = exc
+        job.finish_m = self.m
+        self.t, self.m = t0, m0
+        return job
+
+
+class FakeBackground:
+    def __init__(self, clock):
+        self.clock, self.value, self.error, self.finish_m = clock, None, None, None
+
+    def join(self, timeout):
+        wait = self.finish_m - self.clock.m
+        if wait <= 0:
+            return True
+        if timeout is not None and wait > timeout:
+            self.clock.advance(max(0, timeout))
+            return False
+        self.clock.advance(wait)
+        return True
+
 
 class ShortSleepClock(FakeClock):
     """A clock whose sleeps return early, to prove waits are re-checked rather than trusted."""
@@ -59,9 +88,20 @@ class Replay:
         self.broken = set()    # substrings; any URL containing one fails with 503
         self.latency_for = {}  # substring -> seconds this kind of request takes to answer
         self.drop_books = set()  # ticker prefixes left out of an otherwise normal 200 response
+        # substrings whose responses trickle in: each read beats the socket timeout, so the
+        # whole response can take longer than `timeout` and still succeed (as with urllib)
+        self.trickle = set()
+        self.drop_recheck = set()  # like drop_books, but only from the second order-book request on
+        self.book_calls = 0
 
     def __call__(self, method, url, headers, body, timeout):
-        self.clock.advance(next((s for k, s in self.latency_for.items() if k in url), self.latency))
+        latency = next((s for k, s in self.latency_for.items() if k in url), self.latency)
+        trickles = any(k in url for k in self.trickle)
+        if timeout is not None and latency > timeout and not trickles:  # like a real socket timeout
+            self.clock.advance(timeout)
+            self.calls.append((self.clock.now(), url))
+            raise TimeoutError(f"timed out after {timeout}s")
+        self.clock.advance(latency)
         self.calls.append((self.clock.now(), url))
         if any(b in url for b in self.broken):
             return 503, {}, b"unavailable"
@@ -76,8 +116,9 @@ class Replay:
                     books = []
                     for series in sorted({t.split("-")[0] for t in q["tickers"]}):
                         books += json.loads(fixture(series + "_orderbooks.json"))["orderbooks"]
-                    wanted = {t for t in q["tickers"]
-                              if not any(t.startswith(p) for p in self.drop_books)}
+                    self.book_calls += 1
+                    dropped = self.drop_books | (self.drop_recheck if self.book_calls >= 2 else set())
+                    wanted = {t for t in q["tickers"] if not any(t.startswith(p) for p in dropped)}
                     return ok(json.dumps({"orderbooks": [b for b in books if b["ticker"] in wanted]}).encode())
                 if u.path.endswith("/markets"):
                     if "event_ticker" in q:
@@ -85,6 +126,8 @@ class Replay:
                         return ok(json.dumps({"cursor": "", "markets": self.settlement.get(ev, [])}).encode())
                     return ok(fixture(q["series_ticker"][0] + "_markets.json"))
             if u.netloc == "api.weather.gov":
+                if u.path.endswith("/observations"):
+                    return ok(observations(u.path.split("/")[2], q["start"][0], q["end"][0]))
                 if "/points/" in u.path:
                     return ok(fixture(STATION_BY_POINT[u.path.rsplit("/", 1)[1]] + "_point.json"))
                 grid = u.path.split("/gridpoints/")[1]
@@ -97,6 +140,29 @@ class Replay:
         except (KeyError, FileNotFoundError):
             pass
         return 404, {}, b"not found"
+
+
+def observations(station: str, start: str, end: str) -> bytes:
+    """Synthetic NWS observations: one report at :51 each hour in [start, end], newest first,
+    plus one report with a missing temperature, as the real API sometimes returns."""
+    s = datetime.fromisoformat(start.replace("Z", "+00:00"))
+    e = datetime.fromisoformat(end.replace("Z", "+00:00"))
+    t = s.replace(minute=51, second=0, microsecond=0)
+    if t < s:
+        t += timedelta(hours=1)
+    feats, i = [], 0
+    while t <= e:
+        feats.append({"properties": {"station": station, "timestamp": t.isoformat(),
+                                     "temperature": {"unitCode": "wmoUnit:degC", "value": 10.0 + 0.5 * i,
+                                                     "qualityControl": "V"}}})
+        t += timedelta(hours=1)
+        i += 1
+    if feats:
+        feats.append({"properties": {"station": station, "timestamp": (t - timedelta(minutes=30)).isoformat(),
+                                     "temperature": {"unitCode": "wmoUnit:degC", "value": None,
+                                                     "qualityControl": "Z"}}})
+    feats.reverse()
+    return json.dumps({"type": "FeatureCollection", "features": feats}).encode()
 
 
 def event_markets(series: str, event: str, **changes) -> list:

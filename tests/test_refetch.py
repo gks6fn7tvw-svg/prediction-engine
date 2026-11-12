@@ -327,6 +327,63 @@ class StagedRefetchTests(unittest.TestCase):
         self.assertFalse(any("kalshi" in u for u in self.world.calls))
         self.assertEqual(self.v.pending(), [])
 
+    def test_invalid_staged_batch_does_not_stop_later_dates(self):
+        batch = self.world.batch
+        manifest_path = batch / "forecast-manifest.json"
+        forecast_path = batch / "NY/nbm.json"
+        original_manifest = manifest_path.read_bytes()
+        original_forecast = forecast_path.read_bytes()
+
+        following = batch.with_name("2026-10-02")
+        following.mkdir()
+        (following / "forecast-manifest.json").write_text(json.dumps({
+            "schema_version": 1,
+            "target_date": following.name,
+            "nbm_bucket": "noaa-nbm-grib2-pds",
+            "files": {},
+            "missing": {path.parent.name: "forecast unavailable" for path in batch.glob("*/nbm.json")},
+        }))
+
+        cases = {
+            "malformed forecast": "malformed JSON",
+            "null forecast": "not a JSON object",
+            "null manifest": "not a JSON object",
+            "null files": "must be JSON objects",
+            "null entry": "invalid manifest file entry",
+            "unexpected path": "holds more than forecasts",
+            "missing forecast": "listed in the manifest but missing",
+        }
+        for case, expected in cases.items():
+            with self.subTest(case=case):
+                manifest = json.loads(original_manifest)
+                forecast_path.write_bytes(original_forecast)
+                if case in {"malformed forecast", "null forecast"}:
+                    raw = b"{broken" if case == "malformed forecast" else b"null"
+                    forecast_path.write_bytes(raw)
+                    manifest["files"]["NY/nbm.json"] = {
+                        "bytes": len(raw), "sha256": hashlib.sha256(raw).hexdigest(),
+                    }
+                elif case == "null manifest":
+                    manifest = None
+                elif case == "null files":
+                    manifest["files"] = None
+                elif case == "null entry":
+                    manifest["files"]["NY/nbm.json"] = None
+                elif case == "unexpected path":
+                    manifest["files"]["../unexpected.json"] = {}
+                elif case == "missing forecast":
+                    forecast_path.unlink()
+                manifest_path.write_text(json.dumps(manifest))
+
+                results = run_once(self.v, self.sink, "regression")
+                self.assertEqual([r["status"] for r in results], ["failed", "ok"])
+                self.assertEqual([r["batch"].rsplit("/", 1)[1] for r in results], [batch.name, following.name])
+                report = json.loads(self.sink.read(results[0]["report"]))
+                self.assertTrue(any(expected in failure for failure in report["failures"]), report["failures"])
+                self.assertEqual(self.world.calls, [])
+                self.assertEqual(self.v.pending(), [])
+                shutil.rmtree(self.root / "verification")
+
 
 class HoldoutNotesTests(unittest.TestCase):
     def test_holdout_batches_never_compare_forecast_with_outcome(self):

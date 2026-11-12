@@ -299,8 +299,9 @@ class Verifier:
         fail = report["failures"].append
         offline = check_staged(root, batch)
         report["offline"] = {"passed_checks": offline.passed, "failures": offline.failures}
-        for f in offline.failures:
-            fail(f"offline: {f}")
+        if offline.failures:
+            report["failures"].extend(f"offline: {f}" for f in offline.failures)
+            return self._finish(report)
         manifest = json.loads((root / batch / "forecast-manifest.json").read_bytes())
         listing = S3Listing(self.net, manifest["nbm_bucket"])
         rng = random.Random(self.rng_seed if self.rng_seed is not None else digest)

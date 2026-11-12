@@ -139,24 +139,31 @@ def forecast_schema_problems(nbm) -> list[str]:
     return out
 
 
-def load_json(r: "Report", path: Path, what: str):
-    """Parse a JSON file, recording a failure (not raising) if it is missing or malformed."""
+def load_json_object(r: Report, path: Path, what: str) -> dict | None:
+    """Load an object or record a batch failure."""
     try:
-        return json.loads(path.read_bytes())
+        data = json.loads(path.read_bytes())
     except FileNotFoundError:
         r.check(False, f"{what}: file missing")
-    except (ValueError, UnicodeDecodeError) as exc:
+        return None
+    except ValueError as exc:
         r.check(False, f"{what}: malformed JSON ({exc})")
-    return None
+        return None
+    except OSError as exc:
+        r.check(False, f"{what}: could not read file ({exc})")
+        return None
+    if not isinstance(data, dict):
+        r.check(False, f"{what}: not a JSON object")
+        return None
+    return data
 
 
 def check_staged(data_root: Path, batch_rel: str) -> Report:
     """A forecast-only holdout batch staged before registration: forecasts, nothing else."""
     r = Report()
     batch = data_root / batch_rel
-    manifest = load_json(r, batch / "forecast-manifest.json", "forecast-manifest.json")
-    if not isinstance(manifest, dict):
-        r.check(manifest is None, "forecast-manifest.json is not a JSON object")
+    manifest = load_json_object(r, batch / "forecast-manifest.json", "forecast-manifest.json")
+    if manifest is None:
         return r
     r.check(set(manifest) <= STAGED_MANIFEST_KEYS, f"forecast-manifest has unexpected keys "
             f"{sorted(set(manifest) - STAGED_MANIFEST_KEYS)}")
@@ -167,28 +174,41 @@ def check_staged(data_root: Path, batch_rel: str) -> Report:
         return r
     r.check(batch_rel.rstrip("/") == STAGED_RE.format(date=target.isoformat()), "staged folder does not match its date")
     r.check(HOLDOUT_START <= target <= HOLDOUT_END, f"staged date {target} is outside the holdout")
-    listed = manifest.get("files", {})
-    for rel, meta in listed.items():
+    if manifest.get("nbm_bucket") != "noaa-nbm-grib2-pds":
+        r.check(False, "forecast-manifest must name the NOAA NBM archive")
+    listed = manifest.get("files")
+    reasons = manifest.get("missing", {})
+    if not isinstance(listed, dict) or not isinstance(reasons, dict):
+        r.check(False, "forecast-manifest files and missing must be JSON objects")
+        return r
+
+    allowed = {f"{k}/nbm.json" for k in BY_KEY}
+    r.check(set(listed) <= allowed, f"staged batch holds more than forecasts: {sorted(set(listed) - allowed)}")
+    for rel in sorted(set(listed) & allowed):
+        meta = listed[rel]
+        if (not isinstance(meta, dict) or set(meta) != {"bytes", "sha256"}
+                or type(meta["bytes"]) is not int or not isinstance(meta["sha256"], str)):
+            r.check(False, f"{rel}: invalid manifest file entry")
+            continue
         try:
             data = (batch / rel).read_bytes()
         except FileNotFoundError:
             r.check(False, f"{rel}: listed in the manifest but missing")
             continue
+        except OSError as exc:
+            r.check(False, f"{rel}: could not read file ({exc})")
+            continue
         r.check(len(data) == meta["bytes"] and hashlib.sha256(data).hexdigest() == meta["sha256"],
                 f"{rel}: bytes or sha256 differ from manifest")
     on_disk = {q.relative_to(batch).as_posix() for q in batch.rglob("*") if q.is_file()} - {"forecast-manifest.json"}
     r.check(on_disk == set(listed), f"files on disk differ from manifest: {sorted(on_disk ^ set(listed))}")
-    # Sealed: forecasts only. No Kalshi data, prices or outcomes may be staged.
-    allowed = {f"{k}/nbm.json" for k in BY_KEY}
-    r.check(set(listed) <= allowed, f"staged batch holds more than forecasts: {sorted(set(listed) - allowed)}")
-    missing = allowed - set(listed)
-    for rel in sorted(missing):
-        reason = (manifest.get("missing") or {}).get(rel.split("/")[0])
-        r.check(bool(reason), f"{rel} missing without a reason")
+    for rel in sorted(allowed - set(listed)):
+        reason = reasons.get(rel.split("/")[0])
+        r.check(isinstance(reason, str) and bool(reason.strip()), f"{rel} missing without a reason")
     for key, city in BY_KEY.items():
         if f"{key}/nbm.json" not in listed:
             continue
-        nbm = load_json(r, batch / key / "nbm.json", f"{key}/nbm.json")
+        nbm = load_json_object(r, batch / key / "nbm.json", f"{key}/nbm.json")
         if nbm is None:
             continue
         problems = forecast_schema_problems(nbm)

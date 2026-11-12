@@ -1,7 +1,7 @@
 """Test doubles: a fake clock and a transport that replays saved real responses."""
 import json
 import os
-from datetime import timedelta
+from datetime import datetime, timedelta
 from urllib.parse import parse_qs, urlparse
 
 FIXTURES = os.path.join(os.path.dirname(__file__), "fixtures")
@@ -61,7 +61,12 @@ class Replay:
         self.drop_books = set()  # ticker prefixes left out of an otherwise normal 200 response
 
     def __call__(self, method, url, headers, body, timeout):
-        self.clock.advance(next((s for k, s in self.latency_for.items() if k in url), self.latency))
+        latency = next((s for k, s in self.latency_for.items() if k in url), self.latency)
+        if timeout is not None and latency > timeout:  # like a real socket timeout
+            self.clock.advance(timeout)
+            self.calls.append((self.clock.now(), url))
+            raise TimeoutError(f"timed out after {timeout}s")
+        self.clock.advance(latency)
         self.calls.append((self.clock.now(), url))
         if any(b in url for b in self.broken):
             return 503, {}, b"unavailable"
@@ -85,6 +90,8 @@ class Replay:
                         return ok(json.dumps({"cursor": "", "markets": self.settlement.get(ev, [])}).encode())
                     return ok(fixture(q["series_ticker"][0] + "_markets.json"))
             if u.netloc == "api.weather.gov":
+                if u.path.endswith("/observations"):
+                    return ok(observations(u.path.split("/")[2], q["start"][0], q["end"][0]))
                 if "/points/" in u.path:
                     return ok(fixture(STATION_BY_POINT[u.path.rsplit("/", 1)[1]] + "_point.json"))
                 grid = u.path.split("/gridpoints/")[1]
@@ -97,6 +104,29 @@ class Replay:
         except (KeyError, FileNotFoundError):
             pass
         return 404, {}, b"not found"
+
+
+def observations(station: str, start: str, end: str) -> bytes:
+    """Synthetic NWS observations: one report at :51 each hour in [start, end], newest first,
+    plus one report with a missing temperature, as the real API sometimes returns."""
+    s = datetime.fromisoformat(start.replace("Z", "+00:00"))
+    e = datetime.fromisoformat(end.replace("Z", "+00:00"))
+    t = s.replace(minute=51, second=0, microsecond=0)
+    if t < s:
+        t += timedelta(hours=1)
+    feats, i = [], 0
+    while t <= e:
+        feats.append({"properties": {"station": station, "timestamp": t.isoformat(),
+                                     "temperature": {"unitCode": "wmoUnit:degC", "value": 10.0 + 0.5 * i,
+                                                     "qualityControl": "V"}}})
+        t += timedelta(hours=1)
+        i += 1
+    if feats:
+        feats.append({"properties": {"station": station, "timestamp": (t - timedelta(minutes=30)).isoformat(),
+                                     "temperature": {"unitCode": "wmoUnit:degC", "value": None,
+                                                     "qualityControl": "Z"}}})
+    feats.reverse()
+    return json.dumps({"type": "FeatureCollection", "features": feats}).encode()
 
 
 def event_markets(series: str, event: str, **changes) -> list:

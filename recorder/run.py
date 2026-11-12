@@ -29,7 +29,8 @@ from zoneinfo import ZoneInfo
 
 from .config import CITIES, KALSHI_BASE, NWS_BASE
 from .net import RealClock, fetch, iso, urllib_transport
-from .schedule import climate_day_utc, cutoffs_between, due_cutoffs, event_ticker
+from .schedule import (climate_day_utc, cutoffs_between, due_cutoffs, due_noon, event_ticker,
+                       noon_cutoffs_between)
 from .store import GitHubSink, LocalSink
 
 LEAD = timedelta(minutes=10)            # start preparing this long before a cutoff
@@ -37,6 +38,9 @@ LATENESS_LIMIT = timedelta(minutes=10)  # design v0.3: first book must be RECEIV
 MAX_LATE = timedelta(minutes=20)        # still captured (and flagged) up to here; then "missed"
 PRE_FETCH_MARGIN = timedelta(seconds=45)  # weather fetches not started by then are deferred
 RECHECK_SECONDS = 1.0
+OBS_FETCH_LEAD = timedelta(seconds=30)  # noon capture: start the observations fetch this long before
+OBS_DEADLINE = timedelta(seconds=3)     # ...and never let it run past this close to the cutoff
+OBS_LATE_TIMEOUT = 30                   # audit-only refetch after the books; no rush, never scored
 FINAL_STATUSES = {"finalized", "settled"}
 POST_FINAL_POLL = timedelta(hours=48)   # keep watching for revisions after finalization
 GIVE_UP = timedelta(days=14)
@@ -131,6 +135,7 @@ class Recorder:
         self.run = {
             "run_id": self.run_id, "started_at": iso(start), "code_version": code_version,
             "cutoffs": [], "missed": [], "settlement": [], "cli": [], "fetches": [], "errors": [],
+            "noon": [], "noon_missed": [],
         }
 
     # ---------- plumbing ----------
@@ -158,7 +163,7 @@ class Recorder:
 
     def load_state(self):
         now = iso(self.clock.now())
-        fresh = {"version": 1, "created_at": now, "cutoffs": {}, "events": {}, "cli": {}}
+        fresh = {"version": 1, "created_at": now, "cutoffs": {}, "events": {}, "cli": {}, "noon": {}}
         try:
             raw = self.sink.read(STATE_PATH)
         except Exception as exc:
@@ -346,6 +351,169 @@ class Recorder:
         books = (_json(f.body) or {}).get("orderbooks") or [] if f.ok else []
         return {b["ticker"]: best_quotes(b.get("orderbook_fp") or {}) for b in books}
 
+    # ---------- same-day noon capture (H1 inputs only) ----------
+
+    def capture_noon(self, cutoff: datetime, items):
+        """Inputs at noon local standard time for the SAME day's event: station observations
+        that arrived by noon, the markets, and two order-book snapshots. No outcomes."""
+        ndir = f"{self.base}/noon_{cutoff:%Y%m%dT%H%MZ}"
+        rec = {"kind": "noon_lst", "cutoff_utc": iso(cutoff), "started_before_cutoff": self.clock.now() < cutoff,
+               "note": "inputs only (observations, markets, books); no settlement data", "cities": {}}
+        self.run["noon"].append(rec)
+        for city, target in items:
+            start, end = climate_day_utc(city, target)
+            info = rec["cities"][city.key] = {
+                "series": city.series, "event_ticker": event_ticker(city, target),
+                "target_date": target.isoformat(), "station": city.station,
+                "climate_day_utc": [iso(start), iso(end)], "tickers": [], "problems": [],
+            }
+            m, _ = self.get(
+                f"{KALSHI_BASE}/markets?series_ticker={city.series}&status=open&limit=200",
+                "noon_kalshi_markets", f"{ndir}/{city.key}/kalshi_markets.json", attempts=2)
+            payload = _json(m.body) if m.ok else None
+            markets = payload.get("markets") if isinstance(payload, dict) else None
+            if markets is None:
+                info["problems"].append("markets_unavailable")
+                continue
+            info["tickers"] = sorted(x["ticker"] for x in markets
+                                     if x.get("event_ticker") == info["event_ticker"] and x.get("ticker"))
+            if not info["tickers"]:
+                info["problems"].append("no_open_markets_for_event")
+
+        # Observations just before noon. Retries stop short of the cutoff so they can never
+        # delay the book requests; anything not received by noon is fetched afterwards for the
+        # audit trail and makes the city ineligible.
+        # Each city gets a fair share of the window, so one slow station cannot starve the next.
+        while (wait := (cutoff - OBS_FETCH_LEAD - self.clock.now()).total_seconds()) > 0:
+            self.clock.sleep(wait)
+        for i, (city, target) in enumerate(items):
+            share_end = self.clock.now() + (cutoff - OBS_DEADLINE - self.clock.now()) / (len(items) - i)
+            self.fetch_observations(ndir, city, rec["cities"][city.key], cutoff, deadline=share_end)
+
+        while (wait := (cutoff - self.clock.now()).total_seconds()) > 0:
+            self.clock.sleep(wait)
+        tickers = [t for info in rec["cities"].values() for t in info["tickers"]]
+        books_ok, eligible, reason, got1, got2 = False, False, "no_markets", None, None
+        if tickers:
+            url = f"{KALSHI_BASE}/markets/orderbooks?" + "&".join("tickers=" + quote(t, safe="") for t in tickers)
+            b1, _ = self.get(url, "noon_kalshi_books_1", f"{ndir}/books_1.json")
+            while (gap := b1.monotonic_received + RECHECK_SECONDS - self.clock.monotonic()) > 0:
+                self.clock.sleep(gap)
+            b2, _ = self.get(url, "noon_kalshi_books_2", f"{ndir}/books_2.json")
+            books_ok = b1.ok
+            eligible, reason = first_book_verdict(cutoff, b1.ok, b1.received)
+            got1, got2 = returned_tickers(b1), returned_tickers(b2)
+            rec["books"] = {
+                "tickers_requested": len(tickers),
+                "tickers_returned_first": len(got1) if got1 is not None else None,
+                "first_requested_at": iso(b1.requested), "first_received_at": iso(b1.received),
+                "second_requested_at": iso(b2.requested), "second_received_at": iso(b2.received),
+                "request_lateness_seconds": round((b1.requested - cutoff).total_seconds(), 6),
+                "receipt_lateness_seconds": round((b1.received - cutoff).total_seconds(), 6),
+                "recheck_gap_seconds": round(b2.monotonic_requested - b1.monotonic_received, 6),
+                "timing_eligible": eligible, "timing_reason_code": reason,
+                "first_ok": b1.ok, "recheck_ok": b2.ok,
+                "note": "raw books (full depth) are in books_1.json and books_2.json",
+            }
+            self.guard("noon_quotes", lambda: rec["books"].update(
+                quotes_first=self.quotes(b1), quotes_recheck=self.quotes(b2)))
+
+        for city, target in items:  # audit-only refetch for anything that missed noon; never scored
+            info = rec["cities"][city.key]
+            if not info["observations"]["received_before_cutoff"]:
+                self.fetch_observations(ndir, city, info, cutoff, deadline=None)
+
+        for city, target in items:
+            info = rec["cities"][city.key]
+            obs = info["observations"]
+            wanted = set(info["tickers"])
+            info["books_missing_first"] = sorted(wanted - (got1 or set()))
+            info["books_missing_recheck"] = sorted(wanted - (got2 or set()))
+            if not info["tickers"]:
+                verdict = ("failed", False, "no_markets")
+            elif not books_ok:
+                verdict = ("failed", False, reason)
+            elif info["books_missing_first"]:
+                verdict = ("failed", False, "missing_books")
+            elif not eligible:
+                verdict = ("captured", False, reason)  # books late: the snapshot is out whatever the weather
+            elif not obs["ok"] and obs["no_answer_in_time"]:
+                verdict = ("captured", False, "weather_late")
+            elif not obs["ok"]:
+                verdict = ("captured", False, "weather_failed")
+            elif not obs.get("usable_reports"):
+                verdict = ("captured", False, "weather_empty")
+            else:
+                verdict = ("captured", eligible, reason)
+            info["status"], info["eligible"], info["reason_code"] = verdict
+            self.state["noon"].setdefault(city.key, {})[target.isoformat()] = {
+                "status": info["status"], "eligible": info["eligible"], "reason_code": info["reason_code"],
+                "run_id": self.run_id, "cutoff_utc": iso(cutoff),
+                "receipt_lateness_seconds": rec.get("books", {}).get("receipt_lateness_seconds"),
+                "newest_usable_obs_age_seconds": obs.get("newest_usable_age_seconds"),
+            }
+
+    def fetch_observations(self, ndir, city, info, cutoff, deadline):
+        """Observations from the start of the climate day up to noon.
+
+        With a deadline (before noon): retry until the deadline, with each request's timeout cut
+        so it can never run past it. The result is the decision snapshot in info["observations"].
+        Without one (after the books): a single audit-only request saved as *_late.json and
+        recorded in info["observations_late"]; it never replaces the snapshot.
+        """
+        start = info["climate_day_utc"][0].replace("+00:00", "Z")
+        end = cutoff.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        url = (f"{NWS_BASE}/stations/{city.station}/observations"
+               f"?start={quote(start, safe='')}&end={quote(end, safe='')}")
+        if deadline is None:
+            f, _ = self.get(url, "noon_nws_observations_late", f"{ndir}/{city.key}/nws_observations_late.json",
+                            attempts=1, timeout=OBS_LATE_TIMEOUT)
+            info["observations_late"] = self._obs_record(f, cutoff, audit_only=True)
+            return
+        f, tries = None, 0
+        while (left := (deadline - self.clock.now()).total_seconds()) >= 1:
+            tries += 1
+            f, _ = self.get(url, "noon_nws_observations", f"{ndir}/{city.key}/nws_observations.json",
+                            attempts=1, timeout=min(15, left))
+            if f.ok:
+                break
+            self.clock.sleep(min(2, max(0, (deadline - self.clock.now()).total_seconds())))
+        if f is None:
+            info["observations"] = {"ok": False, "received_before_cutoff": False, "no_answer_in_time": True,
+                                    "tries": 0, "note": "no time left before the cutoff"}
+            return
+        info["observations"] = {**self._obs_record(f, cutoff, audit_only=False), "tries": tries}
+
+    def _obs_record(self, f, cutoff, audit_only):
+        rec = {"ok": f.ok, "requested_at": iso(f.requested), "received_at": iso(f.received),
+               "http_status": f.status, "error": f.error,
+               "received_before_cutoff": f.ok and f.received <= cutoff and not audit_only,
+               # No HTTP answer before we had to stop (a timeout or dropped connection), as
+               # opposed to the server answering with an error.
+               "no_answer_in_time": f.status is None, "audit_only": audit_only}
+        if f.ok:
+            self.guard("observations_summary", lambda: rec.update(self.observation_summary(f.body, cutoff)))
+        return rec
+
+    @staticmethod
+    def observation_summary(body: bytes, cutoff: datetime) -> dict:
+        feats = (_json(body) or {}).get("features") or []
+        rows = []
+        for ft in feats:
+            p = ft.get("properties") or {}
+            ts, t = p.get("timestamp"), p.get("temperature") or {}
+            if not ts:
+                continue
+            rows.append({"timestamp": ts, "temperature_c": t.get("value"), "qc": t.get("qualityControl")})
+        rows.sort(key=lambda r: r["timestamp"])
+        usable = [r for r in rows if r["temperature_c"] is not None and _parse(r["timestamp"]) <= cutoff]
+        newest = usable[-1]["timestamp"] if usable else None
+        return {
+            "reports": len(rows), "usable_reports": len(usable), "usable": usable,
+            "newest_usable_timestamp": newest,
+            "newest_usable_age_seconds": round((cutoff - _parse(newest)).total_seconds(), 3) if newest else None,
+        }
+
     # ---------- missed cutoffs ----------
 
     def record_missed(self):
@@ -360,6 +528,14 @@ class Recorder:
                     entry = {"status": "missed", "run_id": self.run_id, "cutoff_utc": iso(cutoff)}
                     seen[target.isoformat()] = entry
                     self.run["missed"].append({"city": city.key, "target_date": target.isoformat(), **entry})
+        noon_since = max(_parse(self.state.setdefault("noon_started_at", iso(now))), now - MISSED_LOOKBACK)
+        for city in self.cities:
+            for cutoff, target in noon_cutoffs_between(city, noon_since, now - MAX_LATE):
+                seen = self.state["noon"].setdefault(city.key, {})
+                if target.isoformat() not in seen:
+                    entry = {"status": "missed", "run_id": self.run_id, "cutoff_utc": iso(cutoff)}
+                    seen[target.isoformat()] = entry
+                    self.run["noon_missed"].append({"city": city.key, "target_date": target.isoformat(), **entry})
 
     # ---------- settlement ----------
 
@@ -487,11 +663,18 @@ class Recorder:
         self.load_state()
         self.state_loaded = json.dumps(self.state, sort_keys=True)
         now = self.clock.now()
-        for cutoff, items in due_cutoffs(now, self.cities, LEAD, MAX_LATE).items():
+        jobs = [(c, "day_before", items) for c, items in due_cutoffs(now, self.cities, LEAD, MAX_LATE).items()]
+        jobs += [(c, "noon", items) for c, items in due_noon(now, self.cities, LEAD, MAX_LATE).items()]
+        for cutoff, kind, items in sorted(jobs, key=lambda j: j[0]):
+            seen = self.state["cutoffs"] if kind == "day_before" else self.state["noon"]
             todo = [(c, t) for c, t in items
-                    if self.state["cutoffs"].get(c.key, {}).get(t.isoformat(), {}).get("status") != "captured"]
-            if todo:
+                    if seen.get(c.key, {}).get(t.isoformat(), {}).get("status") != "captured"]
+            if not todo:
+                continue
+            if kind == "day_before":
                 self.guard(f"cutoff {iso(cutoff)}", lambda: self.capture_cutoff(cutoff, todo))
+            else:
+                self.guard(f"noon {iso(cutoff)}", lambda: self.capture_noon(cutoff, todo))
         self.guard("missed", self.record_missed)
         self.guard("settlement", self.poll_settlements)
         self.guard("cli", self.capture_cli)
@@ -503,9 +686,14 @@ class Recorder:
         # Save when anything was captured, or when tracking state changed (for example an
         # event was closed out), so that a change is never held only in memory.
         state_changed = self.state_ok and json.dumps(self.state, sort_keys=True) != self.state_loaded
-        worth_saving = bool(self.files or self.run["cutoffs"] or self.run["missed"] or state_changed)
+        worth_saving = bool(self.files or self.run["cutoffs"] or self.run["missed"] or self.run["noon"]
+                            or self.run["noon_missed"] or state_changed)
         failed = [c for rec in self.run["cutoffs"] for c, i in rec["cities"].items()
                   if i.get("status") != "captured"]
+        noon_failed = [c for rec in self.run["noon"] for c, i in rec["cities"].items()
+                       if i.get("status") != "captured"]
+        noon_ineligible = {c: i.get("reason_code") for rec in self.run["noon"] for c, i in rec["cities"].items()
+                           if i.get("status") == "captured" and not i.get("eligible")}
         # Saved, but outside the cutoff rule (for example a late first book): not scoreable.
         ineligible = {c: i.get("reason_code") for rec in self.run["cutoffs"]
                       for c, i in rec["cities"].items()
@@ -514,6 +702,8 @@ class Recorder:
             "run_id": self.run_id, "files": len(self.files), "cutoffs": len(self.run["cutoffs"]),
             "failed_captures": failed, "ineligible_captures": ineligible,
             "missed": len(self.run["missed"]),
+            "noon_captures": len(self.run["noon"]), "noon_failed": noon_failed,
+            "noon_ineligible": noon_ineligible, "noon_missed": len(self.run["noon_missed"]),
             "errors": len(self.run["errors"]), "commit": None,
         }
         if worth_saving:
@@ -534,7 +724,7 @@ class Recorder:
             summary["live_check_problems"] = check.get("all_problems")
         # Any error (including an unreadable state file or a bad token) fails the run, so it
         # shows up in Render's logs on the hour rather than at the next cutoff.
-        summary["ok"] = ("commit_error" not in summary and not failed and not self.run["errors"]
+        summary["ok"] = ("commit_error" not in summary and not failed and not noon_failed and not self.run["errors"]
                          and (check is None or check.get("ok", False)))
         return summary
 
@@ -544,8 +734,9 @@ class Recorder:
             ev: i for ev, i in self.state["events"].items()
             if not (i.get("done") and now - _parse(i["first_seen"]) > timedelta(days=45))}
         horizon = (now - timedelta(days=60)).date().isoformat()
-        for city, seen in self.state["cutoffs"].items():
-            self.state["cutoffs"][city] = {d: v for d, v in seen.items() if d >= horizon}
+        for table in ("cutoffs", "noon"):
+            for city, seen in self.state.get(table, {}).items():
+                self.state[table][city] = {d: v for d, v in seen.items() if d >= horizon}
 
 
 def main() -> int:

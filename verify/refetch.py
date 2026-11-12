@@ -28,16 +28,18 @@ import re
 import sys
 import tempfile
 import xml.etree.ElementTree as ET
+from email.utils import parsedate_to_datetime
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from urllib.parse import quote
 
 from recorder.net import RealClock, iso, urllib_transport
 from recorder.store import GitHubSink, LocalSink
-from verify.check_history import HOLDOUT_END, HOLDOUT_START, check_batch
+from verify.check_history import BY_KEY, HOLDOUT_END, HOLDOUT_START, check_batch, check_staged
 
 S3 = "https://{bucket}.s3.amazonaws.com"
 BATCH_RE = re.compile(r"^history/(development|holdout)/(\d{4}-\d{2}-\d{2})/manifest\.json$")
+STAGED_RE = re.compile(r"^staging/holdout/(\d{4}-\d{2}-\d{2})/forecast-manifest\.json$")
 SAMPLE_HOURS = int(os.environ.get("VERIFY_SAMPLE_HOURS", "3"))
 MAX_BATCHES = int(os.environ.get("VERIFY_MAX_BATCHES", "10"))
 USER_AGENT = "prediction-engine-verifier (public-data research check)"
@@ -68,13 +70,22 @@ BACKOFF = (5, 15, 45)  # seconds before retries 2, 3 and 4, unless Retry-After s
 MAX_RETRY_AFTER = 120
 
 
-def retry_after_seconds(headers) -> float | None:
+def retry_after_seconds(headers, now: datetime) -> float | None:
+    """Seconds to wait per a Retry-After header (delta-seconds or HTTP-date), or None if absent."""
     for k, v in (headers or {}).items():
-        if k.lower() == "retry-after":
-            try:
-                return max(0.0, min(float(v), MAX_RETRY_AFTER))
-            except (TypeError, ValueError):
-                return None  # an HTTP-date form: fall back to our own backoff
+        if k.lower() != "retry-after":
+            continue
+        try:
+            return max(0.0, float(v))
+        except (TypeError, ValueError):
+            pass
+        try:
+            when = parsedate_to_datetime(v)
+        except (TypeError, ValueError, IndexError):
+            return None
+        if when.tzinfo is None:
+            when = when.replace(tzinfo=timezone.utc)
+        return max(0.0, (when - now).total_seconds())
     return None
 
 
@@ -84,9 +95,15 @@ class Net:
     def __init__(self, transport, clock):
         self.transport, self.clock = transport, clock
         self.last_request = {}  # host -> monotonic time of the previous request
+        self.cooldown_until = {}  # host -> monotonic time before which it asked us not to call
 
     def _pace(self, url):
         host = url.split("/")[2] if "://" in url else ""
+        wait = self.cooldown_until.get(host, 0.0) - self.clock.monotonic()
+        if wait > MAX_RETRY_AFTER:
+            raise TransientError(f"GET {url}: {host} asked us to wait {wait:.0f}s more; leaving it pending")
+        if wait > 0:
+            self.clock.sleep(wait)
         gap = MIN_INTERVAL.get(host, 0.0)
         if gap and host in self.last_request:
             wait = self.last_request[host] + gap - self.clock.monotonic()
@@ -98,7 +115,7 @@ class Net:
         last = None
         for attempt in range(1, tries + 1):
             self._pace(url)
-            wait = None
+            cooled = False  # True when the server set a host cooldown that _pace will honour
             try:
                 status, hdrs, body = self.transport(
                     "GET", url, {"User-Agent": USER_AGENT, **(headers or {})}, None, 60)
@@ -110,9 +127,19 @@ class Net:
                 last = f"HTTP {status}"
                 if not retryable(status):
                     raise SourceError(f"GET {url} failed: {last}")
-                wait = retry_after_seconds(hdrs)
-            if attempt < tries:
-                self.clock.sleep(wait if wait is not None else BACKOFF[min(attempt, len(BACKOFF)) - 1])
+                wait = retry_after_seconds(hdrs, self.clock.now())
+                if wait is not None:  # the whole host is cooling down, not just this URL
+                    host = url.split("/")[2] if "://" in url else ""
+                    self.cooldown_until[host] = max(self.cooldown_until.get(host, 0.0),
+                                                    self.clock.monotonic() + wait)
+                    remaining = self.cooldown_until[host] - self.clock.monotonic()
+                    if remaining > MAX_RETRY_AFTER:
+                        # Asked to wait longer than this run should: leave it pending for a later run.
+                        raise TransientError(f"GET {url}: {last}, Retry-After {remaining:.0f}s exceeds the "
+                                             f"{MAX_RETRY_AFTER}s per-run budget")
+                    cooled = True
+            if attempt < tries and not cooled:
+                self.clock.sleep(BACKOFF[min(attempt, len(BACKOFF)) - 1])
         raise TransientError(f"GET {url} failed after {tries} tries: {last}")
 
 
@@ -192,22 +219,30 @@ class Verifier:
     def pending(self):
         """Batches without a canonical report, all read at ONE pinned data-repo commit."""
         ref = self.sink.head()
-        paths = self.sink.list_files("history/", ref=ref)
+        paths = self.sink.list_files("history/", ref=ref) + self.sink.list_files("staging/", ref=ref)
         done = set(self.sink.list_files("verification/", ref=ref))
         todo = []
         for path in paths:
-            m = BATCH_RE.match(path)
-            if not m:
+            m, st = BATCH_RE.match(path), STAGED_RE.match(path)
+            if m:
+                prefix = f"verification/{m.group(1)}/{m.group(2)}"
+            elif st:  # forecast-only holdout batch staged before registration
+                prefix = f"verification/staging/holdout/{st.group(1)}"
+            else:
                 continue
             raw = self.sink.read(path, ref=ref)
             digest = hashlib.sha256(raw).hexdigest()
-            report = f"verification/{m.group(1)}/{m.group(2)}/{digest}.json"
+            report = f"{prefix}/{digest}.json"
             if report not in done:
                 todo.append((path.rsplit("/", 1)[0], digest, report, ref))
         return todo[:MAX_BATCHES]
 
     def download(self, batch: str, dest: Path, ref: str):
-        for path in self.sink.list_files(batch + "/", ref=ref):
+        paths = self.sink.list_files(batch + "/", ref=ref)
+        m = BATCH_RE.match(batch + "/manifest.json")
+        if m and m.group(1) == "holdout":  # the final holdout batch is checked against its staged forecasts
+            paths += self.sink.list_files(f"staging/holdout/{m.group(2)}/", ref=ref)
+        for path in paths:
             target = dest / path
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_bytes(self.sink.read(path, ref=ref))
@@ -224,10 +259,14 @@ class Verifier:
             except Exception as exc:
                 report["transient_errors"].append(f"download: {type(exc).__name__}: {exc}")
                 return self._finish(report)
-            got = hashlib.sha256((root / batch / "manifest.json").read_bytes()).hexdigest()
+            staged = batch.startswith("staging/")
+            manifest_name = "forecast-manifest.json" if staged else "manifest.json"
+            got = hashlib.sha256((root / batch / manifest_name).read_bytes()).hexdigest()
             if got != digest:  # never certify a manifest other than the one discovered
                 report["transient_errors"].append(f"manifest at {ref} hashes to {got}, expected {digest}")
                 return self._finish(report)
+            if staged:
+                return self._verify_staged(root, batch, digest, report)
             offline = check_batch(root, batch)
             report["offline"] = {"passed_checks": offline.passed, "failures": offline.failures,
                                  "primary_complete": offline.primary,
@@ -253,6 +292,33 @@ class Verifier:
                         report["transient_errors"].append(f"{key}: {name}: {exc}")
                     except Exception as exc:
                         fail(f"{key}: {name} re-fetch error {type(exc).__name__}: {exc}")
+        return self._finish(report)
+
+    def _verify_staged(self, root: Path, batch: str, digest: str, report: dict) -> dict:
+        """Forecast-only holdout batch: offline checks plus NOAA re-fetch. No Kalshi, no outcomes."""
+        fail = report["failures"].append
+        offline = check_staged(root, batch)
+        report["offline"] = {"passed_checks": offline.passed, "failures": offline.failures}
+        if offline.failures:
+            report["failures"].extend(f"offline: {f}" for f in offline.failures)
+            return self._finish(report)
+        manifest = json.loads((root / batch / "forecast-manifest.json").read_bytes())
+        listing = S3Listing(self.net, manifest["nbm_bucket"])
+        rng = random.Random(self.rng_seed if self.rng_seed is not None else digest)
+        for key in BY_KEY:
+            rel = f"{key}/nbm.json"
+            if rel not in manifest.get("files", {}):
+                report["cities"][key] = {"status": "missing"}
+                continue
+            nbm = json.loads((root / batch / rel).read_bytes())
+            info = {"forecast_path": rel, "cutoff_utc": nbm["cutoff_utc"]}
+            city = report["cities"][key] = {}
+            try:
+                self.check_nbm(root / batch, key, info, city, fail, listing, rng, True)
+            except TransientError as exc:
+                report["transient_errors"].append(f"{key}: NOAA: {exc}")
+            except Exception as exc:
+                fail(f"{key}: NOAA re-fetch error {type(exc).__name__}: {exc}")
         return self._finish(report)
 
     def _finish(self, report: dict) -> dict:

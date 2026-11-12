@@ -11,7 +11,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from verify.check_history import check_batch
+from verify.check_history import check_batch, check_staged
 
 FIXTURE = Path(__file__).parent / "fixtures"
 BATCH = "history/development/2026-09-11"
@@ -172,6 +172,123 @@ class HistoryCheckTests(unittest.TestCase):
     def test_holdout_date_labelled_development_is_caught(self):
         self.edit("manifest.json", lambda m: m.update(target_date="2026-10-02"))
         self.assertTrue(any("partition" in f for f in self.failures()))
+
+
+STAGED = "staging/holdout/2026-10-01"
+
+
+class StagedCheckTests(unittest.TestCase):
+    """Forecast-only holdout batches staged before registration (ChatGPT #13)."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        shutil.copytree(FIXTURE / "staging", self.root / "staging")
+        self.batch = self.root / STAGED
+
+    def manifest(self, fn):
+        path = self.batch / "forecast-manifest.json"
+        m = json.loads(path.read_bytes())
+        fn(m)
+        path.write_bytes(json.dumps(m).encode())
+
+    def test_real_staged_batch_passes(self):
+        report = check_staged(self.root, STAGED)
+        self.assertEqual(report.failures, [])
+        self.assertGreater(report.passed, 350)
+
+    def test_anything_but_forecasts_is_rejected(self):
+        (self.batch / "NY" / "kalshi_markets.json").write_bytes(b"{}")
+        self.manifest(lambda m: m["files"].update({"NY/kalshi_markets.json": {
+            "bytes": 2, "sha256": hashlib.sha256(b"{}").hexdigest()}}))
+        self.assertTrue(any("more than forecasts" in f for f in check_staged(self.root, STAGED).failures))
+
+    def test_dropped_city_needs_a_reason(self):
+        shutil.rmtree(self.batch / "LAX")
+        self.manifest(lambda m: m["files"].pop("LAX/nbm.json"))
+        self.assertTrue(any("LAX/nbm.json missing without a reason" in f
+                            for f in check_staged(self.root, STAGED).failures))
+        self.manifest(lambda m: m.update(missing={"LAX": "no complete cycle before cutoff"}))
+        self.assertEqual(check_staged(self.root, STAGED).failures, [])
+
+    def test_forecast_published_after_cutoff_is_caught(self):
+        path = self.batch / "DEN" / "nbm.json"
+        n = json.loads(path.read_bytes())
+        n["hours"][3]["source"]["index"]["last_modified_utc"] = "2026-10-01T01:00:01.000Z"
+        raw = json.dumps(n).encode()
+        path.write_bytes(raw)
+        self.manifest(lambda m: m["files"].update({"DEN/nbm.json": {
+            "bytes": len(raw), "sha256": hashlib.sha256(raw).hexdigest()}}))
+        self.assertTrue(any("DEN: objects published after the cutoff" in f
+                            for f in check_staged(self.root, STAGED).failures))
+
+    # --- found in ChatGPT #14 ---
+
+    def rewrite(self, rel, fn):
+        path = self.batch / rel
+        n = json.loads(path.read_bytes())
+        fn(n)
+        raw = json.dumps(n).encode()
+        path.write_bytes(raw)
+        self.manifest(lambda m: m["files"].update({rel: {"bytes": len(raw), "sha256": hashlib.sha256(raw).hexdigest()}}))
+
+    def test_extra_outcome_field_inside_a_valid_forecast_is_rejected(self):
+        self.rewrite("NY/nbm.json", lambda n: n.update(settled_high_f=71))
+        self.assertTrue(any("NY: not forecast-only" in f for f in check_staged(self.root, STAGED).failures))
+
+    def test_extra_field_deep_inside_an_hour_is_rejected(self):
+        self.rewrite("MIA/nbm.json", lambda n: n["hours"][5]["source"]["index"].update(result="yes"))
+        self.assertTrue(any("MIA: not forecast-only" in f for f in check_staged(self.root, STAGED).failures))
+
+    def test_malformed_or_missing_forecast_is_a_failure_not_a_crash(self):
+        bad = b"{not json"
+        (self.batch / "CHI" / "nbm.json").write_bytes(bad)
+        self.manifest(lambda m: m["files"].update({"CHI/nbm.json": {
+            "bytes": len(bad), "sha256": hashlib.sha256(bad).hexdigest()}}))
+        (self.batch / "DEN" / "nbm.json").unlink()
+        fails = check_staged(self.root, STAGED).failures
+        self.assertTrue(any("CHI/nbm.json: malformed JSON" in f for f in fails))
+        self.assertTrue(any("DEN/nbm.json: listed in the manifest but missing" in f for f in fails))
+
+    def test_malformed_manifest_is_a_failure_not_a_crash(self):
+        (self.batch / "forecast-manifest.json").write_bytes(b"[]")
+        self.assertTrue(check_staged(self.root, STAGED).failures)
+
+    def test_final_reuse_checks_the_staged_bytes_not_just_the_manifest_digest(self):
+        final = self.root / "history/holdout/2026-10-01"
+        shutil.copytree(FIXTURE / BATCH, final)
+        man = json.loads((final / "manifest.json").read_bytes())
+        man.update(target_date="2026-10-01", partition="holdout")
+        (final / "manifest.json").write_bytes(json.dumps(man).encode())
+        for key in ("NY", "MIA", "CHI", "DEN", "LAX"):
+            shutil.copy(self.batch / key / "nbm.json", final / key / "nbm.json")
+        # Change the final NY forecast, then forge the staged MANIFEST digest to match it,
+        # leaving the staged FILE as it was (ChatGPT's reproduction).
+        (final / "NY" / "nbm.json").write_bytes((final / "NY" / "nbm.json").read_bytes() + b" ")
+        forged = hashlib.sha256((final / "NY" / "nbm.json").read_bytes()).hexdigest()
+        self.manifest(lambda m: m["files"]["NY/nbm.json"].update(sha256=forged))
+        fails = check_batch(self.root, "history/holdout/2026-10-01").failures
+        self.assertTrue(any("NY: staged forecast file does not match the staged manifest" in f for f in fails))
+        self.assertTrue(any("NY: holdout forecast differs from the staged forecast" in f for f in fails))
+
+    def test_final_holdout_batch_must_reuse_the_staged_forecast_exactly(self):
+        # A minimal stand-in for the final holdout batch: only the forecast matters here.
+        final = self.root / "history/holdout/2026-10-01"
+        shutil.copytree(FIXTURE / BATCH, final)
+        man = json.loads((final / "manifest.json").read_bytes())
+        man.update(target_date="2026-10-01", partition="holdout")
+        (final / "manifest.json").write_bytes(json.dumps(man).encode())
+        for key in ("NY", "MIA", "CHI", "DEN", "LAX"):  # the staged forecasts, byte for byte
+            shutil.copy(self.batch / key / "nbm.json", final / key / "nbm.json")
+        fails = check_batch(self.root, "history/holdout/2026-10-01").failures
+        self.assertFalse(any("differs from the staged forecast" in f for f in fails))
+        (final / "NY" / "nbm.json").write_bytes((final / "NY" / "nbm.json").read_bytes() + b" ")
+        fails = check_batch(self.root, "history/holdout/2026-10-01").failures
+        self.assertTrue(any("NY: holdout forecast differs from the staged forecast" in f for f in fails))
+        shutil.rmtree(self.root / "staging")
+        fails = check_batch(self.root, "history/holdout/2026-10-01").failures
+        self.assertTrue(any("no staged forecast" in f for f in fails))
 
 
 if __name__ == "__main__":

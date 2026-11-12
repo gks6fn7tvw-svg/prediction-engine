@@ -1,0 +1,27 @@
+{
+  "schema_version": 1,
+  "target_date": "2026-10-01",
+  "nbm_bucket": "noaa-nbm-grib2-pds",
+  "files": {
+    "CHI/nbm.json": {
+      "bytes": 21690,
+      "sha256": "a2936099c2045fe414b16e1e6a75a1b475797657b016d6560d121d2de416e711"
+    },
+    "DEN/nbm.json": {
+      "bytes": 21702,
+      "sha256": "69a8cc0a488ec990a74ebbdf9ab6d8b4cdd5e75ef4ac916f255e1687e89cdf96"
+    },
+    "LAX/nbm.json": {
+      "bytes": 21702,
+      "sha256": "2dd39339106cf810b4dc42a3db220b5f7aabaa07e661a3697613adc482770d33"
+    },
+    "MIA/nbm.json": {
+      "bytes": 21701,
+      "sha256": "0b8d669cba347ae92d9619a0aa37d8963d21ff0a7496b0fdc055835339a7fe7b"
+    },
+    "NY/nbm.json": {
+      "bytes": 21700,
+      "sha256": "facb4afa3b59f68bb870f8ccb8df8f7e952532243626dce570a9c7878c7aaea6"
+    }
+  }
+}

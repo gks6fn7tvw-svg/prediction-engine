@@ -83,6 +83,15 @@ only. The raw files are the record.
   outrank weather as the reason. Noon captures have their own bookkeeping, so
   the day-before and noon snapshots for the same day both survive, and noon
   misses are listed separately (`noon_missed`).
+- **A run is never lost silently.** Saving to GitHub is retried, including
+  GitHub's own "request timed out" answer, and then the whole save is retried
+  after 30, 90 and 180 seconds. If every attempt fails, the run prints all its
+  files to the log as numbered `UNSAVED_RUN` lines.
+  `python -m recorder.unsaved <log file> [--commit]` puts them back together,
+  checks each file against run.json, and saves the run folder. It never
+  restores `state/state.json`, because by then the recorder has moved on. The
+  log line for every run also gives the reason for any failed capture
+  (`failed_reasons`, `noon_failed_reasons`).
 - **Paper fills need a complete delayed book.** Paper fills are priced on the
   second snapshot, so a city is `paper_fill_eligible` only if its first
   snapshot is eligible and the second arrived on time with every range

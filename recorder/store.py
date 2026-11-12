@@ -50,6 +50,15 @@ class LocalSink:
         return "local"
 
 
+def _transient(status: int, data: bytes) -> bool:
+    """Worth retrying: rate limits, server errors, and GitHub's own request timeout, which it
+    reports as a 422 ("Sorry, your request timed out") on tree creation. Other 422s, such as
+    a branch update that is not a fast forward, are real answers and are not retried here."""
+    if status in (429, 500, 502, 503, 504):
+        return True
+    return status == 422 and b"timed out" in (data or b"").lower()
+
+
 class GitHubSink:
     def __init__(self, repo: str, token: str, branch: str = "main",
                  transport=urllib_transport, clock=None, timeout: int = 30):
@@ -75,9 +84,9 @@ class GitHubSink:
             except Exception as exc:
                 last = f"{type(exc).__name__}: {exc}"
             else:
-                if status not in (429, 500, 502, 503, 504):
+                if not _transient(status, data):
                     return status, data
-                last = f"HTTP {status}"
+                last = f"HTTP {status} {(data or b'')[:120].decode('utf-8', 'replace')}"
             if attempt < tries:
                 self.clock.sleep(2 * attempt)
         raise StoreError(f"GitHub {method} {path} failed: {last}")

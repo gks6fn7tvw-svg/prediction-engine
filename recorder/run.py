@@ -32,9 +32,11 @@ from .net import RealClock, fetch, iso, urllib_transport
 from .schedule import (climate_day_utc, cutoffs_between, due_cutoffs, due_noon, event_ticker,
                        noon_cutoffs_between)
 from .store import GitHubSink, LocalSink
+from .unsaved import encode_lines
 
 LEAD = timedelta(minutes=10)            # start preparing this long before a cutoff
 LATENESS_LIMIT = timedelta(minutes=10)  # design v0.3: first book must be RECEIVED by then
+COMMIT_WAITS = (30, 90, 180)            # seconds between whole-commit retries when saving fails
 MAX_LATE = timedelta(minutes=20)        # still captured (and flagged) up to here; then "missed"
 PRE_FETCH_MARGIN = timedelta(seconds=45)  # weather fetches not started by then are deferred
 RECHECK_SECONDS = 1.0
@@ -156,6 +158,7 @@ class Recorder:
         self.run_id = f"{start:%Y%m%dT%H%M%SZ}-{uuid.uuid4().hex[:6]}"
         self.base = f"runs/{start:%Y/%m/%d}/{self.run_id}"
         self.files: dict[str, bytes] = {}
+        self.unsaved: dict[str, bytes] = {}  # filled only if every save attempt failed
         self.state = None
         self.state_ok = False
         self.run = {
@@ -774,6 +777,11 @@ class Recorder:
                   if i.get("status") != "captured"]
         noon_failed = [c for rec in self.run["noon"] for c, i in rec["cities"].items()
                        if i.get("status") != "captured"]
+        # Reasons go in the log line too, so they survive even if the run cannot be saved.
+        failed_reasons = {c: i.get("reason_code") for rec in self.run["cutoffs"] for c, i in rec["cities"].items()
+                          if i.get("status") != "captured"}
+        noon_failed_reasons = {c: i.get("reason_code") for rec in self.run["noon"]
+                               for c, i in rec["cities"].items() if i.get("status") != "captured"}
         noon_ineligible = {c: i.get("reason_code") for rec in self.run["noon"] for c, i in rec["cities"].items()
                            if i.get("status") == "captured" and not i.get("eligible")}
         # Saved, but outside the cutoff rule (for example a late first book): not scoreable.
@@ -785,6 +793,7 @@ class Recorder:
             "failed_captures": failed, "ineligible_captures": ineligible,
             "missed": len(self.run["missed"]),
             "noon_captures": len(self.run["noon"]), "noon_failed": noon_failed,
+            "failed_reasons": failed_reasons, "noon_failed_reasons": noon_failed_reasons,
             "noon_ineligible": noon_ineligible, "noon_missed": len(self.run["noon_missed"]),
             "errors": len(self.run["errors"]), "commit": None,
         }
@@ -796,10 +805,7 @@ class Recorder:
             if self.state_ok:
                 self.prune_state()
                 self.files[STATE_PATH] = json.dumps(self.state, indent=1, sort_keys=True).encode()
-            try:
-                summary["commit"] = self.sink.commit(self.files, f"recorder run {self.run_id}")
-            except Exception as exc:
-                summary["commit_error"] = f"{type(exc).__name__}: {exc}"
+            self.commit_with_retries(summary)
         check = self.run.get("live_check")
         if check is not None:
             summary["live_check_ok"] = check.get("ok", False)
@@ -809,6 +815,25 @@ class Recorder:
         summary["ok"] = ("commit_error" not in summary and not failed and not noon_failed and not self.run["errors"]
                          and (check is None or check.get("ok", False)))
         return summary
+
+    def commit_with_retries(self, summary):
+        """A capture can't be repeated, so a failed save is retried over several minutes (well
+        inside the hour before the next run). If it still fails, the files are kept for main()
+        to print to the log (recorder/unsaved.py), so nothing is lost silently."""
+        errors = []
+        for attempt in range(len(COMMIT_WAITS) + 1):
+            try:
+                summary["commit"] = self.sink.commit(self.files, f"recorder run {self.run_id}")
+                break
+            except Exception as exc:
+                errors.append(f"{iso(self.clock.now())} {type(exc).__name__}: {exc}"[:400])
+                if attempt < len(COMMIT_WAITS):
+                    self.clock.sleep(COMMIT_WAITS[attempt])
+        if errors:
+            summary["commit_attempt_errors"] = errors
+        if summary["commit"] is None:
+            summary["commit_error"] = errors[-1]
+            self.unsaved = dict(self.files)
 
     def prune_state(self):
         now = self.clock.now()
@@ -835,6 +860,9 @@ def main() -> int:
                         code_version=os.environ.get("RENDER_GIT_COMMIT"))
     summary = recorder.execute()
     print(json.dumps(summary))
+    if recorder.unsaved:  # every retry failed: put the files in the log rather than lose them
+        for line in encode_lines(recorder.run_id, recorder.unsaved):
+            print(line)
     if recorder.run["errors"]:
         print(json.dumps({"errors": recorder.run["errors"]}), file=sys.stderr)
     return 0 if summary["ok"] else 1

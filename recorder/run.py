@@ -41,6 +41,7 @@ RECHECK_SECONDS = 1.0
 OBS_FETCH_LEAD = timedelta(seconds=30)  # noon capture: start the observations fetch this long before
 OBS_DEADLINE = timedelta(seconds=3)     # ...and never let it run past this close to the cutoff
 OBS_LATE_TIMEOUT = 30                   # audit-only refetch after the books; no rush, never scored
+OBS_JOIN_LIMIT = 60.0                   # after the books, wait at most this long for weather threads
 FINAL_STATUSES = {"finalized", "settled"}
 POST_FINAL_POLL = timedelta(hours=48)   # keep watching for revisions after finalization
 GIVE_UP = timedelta(days=14)
@@ -83,6 +84,21 @@ def book_depth(orderbook_fp: dict) -> dict:
         out[f"{side}_levels"] = len(rows)
         out[f"{side}_contracts"] = str(sum((q for _, q in rows), Decimal(0)))
     return out
+
+
+def paper_fill_verdict(first_eligible: bool, cutoff: datetime, recheck, missing_recheck) -> tuple[bool, str]:
+    """Paper fills are priced on the DELAYED book (the recheck), so that book must be complete:
+    received, every one of the city's ranges present, and on time. The first snapshot alone
+    can still support research (ChatGPT #23)."""
+    if not first_eligible:
+        return False, "first_snapshot_ineligible"
+    if recheck is None or not recheck.ok:
+        return False, "recheck_failed"
+    if missing_recheck:
+        return False, "missing_recheck_books"
+    if recheck.received > cutoff + LATENESS_LIMIT:
+        return False, "late_recheck"
+    return True, "complete_recheck"
 
 
 def first_book_verdict(cutoff: datetime, ok: bool, received: datetime) -> tuple[bool, str]:
@@ -296,9 +312,13 @@ class Recorder:
                 info["status"], info["eligible"], info["reason_code"] = "failed", False, "missing_books"
             else:
                 info["status"], info["eligible"], info["reason_code"] = "captured", eligible, reason
+            info["paper_fill_eligible"], info["paper_fill_reason"] = paper_fill_verdict(
+                info["eligible"], cutoff, b2 if tickers else None, info["books_missing_recheck"])
             self.state["cutoffs"].setdefault(city.key, {})[target.isoformat()] = {
                 "status": info["status"], "eligible": info["eligible"],
                 "reason_code": info["reason_code"],
+                "paper_fill_eligible": info["paper_fill_eligible"],
+                "paper_fill_reason": info["paper_fill_reason"],
                 "run_id": self.run_id, "cutoff_utc": iso(cutoff),
                 "receipt_lateness_seconds": rec.get("books", {}).get("receipt_lateness_seconds"),
             }
@@ -395,15 +415,17 @@ class Recorder:
             if not info["tickers"]:
                 info["problems"].append("no_open_markets_for_event")
 
-        # Observations just before noon. Retries stop short of the cutoff so they can never
-        # delay the book requests; anything not received by noon is fetched afterwards for the
-        # audit trail and makes the city ineligible.
-        # Each city gets a fair share of the window, so one slow station cannot starve the next.
+        # Observations just before noon, one background thread per station, so weather can never
+        # delay the book requests: a socket timeout bounds each read, not a whole response, and a
+        # response that trickles in can succeed after noon. Retries stop OBS_DEADLINE before noon.
+        # Whatever was not RECEIVED by noon is audit-only and makes the city ineligible.
         while (wait := (cutoff - OBS_FETCH_LEAD - self.clock.now()).total_seconds()) > 0:
             self.clock.sleep(wait)
-        for i, (city, target) in enumerate(items):
-            share_end = self.clock.now() + (cutoff - OBS_DEADLINE - self.clock.now()) / (len(items) - i)
-            self.fetch_observations(ndir, city, rec["cities"][city.key], cutoff, deadline=share_end)
+        weather = {}
+        for city, _ in items:
+            url = self._obs_url(city, rec["cities"][city.key], cutoff)
+            weather[city.key] = self.clock.background(
+                lambda u=url: self._obs_attempts(u, cutoff - OBS_DEADLINE))
 
         while (wait := (cutoff - self.clock.now()).total_seconds()) > 0:
             self.clock.sleep(wait)
@@ -434,10 +456,28 @@ class Recorder:
                 quotes_first=self.quotes(b1), quotes_recheck=self.quotes(b2),
                 depth_first=self.depth(b1), depth_recheck=self.depth(b2)))
 
-        for city, target in items:  # audit-only refetch for anything that missed noon; never scored
+        # Collect the weather threads (after the books, never before), then an audit-only refetch
+        # for any station with no successful response at all. Neither is ever scored.
+        join_until = self.clock.monotonic() + OBS_JOIN_LIMIT
+        for city, target in items:
+            job = weather[city.key]
+            done = job.join(max(0.0, join_until - self.clock.monotonic()))
+            self._record_observations(ndir, city, rec["cities"][city.key], cutoff,
+                                      job.value if done and job.error is None else None,
+                                      abandoned=not done, error=job.error)
+        for city, target in items:
             info = rec["cities"][city.key]
-            if not info["observations"]["received_before_cutoff"]:
-                self.fetch_observations(ndir, city, info, cutoff, deadline=None)
+            if not info["observations"]["ok"] and "observations_late" not in info:
+                url = self._obs_url(city, info, cutoff)
+                job = self.clock.background(lambda u=url: [self._fetch(u, timeout=OBS_LATE_TIMEOUT)])
+                done = job.join(OBS_JOIN_LIMIT)
+                f = job.value[0] if done and job.value else None
+                if f is not None:
+                    self._log_fetch(f, "noon_nws_observations_audit", ndir, city,
+                                    "nws_observations_late.json" if f.ok else None)
+                    info["observations_late"] = self._obs_record(f, cutoff, audit_only=True)
+                else:
+                    info["observations_late"] = {"ok": False, "audit_only": True, "abandoned": not done}
 
         for city, target in items:
             info = rec["cities"][city.key]
@@ -462,50 +502,76 @@ class Recorder:
             else:
                 verdict = ("captured", eligible, reason)
             info["status"], info["eligible"], info["reason_code"] = verdict
+            info["paper_fill_eligible"], info["paper_fill_reason"] = paper_fill_verdict(
+                info["eligible"], cutoff, b2 if tickers else None, info["books_missing_recheck"])
             self.state["noon"].setdefault(city.key, {})[target.isoformat()] = {
                 "status": info["status"], "eligible": info["eligible"], "reason_code": info["reason_code"],
+                "paper_fill_eligible": info["paper_fill_eligible"], "paper_fill_reason": info["paper_fill_reason"],
                 "run_id": self.run_id, "cutoff_utc": iso(cutoff),
                 "receipt_lateness_seconds": rec.get("books", {}).get("receipt_lateness_seconds"),
                 "newest_usable_obs_age_seconds": obs.get("newest_usable_age_seconds"),
             }
 
-    def fetch_observations(self, ndir, city, info, cutoff, deadline):
-        """Observations from the start of the climate day up to noon.
-
-        With a deadline (before noon): retry until the deadline, with each request's timeout cut
-        so it can never run past it. The result is the decision snapshot in info["observations"].
-        Without one (after the books): a single audit-only request saved as *_late.json and
-        recorded in info["observations_late"]; it never replaces the snapshot.
-        """
+    @staticmethod
+    def _obs_url(city, info, cutoff) -> str:
         start = info["climate_day_utc"][0].replace("+00:00", "Z")
         end = cutoff.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-        url = (f"{NWS_BASE}/stations/{city.station}/observations"
-               f"?start={quote(start, safe='')}&end={quote(end, safe='')}")
-        if deadline is None:
-            f, _ = self.get(url, "noon_nws_observations_late", f"{ndir}/{city.key}/nws_observations_late.json",
-                            attempts=1, timeout=OBS_LATE_TIMEOUT)
-            info["observations_late"] = self._obs_record(f, cutoff, audit_only=True)
-            return
-        f, tries = None, 0
+        return (f"{NWS_BASE}/stations/{city.station}/observations"
+                f"?start={quote(start, safe='')}&end={quote(end, safe='')}")
+
+    def _fetch(self, url, timeout):
+        headers = {"User-Agent": USER_AGENT, "Accept": "application/geo+json, application/json;q=0.9"}
+        return fetch(self.clock, self.transport, url, headers=headers, timeout=timeout, attempts=1)
+
+    def _obs_attempts(self, url, deadline) -> list:
+        """Runs on a background thread: touches no shared state, returns every attempt.
+        Retries until `deadline`, each request's timeout cut to the time left."""
+        attempts = []
         while (left := (deadline - self.clock.now()).total_seconds()) >= 1:
-            tries += 1
-            f, _ = self.get(url, "noon_nws_observations", f"{ndir}/{city.key}/nws_observations.json",
-                            attempts=1, timeout=min(15, left))
+            f = self._fetch(url, timeout=min(15, left))
+            attempts.append(f)
             if f.ok:
                 break
             self.clock.sleep(min(2, max(0, (deadline - self.clock.now()).total_seconds())))
-        if f is None:
-            info["observations"] = {"ok": False, "received_before_cutoff": False, "no_answer_in_time": True,
-                                    "tries": 0, "note": "no time left before the cutoff"}
+        return attempts
+
+    def _log_fetch(self, f, kind, ndir, city, name):
+        entry = f.meta()
+        entry["kind"] = kind
+        self.run["fetches"].append(entry)
+        if name and f.body:
+            self.save(entry, f"{ndir}/{city.key}/{name}", f.body)
+
+    def _record_observations(self, ndir, city, info, cutoff, attempts, abandoned, error=None):
+        """The decision snapshot is a response RECEIVED by noon. A success that finished after
+        noon is kept as audit-only (observations_late), never as the snapshot."""
+        attempts = attempts or []
+        for i, f in enumerate(attempts, 1):
+            on_time = f.ok and f.received <= cutoff
+            name = ("nws_observations.json" if on_time else "nws_observations_late.json" if f.ok
+                    else f"nws_observations_error_{i}.json")
+            self._log_fetch(f, "noon_nws_observations", ndir, city, name)
+        last = attempts[-1] if attempts else None
+        if last is not None and last.ok and last.received <= cutoff:
+            info["observations"] = {**self._obs_record(last, cutoff, audit_only=False), "tries": len(attempts)}
             return
-        info["observations"] = {**self._obs_record(f, cutoff, audit_only=False), "tries": tries}
+        late_success = last is not None and last.ok
+        info["observations"] = {
+            "ok": False, "received_before_cutoff": False, "tries": len(attempts), "abandoned": abandoned,
+            # Late: no HTTP answer by noon (timeout, dropped connection, a success that finished
+            # after noon, or still running). Failed: the service answered with an error in time.
+            "no_answer_in_time": abandoned or late_success or last is None or last.status is None,
+            "last_http_status": last.status if last else None,
+            "last_error": last.error if last else (f"{type(error).__name__}: {error}" if error else None),
+            "last_received_at": iso(last.received) if last else None,
+        }
+        if late_success:
+            info["observations_late"] = self._obs_record(last, cutoff, audit_only=True)
 
     def _obs_record(self, f, cutoff, audit_only):
         rec = {"ok": f.ok, "requested_at": iso(f.requested), "received_at": iso(f.received),
                "http_status": f.status, "error": f.error,
-               "received_before_cutoff": f.ok and f.received <= cutoff and not audit_only,
-               # No HTTP answer before we had to stop (a timeout or dropped connection), as
-               # opposed to the server answering with an error.
+               "received_before_cutoff": f.ok and f.received <= cutoff,
                "no_answer_in_time": f.status is None, "audit_only": audit_only}
         if f.ok:
             self.guard("observations_summary", lambda: rec.update(self.observation_summary(f.body, cutoff)))

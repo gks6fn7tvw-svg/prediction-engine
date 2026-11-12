@@ -70,17 +70,25 @@ only. The raw files are the record.
   scoring. Each city is judged on its own books: if an on-time response
   leaves out any of a city's ranges, that city is `missing_books`. A cutoff more
   than 20 minutes gone is not captured at all and is recorded as `missed`.
-- **Noon weather must arrive before noon.** The observation requests start
-  30 seconds before noon and stop 3 seconds before it, with each city given a
-  fair share of that window, so a slow weather service can never delay the
-  books. A city whose observations did not arrive in time is saved but marked
-  `weather_late` (no answer in time), `weather_failed` (the service answered
-  with an error) or `weather_empty` (no usable temperatures). A late copy may
-  be fetched afterwards for the record; it is labelled `audit_only` and never
-  used for scoring. Late books outrank weather as the reason. Noon captures
-  have their own bookkeeping, so the day-before and noon snapshots for the
-  same day both survive, and noon misses are listed separately
-  (`noon_missed`).
+- **Noon weather must arrive before noon.** Each station's observations are
+  fetched on its own background thread from 30 seconds before noon, with
+  retries stopping 3 seconds before it, so weather can never delay the books
+  (a socket timeout limits each read, not a whole response). Only a response
+  *received* by noon is the decision snapshot. A city without one is saved
+  but marked `weather_late` (no answer by noon, including a success that
+  finished after noon), `weather_failed` (the service answered with an error)
+  or `weather_empty` (no usable temperatures). Late data is kept as
+  `nws_observations_late.json`, labelled `audit_only`, and never scored.
+  Threads still running 60 seconds after the books are abandoned. Late books
+  outrank weather as the reason. Noon captures have their own bookkeeping, so
+  the day-before and noon snapshots for the same day both survive, and noon
+  misses are listed separately (`noon_missed`).
+- **Paper fills need a complete delayed book.** Paper fills are priced on the
+  second snapshot, so a city is `paper_fill_eligible` only if its first
+  snapshot is eligible and the second arrived on time with every range
+  (`complete_recheck`; otherwise `recheck_failed`, `missing_recheck_books`,
+  `late_recheck` or `first_snapshot_ineligible`). The first snapshot alone can
+  still support research. This applies to both capture kinds.
 - **Two different clocks.** The 6 p.m. cutoff follows daylight saving. The day
   the contract measures does not: it is midnight to midnight local *standard*
   time, so 1 a.m. to 1 a.m. on the clock in summer. Both are written to

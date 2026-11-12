@@ -40,6 +40,35 @@ class FakeClock:
             self.sleeps.append(seconds)
             self.advance(seconds)
 
+    def background(self, fn):
+        """Simulates a background thread deterministically: fn runs now on its own branch of
+        time, then the clock goes back to where it was. join() later waits (advances the clock)
+        until the branch's finish time, or gives up after its timeout, like a real join."""
+        t0, m0 = self.t, self.m
+        job = FakeBackground(self)
+        try:
+            job.value = fn()
+        except Exception as exc:
+            job.error = exc
+        job.finish_m = self.m
+        self.t, self.m = t0, m0
+        return job
+
+
+class FakeBackground:
+    def __init__(self, clock):
+        self.clock, self.value, self.error, self.finish_m = clock, None, None, None
+
+    def join(self, timeout):
+        wait = self.finish_m - self.clock.m
+        if wait <= 0:
+            return True
+        if timeout is not None and wait > timeout:
+            self.clock.advance(max(0, timeout))
+            return False
+        self.clock.advance(wait)
+        return True
+
 
 class ShortSleepClock(FakeClock):
     """A clock whose sleeps return early, to prove waits are re-checked rather than trusted."""
@@ -59,10 +88,16 @@ class Replay:
         self.broken = set()    # substrings; any URL containing one fails with 503
         self.latency_for = {}  # substring -> seconds this kind of request takes to answer
         self.drop_books = set()  # ticker prefixes left out of an otherwise normal 200 response
+        # substrings whose responses trickle in: each read beats the socket timeout, so the
+        # whole response can take longer than `timeout` and still succeed (as with urllib)
+        self.trickle = set()
+        self.drop_recheck = set()  # like drop_books, but only from the second order-book request on
+        self.book_calls = 0
 
     def __call__(self, method, url, headers, body, timeout):
         latency = next((s for k, s in self.latency_for.items() if k in url), self.latency)
-        if timeout is not None and latency > timeout:  # like a real socket timeout
+        trickles = any(k in url for k in self.trickle)
+        if timeout is not None and latency > timeout and not trickles:  # like a real socket timeout
             self.clock.advance(timeout)
             self.calls.append((self.clock.now(), url))
             raise TimeoutError(f"timed out after {timeout}s")
@@ -81,8 +116,9 @@ class Replay:
                     books = []
                     for series in sorted({t.split("-")[0] for t in q["tickers"]}):
                         books += json.loads(fixture(series + "_orderbooks.json"))["orderbooks"]
-                    wanted = {t for t in q["tickers"]
-                              if not any(t.startswith(p) for p in self.drop_books)}
+                    self.book_calls += 1
+                    dropped = self.drop_books | (self.drop_recheck if self.book_calls >= 2 else set())
+                    wanted = {t for t in q["tickers"] if not any(t.startswith(p) for p in dropped)}
                     return ok(json.dumps({"orderbooks": [b for b in books if b["ticker"] in wanted]}).encode())
                 if u.path.endswith("/markets"):
                     if "event_ticker" in q:

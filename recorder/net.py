@@ -4,6 +4,7 @@ The clock and the transport are passed in, so tests can replay saved
 responses without touching the network.
 """
 import hashlib
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -17,6 +18,28 @@ def iso(dt: datetime) -> str:
     return dt.astimezone(timezone.utc).isoformat(timespec="microseconds")
 
 
+class Background:
+    """Runs fn on a daemon thread. fn must not touch shared state: it returns its results,
+    and the caller records them after join(), so an abandoned thread can never change a run
+    that is already being saved."""
+
+    def __init__(self, fn):
+        self.value = self.error = None
+        self._thread = threading.Thread(target=self._run, args=(fn,), daemon=True)
+        self._thread.start()
+
+    def _run(self, fn):
+        try:
+            self.value = fn()
+        except Exception as exc:  # recorded by the caller, never raised in the thread
+            self.error = exc
+
+    def join(self, timeout: float | None) -> bool:
+        """Wait up to `timeout` seconds; True if fn has finished."""
+        self._thread.join(timeout)
+        return not self._thread.is_alive()
+
+
 class RealClock:
     def now(self) -> datetime:
         return datetime.now(timezone.utc)
@@ -27,6 +50,9 @@ class RealClock:
     def sleep(self, seconds: float) -> None:
         if seconds > 0:
             time.sleep(seconds)
+
+    def background(self, fn) -> Background:
+        return Background(fn)
 
 
 def urllib_transport(method, url, headers, body, timeout):

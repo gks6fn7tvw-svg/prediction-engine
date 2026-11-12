@@ -175,6 +175,93 @@ class NoonCaptureTests(unittest.TestCase):
         _, again = self.w.run_at(datetime(2026, 11, 11, 17, 5, tzinfo=UTC))
         self.assertEqual(again["noon_captures"], 0)
 
+    # --- ChatGPT #23: timing follow-up ---
+
+    def test_http_success_that_finishes_after_noon_is_audit_only_and_books_start_at_noon(self):
+        # A socket timeout bounds each read, not the whole response: this one trickles in
+        # and succeeds 10 s after noon.
+        self.w.replay.latency_for["/observations"] = 40.0
+        self.w.replay.trickle.add("/observations")
+        rec, summary, noon = self.capture()
+        self.assertGreaterEqual(noon["books"]["request_lateness_seconds"], 0.0)
+        self.assertLess(noon["books"]["request_lateness_seconds"], 1.0)
+        for key in ("NY", "MIA"):
+            c = noon["cities"][key]
+            self.assertEqual((c["status"], c["eligible"], c["reason_code"]), ("captured", False, "weather_late"))
+            obs, late = c["observations"], c["observations_late"]
+            self.assertEqual((obs["ok"], obs["received_before_cutoff"], obs["no_answer_in_time"]),
+                             (False, False, True))
+            self.assertEqual((obs["last_http_status"], obs["abandoned"]), (200, False))
+            self.assertTrue(late["ok"] and late["audit_only"])
+            self.assertFalse(late["received_before_cutoff"])
+            self.assertGreater(datetime.fromisoformat(late["received_at"]), NOON)
+            self.assertIn(f"{rec.base}/noon_20261111T1700Z/{key}/nws_observations_late.json", rec.run["files"])
+            self.assertNotIn(f"{rec.base}/noon_20261111T1700Z/{key}/nws_observations.json", rec.run["files"])
+        # The late success is the audit copy; no second request was needed.
+        self.assertEqual(sum("/observations" in u for _, u in self.w.replay.calls), 2)
+        self.assertEqual(summary["noon_ineligible"], {"NY": "weather_late", "MIA": "weather_late"})
+
+    def test_weather_still_running_long_after_noon_is_abandoned(self):
+        self.w.replay.latency_for["/observations"] = 500.0
+        self.w.replay.trickle.add("/observations")
+        _, summary, noon = self.capture()
+        self.assertLess(noon["books"]["request_lateness_seconds"], 1.0)
+        c = noon["cities"]["NY"]
+        self.assertEqual(c["reason_code"], "weather_late")
+        self.assertTrue(c["observations"]["abandoned"])
+        self.assertEqual(c["observations_late"], {"ok": False, "audit_only": True, "abandoned": True})
+        self.assertTrue(summary["ok"])
+        # The run gave up instead of hanging: about 60 s for the threads and 60 s for the audit refetch.
+        self.assertLess(self.w.clock.now(), NOON + timedelta(minutes=4))
+
+    def test_paper_fills_need_a_complete_delayed_book(self):
+        self.w.replay.drop_recheck.add("KXHIGHMIA")
+        _, _, noon = self.capture()
+        ny, mia = noon["cities"]["NY"], noon["cities"]["MIA"]
+        self.assertEqual((ny["eligible"], ny["paper_fill_eligible"], ny["paper_fill_reason"]),
+                         (True, True, "complete_recheck"))
+        # MIA's first snapshot is complete and still supports research; its delayed book is not.
+        self.assertEqual((mia["eligible"], mia["paper_fill_eligible"], mia["paper_fill_reason"]),
+                         (True, False, "missing_recheck_books"))
+        st = self.w.state()["noon"]["MIA"]["2026-11-11"]
+        self.assertEqual((st["eligible"], st["paper_fill_eligible"]), (True, False))
+
+    def test_no_paper_fill_without_an_eligible_first_snapshot(self):
+        self.w.replay.broken.add("/observations")
+        _, _, noon = self.capture()
+        c = noon["cities"]["NY"]
+        self.assertEqual((c["paper_fill_eligible"], c["paper_fill_reason"]), (False, "first_snapshot_ineligible"))
+
+    def test_day_before_capture_gets_the_same_paper_fill_rule(self):
+        w = World(datetime(2026, 11, 10, 22, 52, tzinfo=UTC))
+        self.addCleanup(w.tmp.cleanup)
+        w.replay.drop_recheck.add("KXHIGHNY")
+        rec, _ = w.run_at()
+        cities = rec.run["cutoffs"][0]["cities"]
+        self.assertEqual((cities["NY"]["eligible"], cities["NY"]["paper_fill_reason"]),
+                         (True, "missing_recheck_books"))
+        self.assertEqual((cities["MIA"]["paper_fill_eligible"], cities["MIA"]["paper_fill_reason"]),
+                         (True, "complete_recheck"))
+        self.assertFalse(w.state()["cutoffs"]["NY"]["2026-11-11"]["paper_fill_eligible"])
+
+
+class RealThreadTests(unittest.TestCase):
+    def test_real_background_join_gives_up_without_waiting_for_the_work(self):
+        import time
+        from recorder.net import RealClock
+        job = RealClock().background(lambda: time.sleep(0.5) or "done")
+        t0 = time.monotonic()
+        self.assertFalse(job.join(0.05))
+        self.assertLess(time.monotonic() - t0, 0.3)
+        self.assertTrue(job.join(5))
+        self.assertEqual((job.value, job.error), ("done", None))
+
+    def test_real_background_keeps_errors_instead_of_raising(self):
+        from recorder.net import RealClock
+        job = RealClock().background(lambda: 1 / 0)
+        self.assertTrue(job.join(5))
+        self.assertIsInstance(job.error, ZeroDivisionError)
+
 
 class BothSnapshotsTests(unittest.TestCase):
     def test_day_before_and_noon_snapshots_for_the_same_target_both_survive(self):

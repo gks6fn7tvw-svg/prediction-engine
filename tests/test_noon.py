@@ -74,6 +74,14 @@ class NoonCaptureTests(unittest.TestCase):
         self.assertGreaterEqual(books["request_lateness_seconds"], 0.0)
         self.assertLess(books["request_lateness_seconds"], 1.0)
         self.assertGreaterEqual(books["recheck_gap_seconds"], 1.0)
+        # Actual book times and depth are logged for every ticker, both snapshots.
+        self.assertLess(books["first_requested_at"], books["first_received_at"])
+        self.assertLess(books["first_received_at"], books["second_requested_at"])
+        self.assertEqual(set(books["depth_first"]), set(books["depth_recheck"]))
+        self.assertEqual(len(books["depth_first"]), 12)
+        d = books["depth_first"]["KXHIGHNY-26NOV11-B61.5"]
+        self.assertEqual(set(d), {"yes_levels", "yes_contracts", "no_levels", "no_contracts"})
+        self.assertGreater(d["yes_levels"] + d["no_levels"], 0)
         # Inputs only: markets, observations and books. No settlement, CLI or outcome files.
         folder = f"{rec.base}/noon_20261111T1700Z/"
         names = sorted(p[len(folder):] for p in rec.run["files"] if p.startswith(folder))

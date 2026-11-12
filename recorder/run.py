@@ -75,6 +75,16 @@ def best_quotes(orderbook_fp: dict) -> dict:
     }
 
 
+def book_depth(orderbook_fp: dict) -> dict:
+    """How deep each side of a Kalshi book is: price levels and total contracts resting."""
+    out = {}
+    for side in ("yes", "no"):
+        rows = [(Decimal(p), Decimal(q)) for p, q in (orderbook_fp.get(f"{side}_dollars") or [])]
+        out[f"{side}_levels"] = len(rows)
+        out[f"{side}_contracts"] = str(sum((q for _, q in rows), Decimal(0)))
+    return out
+
+
 def first_book_verdict(cutoff: datetime, ok: bool, received: datetime) -> tuple[bool, str]:
     """Cutoff eligibility (design v0.3), judged on when the first order book ARRIVED.
 
@@ -351,6 +361,11 @@ class Recorder:
         books = (_json(f.body) or {}).get("orderbooks") or [] if f.ok else []
         return {b["ticker"]: best_quotes(b.get("orderbook_fp") or {}) for b in books}
 
+    @staticmethod
+    def depth(f) -> dict:
+        books = (_json(f.body) or {}).get("orderbooks") or [] if f.ok else []
+        return {b["ticker"]: book_depth(b.get("orderbook_fp") or {}) for b in books}
+
     # ---------- same-day noon capture (H1 inputs only) ----------
 
     def capture_noon(self, cutoff: datetime, items):
@@ -416,7 +431,8 @@ class Recorder:
                 "note": "raw books (full depth) are in books_1.json and books_2.json",
             }
             self.guard("noon_quotes", lambda: rec["books"].update(
-                quotes_first=self.quotes(b1), quotes_recheck=self.quotes(b2)))
+                quotes_first=self.quotes(b1), quotes_recheck=self.quotes(b2),
+                depth_first=self.depth(b1), depth_recheck=self.depth(b2)))
 
         for city, target in items:  # audit-only refetch for anything that missed noon; never scored
             info = rec["cities"][city.key]

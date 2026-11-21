@@ -398,6 +398,18 @@ class TestScore(BotCase):
         text = score(os.path.join(self.dir, "trades.csv"))
         self.assertIn("Trades: 1", text)
         self.assertIn("Total profit after fees: $+0.18", text)
+        self.assertIn("too early. 1 of 200 trades", text)
+
+    def test_verdicts(self):
+        from btcbot.ledger import luck_margin, verdict
+        # 300 trades at 90% when 80% is needed: clearly ahead
+        self.assertIn("ahead", verdict(0.90, 0.80, luck_margin(0.90, 300), 300))
+        # 300 trades at 70% when 80% is needed: clearly behind
+        self.assertIn("behind", verdict(0.70, 0.80, luck_margin(0.70, 300), 300))
+        # 300 trades at 81% when 80% is needed: luck could explain it
+        self.assertIn("too close", verdict(0.81, 0.80, luck_margin(0.81, 300), 300))
+        # the luck range shrinks as trades pile up
+        self.assertLess(luck_margin(0.8, 800), luck_margin(0.8, 200))
 
 
 class FlakyLiveBroker(PaperBroker):

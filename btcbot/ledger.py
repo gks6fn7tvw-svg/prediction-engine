@@ -102,14 +102,35 @@ def score(trades_path: str, mode: str | None = None) -> str:
         cost = sum((Decimal(r["contracts"]) * Decimal(r["entry_price"]) for r in rs), Decimal("0"))
         avg_price = cost / contracts if contracts else Decimal("0")
         need = (cost + fees) / contracts if contracts else Decimal("0")
+        rate = wins / n
+        luck = luck_margin(rate, n)
         lines += [
             f"== {name} ==",
-            f"Trades: {n}   Wins: {wins}   Losses: {n - wins}   Win rate: {100 * wins / n:.1f}%",
+            f"Trades: {n}   Wins: {wins}   Losses: {n - wins}   Win rate: {100 * rate:.1f}%",
             f"Average price paid: {avg_price * 100:.1f}c   Fees paid: ${fees:.2f}",
             f"To break even you need to win about {need * 100:.1f}% of contracts (price + fees).",
             f"Total profit after fees: ${profit:+.2f}",
+            f"Luck can move a win rate this much with {n} trades: about +/-{100 * luck:.1f} points.",
+            verdict(rate, float(need), luck, n),
         ]
-        if n < 50:
-            lines.append(f"Only {n} trades so far. Wait for about 50 before trusting this.")
         lines.append("")
     return "\n".join(lines)
+
+
+MIN_TRADES = 200  # first checkpoint; more trades shrink the luck range
+
+
+def luck_margin(rate: float, n: int) -> float:
+    """About 95% of the time, pure luck stays inside this many points of the true win rate."""
+    p = min(max(rate, 0.02), 0.98)  # never let the range shrink to zero
+    return 2 * (p * (1 - p) / n) ** 0.5
+
+
+def verdict(rate: float, need: float, luck: float, n: int) -> str:
+    if n < MIN_TRADES:
+        return f"Verdict: too early. {n} of {MIN_TRADES} trades so far. Keep it running."
+    if rate - luck > need:
+        return "Verdict: ahead by more than luck usually explains. A good sign; keep watching."
+    if rate + luck < need:
+        return "Verdict: behind by more than bad luck explains. This setting is losing money."
+    return "Verdict: too close to call. Keep it running; more trades shrink the luck range."

@@ -6,8 +6,9 @@ mode**, which uses pretend money. It only places real orders after you switch
 it to live mode on purpose.
 
 **Honest note:** no setting here has been shown to beat Kalshi's fees. Let
-paper mode run for about 50 trades, then check the score before you use real
-money.
+paper mode run for at least 200 trades, then check the score before you use
+real money. Paper testing is free, and running longer adds no cost. The score
+report includes a verdict that says whether the result is bigger than luck.
 
 ## What each setting does
 
@@ -49,7 +50,7 @@ Do this once. A computer is easier, but a phone works.
 5. **Install the bot.** Paste these lines into that window and press Enter:
    ```
    sudo apt-get update && sudo apt-get install -y git python3-venv
-   git clone https://github.com/gks6fn7tvw-svg/prediction-engine.git
+   git clone -b btcbot https://github.com/gks6fn7tvw-svg/prediction-engine.git
    cd prediction-engine
    python3 -m venv .venv
    .venv/bin/pip install -r btcbot/requirements.txt
@@ -58,6 +59,10 @@ Do this once. A computer is easier, but a phone works.
    ```
    `check` shows the current market and what each play would do right now.
    It never places an order.
+
+   The `-b btcbot` part is needed only until pull request #8 is merged. After
+   it's merged, run `git checkout main && git pull` once on the server, then
+   restart the bot.
 6. **Keep it running all the time:**
    ```
    bash btcbot/deploy/install_service.sh
@@ -74,7 +79,7 @@ Open the SSH window, then run `cd prediction-engine` first.
 | To... | Type |
 |---|---|
 | Watch it live | `journalctl -u btcbot -f` (Ctrl+C stops watching, not the bot) |
-| See the score | `.venv/bin/python -m btcbot score` |
+| See the score and verdict | `.venv/bin/python -m btcbot score` |
 | Change settings | `nano btcbot/settings.yaml`, save with Ctrl+O, Enter, Ctrl+X, then `sudo systemctl restart btcbot` |
 | Pause new trades | `touch btcbot/data/paper/STOP` (for live: `btcbot/data/live/STOP`) |
 | Resume | `rm btcbot/data/paper/STOP` |
@@ -87,7 +92,7 @@ folders, so the scores never mix. To restart paper testing from zero, delete
 
 ## Going live (real money)
 
-Only do this after the paper score looks good over about 50 trades.
+Only do this after `score` says "ahead by more than luck" over at least 200 trades.
 
 1. **Make a Kalshi API key:** on kalshi.com, open your profile settings
    (kalshi.com/account/profile), find **API Keys**, and click **Create New

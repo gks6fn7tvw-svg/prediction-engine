@@ -1,0 +1,180 @@
+"""Read and check settings.yaml. Every setting has a safe default."""
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from decimal import Decimal
+
+import yaml
+
+LIVE_CONFIRM_TEXT = "I accept real-money risk"
+
+
+class SettingsError(Exception):
+    pass
+
+
+def _dec(value, name: str, lo=None, hi=None, allow_none=False) -> Decimal | None:
+    if value is None:
+        if allow_none:
+            return None
+        raise SettingsError(f"{name} is missing")
+    try:
+        d = Decimal(str(value))
+    except Exception:
+        raise SettingsError(f"{name} must be a number, got {value!r}")
+    if lo is not None and d < Decimal(str(lo)):
+        raise SettingsError(f"{name} must be at least {lo}, got {value}")
+    if hi is not None and d > Decimal(str(hi)):
+        raise SettingsError(f"{name} must be at most {hi}, got {value}")
+    return d
+
+
+@dataclass
+class Conditions:
+    max_spread_cents: Decimal | None = None
+    min_contracts_at_price: Decimal | None = None
+    favorite_rising_seconds: Decimal | None = None
+    btc_distance_min_dollars: Decimal | None = None
+
+
+@dataclass
+class Play:
+    name: str
+    enabled: bool
+    buy: str                      # favorite | underdog | up | down
+    min_price: Decimal
+    max_price: Decimal
+    act_from_minutes_left: Decimal
+    act_until_minutes_left: Decimal
+    slippage_cents: Decimal
+    take_profit: Decimal | None
+    stop_loss: Decimal | None
+    conditions: Conditions
+
+    @property
+    def has_exits(self) -> bool:
+        return self.take_profit is not None or self.stop_loss is not None
+
+
+@dataclass
+class Settings:
+    mode: str
+    live_confirm: str
+    markets: list
+    paper_balance: Decimal
+    balance_share_pct: Decimal
+    size_mode: str
+    size_value: Decimal
+    max_contracts: Decimal
+    daily_loss_mode: str
+    daily_loss_value: Decimal
+    max_trades_per_day: int
+    day_timezone: str
+    plays: list = field(default_factory=list)
+    fast_seconds: float = 1.0
+    slow_seconds: float = 15.0
+    folder: str = "data"
+    api_base: str = "https://external-api.kalshi.com/trade-api/v2"
+
+    @property
+    def live(self) -> bool:
+        return self.mode == "live"
+
+
+def _play(raw: dict, i: int) -> Play:
+    name = str(raw.get("name") or f"play{i + 1}")
+    p = f"plays[{name}]"
+    buy = str(raw.get("buy", "favorite")).lower()
+    if buy not in ("favorite", "underdog", "up", "down", "yes", "no"):
+        raise SettingsError(f"{p}.buy must be favorite, underdog, up or down, got {buy!r}")
+    buy = {"yes": "up", "no": "down"}.get(buy, buy)
+    lo = _dec(raw.get("min_price", 0.01), f"{p}.min_price", 0.01, 0.99)
+    hi = _dec(raw.get("max_price", 0.99), f"{p}.max_price", 0.01, 0.99)
+    if lo > hi:
+        raise SettingsError(f"{p}.min_price ({lo}) is above max_price ({hi})")
+    start = _dec(raw.get("act_from_minutes_left", 15), f"{p}.act_from_minutes_left", 0, 1440)
+    end = _dec(raw.get("act_until_minutes_left", 0), f"{p}.act_until_minutes_left", 0, 1440)
+    if end > start:
+        raise SettingsError(f"{p}: act_until_minutes_left ({end}) must be smaller than "
+                            f"act_from_minutes_left ({start}); the clock counts down")
+    tp = _dec(raw.get("take_profit"), f"{p}.take_profit", 0.01, 0.99, allow_none=True)
+    sl = _dec(raw.get("stop_loss"), f"{p}.stop_loss", 0.01, 0.99, allow_none=True)
+    if tp is not None and sl is not None and sl >= tp:
+        raise SettingsError(f"{p}: stop_loss ({sl}) must be below take_profit ({tp})")
+    c = raw.get("conditions") or {}
+    conditions = Conditions(
+        max_spread_cents=_dec(c.get("max_spread_cents"), f"{p}.max_spread_cents", 0, 99, True),
+        min_contracts_at_price=_dec(c.get("min_contracts_at_price"), f"{p}.min_contracts_at_price", 0, None, True),
+        favorite_rising_seconds=_dec(c.get("favorite_rising_seconds"), f"{p}.favorite_rising_seconds", 1, 900, True),
+        btc_distance_min_dollars=_dec(c.get("btc_distance_min_dollars"), f"{p}.btc_distance_min_dollars", 0, None, True),
+    )
+    return Play(name, bool(raw.get("enabled", True)), buy, lo, hi, start, end,
+                _dec(raw.get("slippage_cents", 0), f"{p}.slippage_cents", 0, 20), tp, sl, conditions)
+
+
+def parse(raw: dict) -> Settings:
+    if not isinstance(raw, dict):
+        raise SettingsError("settings file is empty or not in the right format")
+    mode = str(raw.get("mode", "paper")).lower()
+    if mode not in ("paper", "live"):
+        raise SettingsError(f"mode must be paper or live, got {mode!r}")
+    live_confirm = str(raw.get("live_confirm") or "")
+    if mode == "live" and live_confirm != LIVE_CONFIRM_TEXT:
+        raise SettingsError(f'mode is live, so live_confirm must say exactly: "{LIVE_CONFIRM_TEXT}"')
+    markets = raw.get("markets") or ["KXBTC15M"]
+    if not isinstance(markets, list) or not all(isinstance(m, str) and m for m in markets):
+        raise SettingsError("markets must be a list like [KXBTC15M]")
+    size = raw.get("size") or {}
+    size_mode = str(size.get("mode", "contracts")).lower()
+    if size_mode not in ("percent", "contracts", "dollars"):
+        raise SettingsError(f"size.mode must be percent, contracts or dollars, got {size_mode!r}")
+    loss = raw.get("daily_loss_limit") or {}
+    loss_mode = str(loss.get("mode", "dollars")).lower()
+    if loss_mode not in ("percent", "dollars"):
+        raise SettingsError(f"daily_loss_limit.mode must be percent or dollars, got {loss_mode!r}")
+    plays = [_play(p or {}, i) for i, p in enumerate(raw.get("plays") or [])]
+    names = [p.name for p in plays]
+    if len(set(names)) != len(names):
+        raise SettingsError("each play needs its own name")
+    if not any(p.enabled for p in plays):
+        raise SettingsError("turn on at least one play (enabled: true)")
+    polling = raw.get("polling") or {}
+    files = raw.get("files") or {}
+    s = Settings(
+        mode=mode,
+        live_confirm=live_confirm,
+        markets=markets,
+        paper_balance=_dec(raw.get("paper_balance", 20), "paper_balance", 0),
+        balance_share_pct=_dec(raw.get("balance_share_pct", 50), "balance_share_pct", 0, 100),
+        size_mode=size_mode,
+        size_value=_dec(size.get("value", 1), "size.value", 0),
+        max_contracts=_dec(size.get("max_contracts", 1), "size.max_contracts", 0),
+        daily_loss_mode=loss_mode,
+        daily_loss_value=_dec(loss.get("value", 5), "daily_loss_limit.value", 0),
+        max_trades_per_day=int(raw.get("max_trades_per_day", 0) or 0),
+        day_timezone=str(raw.get("day_timezone", "Pacific/Honolulu")),
+        plays=plays,
+        fast_seconds=float(polling.get("fast_seconds", 1)),
+        slow_seconds=float(polling.get("slow_seconds", 15)),
+        folder=str(files.get("folder", "data")),
+        api_base=str(raw.get("api_base", "https://external-api.kalshi.com/trade-api/v2")),
+    )
+    if s.fast_seconds < 0.5 or s.slow_seconds < s.fast_seconds:
+        raise SettingsError("polling: fast_seconds must be at least 0.5 and slow_seconds at least fast_seconds")
+    try:
+        from zoneinfo import ZoneInfo
+        ZoneInfo(s.day_timezone)
+    except Exception:
+        raise SettingsError(f"day_timezone {s.day_timezone!r} is not a known time zone")
+    return s
+
+
+def load(path: str) -> Settings:
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            raw = yaml.safe_load(fh)
+    except FileNotFoundError:
+        raise SettingsError(f"no settings file at {path}. Copy settings.example.yaml to settings.yaml first.")
+    except yaml.YAMLError as e:
+        raise SettingsError(f"settings file has a typo: {e}")
+    return parse(raw)

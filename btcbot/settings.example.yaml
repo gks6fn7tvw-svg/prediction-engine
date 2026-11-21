@@ -1,0 +1,90 @@
+# ============================================================
+#  Kalshi 15-minute bot settings
+#  Copy this file to settings.yaml, change any number, save,
+#  then restart the bot. Prices are in dollars: 0.70 = 70 cents.
+#  "null" means the setting is off.
+# ============================================================
+
+# paper = pretend money (safe, the default). live = REAL money.
+mode: paper
+# For live mode you must also change the line below to exactly:
+#   live_confirm: "I accept real-money risk"
+live_confirm: ""
+
+# Which Kalshi markets to watch. KXBTC15M = Bitcoin 15-minute Up/Down.
+# Others: KXETH15M (Ethereum), KXSOL15M (Solana), KXXRP15M (XRP).
+markets:
+  - KXBTC15M
+
+# Pretend starting money for paper mode, in dollars.
+paper_balance: 11.00
+
+# ---- How much of your Kalshi it can use ----
+# Money tied up in open trades never goes above this % of your balance.
+balance_share_pct: 50
+
+# ---- Size and limits ----
+size:
+  mode: contracts      # contracts = a fixed number | percent = % of balance | dollars = fixed $
+  value: 1             # 1 contract per trade (or 9 for 9%, or 2.00 for $2)
+  max_contracts: 1     # never more than this many per trade (0 = no cap)
+daily_loss_limit:
+  mode: dollars        # dollars or percent (of the day's starting balance)
+  value: 5             # stop new trades for the day after losing $5
+max_trades_per_day: 0  # 0 = no cap
+day_timezone: Pacific/Honolulu   # when "today" starts and ends, and log times
+
+# ---- Plays: the rules for when to buy ----
+# Each play buys at most once per market. Add more by copying a block.
+plays:
+  - name: main
+    enabled: true
+
+    # What it buys: favorite | underdog | up | down
+    buy: favorite
+    min_price: 0.70        # only buy if it costs at least 70c
+    max_price: 0.85        # and at most 85c
+    slippage_cents: 0      # pay up to this many cents more than the price you see
+
+    # When it may act (minutes left before the market closes)
+    act_from_minutes_left: 8
+    act_until_minutes_left: 7
+
+    # How it gets out. null = hold to the end and get $1 per contract if it wins.
+    take_profit: null      # e.g. 0.95 = sell as soon as someone will pay 95c
+    stop_loss: null        # e.g. 0.50 = sell if what you could get drops to 50c
+
+    # Extra conditions (all off when null)
+    conditions:
+      max_spread_cents: null          # skip if buy price minus sell price is more than this
+      min_contracts_at_price: null    # skip if fewer contracts are offered at that price
+      favorite_rising_seconds: null   # the side must be higher than it was this many seconds ago
+      btc_distance_min_dollars: null  # price must be this many $ past the target (uses Coinbase)
+
+  # Second play (optional). Off until you set enabled: true.
+  - name: second
+    enabled: false
+    buy: favorite
+    min_price: 0.88
+    max_price: 0.95
+    slippage_cents: 0
+    act_from_minutes_left: 1
+    act_until_minutes_left: 0
+    take_profit: null
+    stop_loss: null
+    conditions:
+      max_spread_cents: 3
+      min_contracts_at_price: null
+      favorite_rising_seconds: null
+      btc_distance_min_dollars: null
+
+# How often it checks prices, in seconds. Fast is used when a play's
+# window is open or a trade has take profit / stop loss. Slow the rest of
+# the time, which keeps the free server's internet use tiny.
+polling:
+  fast_seconds: 1
+  slow_seconds: 15
+
+# Where it keeps its trade log, memory and log file.
+files:
+  folder: data

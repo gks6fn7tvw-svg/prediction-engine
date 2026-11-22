@@ -15,6 +15,13 @@ from .kalshi import KalshiClient, KalshiError, coinbase_spot
 from .ledger import Ledger, Position, State
 from .settings import Settings
 
+PAPER_RESET_FILE = "PAPER_RESET"   # the website writes the new pretend balance here
+
+
+def plain(n) -> str:
+    """10 -> "10", 2.50 -> "2.5" (never "1E+1")."""
+    return format(Decimal(n).normalize(), "f")
+
 log = logging.getLogger("btcbot")
 
 MAX_ORDER_TRIES = 5          # per play per market, so a moving price can't spam orders
@@ -74,6 +81,7 @@ class Bot:
     def step(self) -> float:
         now = self.clock.now()
         self._roll_day(now)
+        self._apply_paper_reset()
         quotes = self._fetch_quotes(now)
         self._share_prices(quotes, now)
         for pos in list(self.state.open_positions()):
@@ -182,6 +190,37 @@ class Bot:
         self.state.day_trades = 0
         log.info("new day %s: starting balance $%.2f", day, bal + open_cost)
 
+    def _apply_paper_reset(self) -> None:
+        """Paper mode only: set the pretend money to the amount the website asked for.
+
+        Past bets and open bets are kept; today's loss count starts over.
+        """
+        path = os.path.join(self.ledger.folder, PAPER_RESET_FILE)
+        if not os.path.exists(path):
+            return
+        try:
+            with open(path, encoding="utf-8") as fh:
+                amount = Decimal(fh.read().strip())
+        except (OSError, ArithmeticError):
+            amount = None
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+        if self.broker.live:
+            log.warning("ignored a pretend-money reset: the bot is using real money")
+            return
+        if amount is None or amount < 0:
+            log.warning("ignored a pretend-money reset: the amount was not a number")
+            return
+        open_cost = sum((p.cost for p in self.state.open_positions()), Decimal("0"))
+        self.broker.cash = amount
+        self.state.paper_cash = str(amount)
+        self.state.day_start_balance = str(amount + open_cost)
+        self.state.day_profit = "0"
+        self.ledger.save_state(self.state)
+        log.info("pretend money reset to $%.2f; past bets are kept", amount)
+
     def _entry_block_reason(self) -> str | None:
         if os.path.exists(self.stop_file):
             return f"STOP file found, so no new trades (delete {self.stop_file} to resume)"
@@ -232,7 +271,7 @@ class Bot:
         if fill is None:
             self._say(key, f"{play.name}: {q.ticker}: price moved before the order filled; will retry")
             return
-        pos = Position(play.name, q.ticker, q.series, chk.side, str(fill.contracts), str(fill.price),
+        pos = Position(play.name, q.ticker, q.series, chk.side, plain(fill.contracts), str(fill.price),
                        str(fill.fee), now.isoformat(), q.close_time.isoformat() if q.close_time else "")
         positions = self.state.open_positions() + [pos]
         self.state.set_positions(positions)
@@ -348,7 +387,7 @@ class Bot:
         self.ledger.record_trade({
             "opened_at": pos.opened_at, "closed_at": now.isoformat(), "mode": self.s.mode,
             "play": pos.play, "market": pos.ticker, "side": rules.side_name(pos.side),
-            "contracts": str(contracts), "entry_price": pos.entry_price,
+            "contracts": plain(contracts), "entry_price": pos.entry_price,
             "entry_fee": f"{entry_fee:.4f}", "exit_type": kind, "exit_price": str(exit_price),
             "exit_fee": f"{exit_fee:.4f}", "result": rules.side_name(result) if result else "",
             "payout": f"{payout:.4f}", "profit": f"{profit:.4f}",

@@ -26,6 +26,7 @@ from zoneinfo import ZoneInfo
 
 from . import ledger as L
 from .kalshi import KalshiClient
+from .bot import PAPER_RESET_FILE
 from .rules import Quote, parse_time
 from .settings import (PACKAGE_DIR, SIZE_MODES, Settings, SettingsError, load, load_raw, mode_folder,
                        save_raw)
@@ -49,7 +50,9 @@ DONE_MESSAGES = {
     "added": "Added a new play. It starts switched off: set it up, tick \"This play is on\", then Save.",
     "copied": "Copied. The copy starts switched off: change it, tick \"This play is on\", then Save.",
     "deleted": "Deleted. Its past bets stay in the trade list.",
+    "reset": "Pretend money reset. The bot picks it up within a few seconds; past bets are kept.",
 }
+LOW_MONEY = Decimal("1")
 
 
 def load_key(path: str | None = None) -> str:
@@ -389,11 +392,20 @@ class App:
                     raise SettingsError("you need at least one play, so this one can't be deleted")
                 plays.pop(i)
                 done = "deleted"
+            elif action == "reset_paper":
+                if raw.get("mode", "paper") != "paper":
+                    raise SettingsError("pretend money can only be reset in paper mode")
+                done = "reset"
             elif action != "save":
                 raise SettingsError("that button didn't work; please try again")
         except (ValueError, IndexError):
             raise SettingsError("that button didn't work; please reload the page and try again")
-        save_raw(self.settings_path, raw)
+        s = save_raw(self.settings_path, raw)
+        if done == "reset":
+            folder = mode_folder(s)
+            os.makedirs(folder, exist_ok=True)
+            with open(os.path.join(folder, PAPER_RESET_FILE), "w", encoding="utf-8") as fh:
+                fh.write(str(s.paper_balance))
         return done, focus
 
     def set_paused(self, paused: bool) -> None:
@@ -718,6 +730,10 @@ def overview_page(app: App) -> str:
         parts.append('<div class="box warn"><b>Paused:</b> no new bets. Open bets still finish.'
                      '<form method="post" action="/resume"><button>Resume betting</button></form></div>')
     total = L.stats(d["rows"])
+    if st is not None and s.mode == "paper" and Decimal(st.paper_cash) < LOW_MONEY:
+        parts.append(f'<div class="box bad"><b>Pretend money is almost gone (${float(st.paper_cash):.2f}),</b> '
+                     'so the plays can\'t place new bets. '
+                     '<a href="/settings#money" style="color:#8fb0ff">Reset it on the Settings page</a>.</div>')
     if st is not None:
         bal = f"${float(st.paper_cash):.2f}" if s.mode == "paper" else "Kalshi app"
         parts.append(
@@ -910,9 +926,21 @@ def settings_page(app: App, raw: dict | None = None, message: str | None = None,
             f'<div class="check"><input type="checkbox" name="market_{m}" value="1"'
             f'{" checked" if m in markets else ""}><span>{esc(n)} 15-minute</span></div>'
             for m, n in MARKETS) + f'<label>Other series (comma separated)</label>{inp("market_other", other, "text")}</div>')
+    reset = ""
+    if raw.get("mode", "paper") == "paper":
+        try:
+            s = load(app.settings_path)
+            now_cash = L.Ledger(mode_folder(s)).load_state(s.paper_balance).paper_cash
+            reset = f'<p class="hint">Pretend money right now: ${float(now_cash):.2f}</p>'
+        except (SettingsError, OSError, ValueError):
+            pass
+        reset += ('<button class="btn2" name="action" value="reset_paper" onclick="return confirm(this.dataset.q)" '
+                  'data-q="Set the pretend money to the amount above? Past bets are kept.">'
+                  'Reset pretend money to this amount</button>')
     out.append(
-        '<h2>Money and limits (all plays)</h2><div class="box">'
+        '<h2 id="money">Money and limits (all plays)</h2><div class="box">'
         f'<label>Pretend starting money ($, paper mode)</label>{inp("paper_balance", plain(raw.get("paper_balance", 11)))}'
+        f'{reset}'
         f'<label>Most of your money in open bets at once (%)</label>{inp("balance_share_pct", plain(raw.get("balance_share_pct", 50)))}'
         f'<div class="row2"><div><label>Default bet size</label><select name="size_mode">'
         f'{opt(SIZE_CHOICES, size.get("mode", "contracts"))}</select></div>'

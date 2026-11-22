@@ -382,6 +382,26 @@ class TestLive(WebCase):
         self.assertIn("main · closes", j["parts"]["live-open"])  # overview names the play
 
 
+class TestPaperMoney(WebCase):
+    def test_low_money_warning_and_reset_button(self):
+        folder = mode_folder(load(self.path))
+        ledger = Ledger(folder)
+        state = ledger.load_state(D(11))
+        state.paper_cash = "0.001"
+        ledger.save_state(state)
+        _, body, _ = self.call(f"/?key={KEY}")
+        self.assertIn("Pretend money is almost gone", body)
+        form = TestPlayButtons.form_from_page(self)
+        form["paper_balance"] = "50"
+        status, _, headers = self.call("/settings", data=dict(form, action="reset_paper"))
+        self.assertEqual(status, 303)
+        self.assertIn("done=reset", headers["Location"])
+        self.assertEqual(load(self.path).paper_balance, D(50))
+        self.assertEqual(read(os.path.join(folder, "PAPER_RESET")), "50")
+        _, body, _ = self.call("/settings", cookie=f"btcbot_key={KEY}")
+        self.assertIn("Pretend money right now: $0.00", body)
+
+
 class TestRestartOnChange(unittest.TestCase):
     def test_watcher_notices_a_saved_file(self):
         d = tempfile.mkdtemp()

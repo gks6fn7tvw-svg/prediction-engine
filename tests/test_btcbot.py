@@ -311,6 +311,36 @@ class TestPlaySizes(BotCase):
         self.assertEqual((m["markets"][0]["yes_bid"], m["markets"][0]["yes_ask"]), ("0.2000", "0.2200"))
 
 
+class TestPaperReset(BotCase):
+    def test_reset_file_sets_pretend_money_and_keeps_bets(self):
+        self.make()
+        self.at(7.5, 0.20, 0.22)            # buy Down at 0.80
+        self.settle("yes")                  # lose 0.82
+        with open(os.path.join(self.dir, "PAPER_RESET"), "w") as fh:
+            fh.write("25")
+        self.at(7.4, 0.20, 0.22)            # next pass picks it up
+        self.assertEqual(self.broker.cash, D("25"))
+        self.assertEqual(D(self.bot.state.paper_cash), D("25"))
+        self.assertEqual(D(self.bot.state.day_profit), D("0"))
+        self.assertFalse(os.path.exists(os.path.join(self.dir, "PAPER_RESET")))
+        self.assertEqual(len(self.trades()), 1)
+
+    def test_bad_reset_is_ignored(self):
+        self.make()
+        with open(os.path.join(self.dir, "PAPER_RESET"), "w") as fh:
+            fh.write("lots")
+        self.at(9, 0.20, 0.22)
+        self.assertEqual(self.broker.cash, D("11"))
+        self.assertFalse(os.path.exists(os.path.join(self.dir, "PAPER_RESET")))
+
+    def test_contract_counts_are_plain_numbers(self):
+        self.make(size={"mode": "contracts", "value": 10, "max_contracts": 10}, balance_share_pct=100)
+        self.at(7.5, 0.25, 0.27)            # Down at 0.75 x 10
+        self.assertEqual(self.bot.state.open_positions()[0].contracts, "10")
+        self.settle("no")
+        self.assertEqual(self.trades()[0]["contracts"], "10")
+
+
 class TestBreakEven(unittest.TestCase):
     def row(self, profit, exit_type="settled", price="0.10"):
         return {"profit": profit, "entry_fee": "0.01", "exit_fee": "0", "contracts": "1",

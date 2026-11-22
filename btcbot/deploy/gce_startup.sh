@@ -87,7 +87,7 @@ systemctl enable btcbot >/dev/null 2>&1
 systemctl restart btcbot
 
 say "checking the connection to Kalshi (no orders)"
-as_bot "$REPO/.venv/bin/python" -m btcbot check 2>&1 | sed 's/^/BTCBOT CHECK: /'
+(cd "$REPO" && as_bot "$REPO/.venv/bin/python" -m btcbot check 2>&1) | sed 's/^/BTCBOT CHECK: /'
 sleep 3
 if systemctl is-active --quiet btcbot; then
   say "DONE. The bot is running. Its log lines follow below as they happen."

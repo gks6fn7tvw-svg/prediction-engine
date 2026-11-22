@@ -486,3 +486,35 @@ class TestRealMoneyPages(WebCase):
         self.assertEqual(load(self.path).plays[0].subaccount, 3)
         _, body, _ = self.call("/settings", cookie=f"btcbot_key={KEY}")
         self.assertIn('name="p0_sub" value="3"', body)
+
+
+class TestGoalPages(WebCase):
+    def test_goal_form_and_progress(self):
+        form = TestPlayButtons.form_from_page(self)
+        form.update(goal_on="1", goal_target="100", goal_boldness="careful", goal_stop="4", goal_max="20")
+        self.call("/settings", data=dict(form, action="save"))
+        g = load(self.path).goal
+        self.assertEqual((g.enabled, g.target, g.boldness, g.stop_below, g.max_bet_pct),
+                         (True, D(100), "careful", D(4), D(20)))
+        folder = mode_folder(load(self.path))
+        ledger = Ledger(folder)
+        state = ledger.load_state(D(11))
+        state.paper_cash, state.goal_start = "32.50", "10.00"
+        ledger.save_state(state)
+        _, body, _ = self.call(f"/?key={KEY}")
+        self.assertIn("$10.00 → $100.00", body)
+        self.assertIn("now <b>$32.50</b>", body)
+        self.assertIn("25% of the way", body)
+        self.assertIn("Goal mode:</b> bets 1 contract until its record proves an edge (0 of 30", body)
+
+    def test_goal_reached_note(self):
+        form = TestPlayButtons.form_from_page(self)
+        form.update(goal_on="1", goal_target="12", goal_boldness="normal", goal_stop="", goal_max="25")
+        self.call("/settings", data=dict(form, action="save"))
+        ledger = Ledger(mode_folder(load(self.path)))
+        state = ledger.load_state(D(11))
+        state.paper_cash, state.goal_start = "12.40", "10.00"
+        state.goal_note = "Goal reached: $12.40 (started at $10.00). New bets are paused."
+        ledger.save_state(state)
+        _, body, _ = self.call(f"/?key={KEY}")
+        self.assertIn("🎉 Goal reached", body)

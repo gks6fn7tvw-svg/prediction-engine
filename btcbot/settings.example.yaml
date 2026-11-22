@@ -89,3 +89,14 @@ polling:
 # Where it keeps its trade log, memory and log file.
 files:
   folder: data
+
+# Goal mode: bet sizes worked out automatically to grow the money toward a goal.
+# Each play bets 1 contract until its record proves an edge (30+ bets), then the
+# share of its money that grows it fastest (Kelly): careful = 1/4, normal = 1/2,
+# bold = all of it. New bets pause at the goal or below stop_below (0 = never).
+goal:
+  enabled: false
+  target: 100
+  boldness: normal
+  stop_below: 0
+  max_bet_pct: 25

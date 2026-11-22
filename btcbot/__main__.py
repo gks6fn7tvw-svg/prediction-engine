@@ -18,7 +18,7 @@ from zoneinfo import ZoneInfo
 
 import requests
 
-from . import rules
+from . import keystore, rules
 from .bot import Bot, RealClock
 from .broker import LiveBroker, PaperBroker
 from .kalshi import KalshiClient, KalshiError, load_private_key
@@ -42,9 +42,11 @@ def setup_logging(folder: str, tz: str) -> None:
 def make_client(settings, need_key: bool) -> KalshiClient:
     key_id = os.environ.get("KALSHI_API_KEY_ID")
     key_path = os.environ.get("KALSHI_PRIVATE_KEY_PATH")
+    if not (key_id and key_path):  # the key saved from the website
+        key_id, key_path = keystore.load_key()
     if need_key and not (key_id and key_path):
-        raise SettingsError("live mode needs KALSHI_API_KEY_ID and KALSHI_PRIVATE_KEY_PATH "
-                            "(see the setup guide, step 6)")
+        raise SettingsError("real-money mode needs your Kalshi API key: add it on the website's "
+                            "Settings page (Real money), over the secure https link")
     private_key = load_private_key(key_path) if (key_id and key_path and need_key) else None
     return KalshiClient(settings.api_base, key_id if private_key is not None else None, private_key)
 

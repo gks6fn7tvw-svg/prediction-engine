@@ -14,6 +14,7 @@ import html
 import json
 import os
 import secrets
+import ssl
 import subprocess
 import sys
 import threading
@@ -25,12 +26,15 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, quote, urlparse
 from zoneinfo import ZoneInfo
 
+from . import goal as G
+from . import keystore
 from . import ledger as L
-from .kalshi import KalshiClient
+from .kalshi import KalshiClient, KalshiError
 from .bot import PAPER_RESET_FILE, TRANSFER_FILE, account_name
 from .rules import Quote, parse_time
-from .settings import (PACKAGE_DIR, SIZE_MODES, Settings, SettingsError, load, load_raw, mode_folder,
-                       save_raw)
+from .secure import SecureLink
+from .settings import (LIVE_CONFIRM_TEXT, PACKAGE_DIR, SIZE_MODES, Settings, SettingsError, load, load_raw,
+                       mode_folder, save_raw)
 
 KEY_FILE_ENV = "BTCBOT_WEB_KEY_FILE"
 MARKETS = [("KXBTC15M", "Bitcoin"), ("KXETH15M", "Ethereum"), ("KXSOL15M", "Solana"), ("KXXRP15M", "XRP")]
@@ -274,6 +278,9 @@ class App:
         self.updater = update_code
         self.restarter = restart_soon
         self.moved = ""
+        self.flash = ""               # one-time message for the Settings page
+        self.secure_link: SecureLink | None = None
+        self.key_tester = test_key
         self.fetcher = self._fetch_from_kalshi
         self._client = None
         self._lock = threading.Lock()
@@ -449,6 +456,14 @@ def form_to_raw(form: dict, current: dict) -> dict:
         "value": number(form, "loss_value", "Daily loss limit"),
     }
     raw["max_trades_per_day"] = number(form, "max_trades_per_day", "Most bets per day")
+    if "goal_target" in form:
+        raw["goal"] = {
+            "enabled": bool(field(form, "goal_on")),
+            "target": number(form, "goal_target", "Goal"),
+            "boldness": field(form, "goal_boldness", "normal"),
+            "stop_below": number(form, "goal_stop", "Goal stop", blank_ok=True) or 0,
+            "max_bet_pct": number(form, "goal_max", "Biggest bet"),
+        }
     plays = []
     for i in range(int(field(form, "play_count", "0") or 0)):
         p = f"p{i}_"
@@ -539,6 +554,8 @@ details{margin-top:12px}summary{cursor:pointer;color:#8fb0ff}
 @keyframes fu{from{background:rgba(54,211,127,.45)}to{background:transparent}}
 @keyframes fd{from{background:rgba(255,107,107,.45)}to{background:transparent}}
 .flash-up{animation:fu 1.3s ease-out;border-radius:6px}.flash-down{animation:fd 1.3s ease-out;border-radius:6px}
+.bar{height:12px;border-radius:99px;background:var(--card2);overflow:hidden;margin:10px 0 4px}
+.bar span{display:block;height:100%;background:linear-gradient(90deg,var(--blue),var(--green))}
 .empty{color:var(--dim);font-size:14px;padding:6px 0}.back{display:inline-block;color:#8fb0ff;text-decoration:none;margin-bottom:6px}
 """
 
@@ -723,7 +740,7 @@ def status_pill(play) -> str:
 
 
 # ---------------------------------------------------------------- pages
-def overview_page(app: App) -> str:
+def overview_page(app: App, secure: bool = False) -> str:
     d = app.snapshot()
     s = d["s"]
     if s is None:
@@ -742,6 +759,12 @@ def overview_page(app: App) -> str:
     if app.moved:
         parts.append(f'<div class="box ok">{esc(app.moved)}</div>')
         app.moved = ""
+    if not secure and app.secure_link is not None and app.secure_link.ready:
+        url = f"{app.secure_link.url()}/?key={app.key}"
+        parts.append(f'<div class="box ok">🔒 <b>A locked link is ready.</b> <a href="{esc(url)}" '
+                     'style="color:#8fb0ff">Open it</a> and add it to your home screen instead of this one. '
+                     '<span class="hint">If it won\'t load, tick "Allow HTTPS traffic" on the server in Google '
+                     'Cloud (one time).</span></div>')
     total = L.stats(d["rows"])
     if st is not None and s.mode == "paper" and Decimal(st.paper_cash) < LOW_MONEY:
         parts.append(f'<div class="box bad"><b>Pretend money is almost gone (${float(st.paper_cash):.2f}),</b> '
@@ -764,6 +787,9 @@ def overview_page(app: App) -> str:
     if st is not None and st.positions:
         parts.append(f'<h2>Open bets · {len(st.positions)}</h2>'
                      f'<div class="box" id="live-open">{overview_open_bets(d)}</div>')
+    history = G.history(s) if s.goal.enabled else []
+    if s.goal.enabled and st is not None:
+        parts.append(goal_box(d, s, st))
     parts.append("<h2>Your plays</h2>")
     by_name = {p.name: p for p in s.plays}
     positions = st.positions if st is not None else []
@@ -774,6 +800,10 @@ def overview_page(app: App) -> str:
         desc = describe_play(play, s) if play else "Removed or renamed. Its past bets are kept here."
         if play and s.mode == "live":
             desc += f" Uses {esc(account_name(play.subaccount))}."
+        if play and play.enabled and s.goal.enabled:
+            e = G.edge([r for r in history if r["play"] == name])
+            share = G.bet_share(e, s.goal.boldness, s.goal.max_bet_pct)
+            desc += f" <b>Goal mode:</b> {esc(G.describe(e, share))}."
         if ps["trades"]:
             mini = (f'<span><b>{ps["trades"]}</b> bet{"" if ps["trades"] == 1 else "s"}</span><span><b>{100 * ps["win_rate"]:.0f}%</b> won</span>'
                     f'<span><b>{money(ps["profit"])}</b></span>')
@@ -827,6 +857,43 @@ def money_section(d: dict) -> str:
             '<button class="btn2">Move money</button></form>'
             '<p class="hint">Each play bets only with the money in its own subaccount. Moves stay inside your '
             'Kalshi account. The Kalshi app shows only your main account.</p></div>')
+
+
+def goal_money(s: Settings, st) -> Decimal | None:
+    """Same count as the bot: cash plus what open bets cost (real money: only the plays' subaccounts)."""
+    opened = st.open_positions()
+    if s.mode == "paper":
+        return Decimal(st.paper_cash) + sum((p.cost for p in opened), Decimal("0"))
+    if not st.accounts:
+        return None
+    accts = {p.subaccount for p in s.plays if p.enabled}
+    cash = sum((Decimal(v) for k, v in st.accounts.items() if int(k) in accts), Decimal("0"))
+    return cash + sum((p.cost for p in opened if p.subaccount in accts), Decimal("0"))
+
+
+def goal_box(d: dict, s: Settings, st) -> str:
+    g = s.goal
+    now = goal_money(s, st)
+    start = Decimal(st.goal_start) if st.goal_start else now
+    out = ['<h2>Goal</h2><div class="box">']
+    if now is None or start is None:
+        out.append(f"Aiming for ${g.target:.2f}. Waiting for the first balance check…</div>")
+        return "".join(out)
+    span = g.target - start
+    done = 0 if span <= 0 else max(0, min(100, float((now - start) / span * 100)))
+    out.append(f'<div style="display:flex;justify-content:space-between"><b>${start:.2f} → ${g.target:.2f}</b>'
+               f'<span>now <b>${now:.2f}</b></span></div>'
+               f'<div class="bar"><span style="width:{done:.0f}%"></span></div>'
+               f'<p class="hint">{done:.0f}% of the way · {esc(g.boldness)} sizing · biggest bet '
+               f'{float(g.max_bet_pct):g}% of the money'
+               + (f" · stops below ${g.stop_below:.2f}" if g.stop_below > 0 else "") + "</p>")
+    if st.goal_note:
+        good = st.goal_note.startswith("Goal reached")
+        out.append(f'<div class="box {"ok" if good else "bad"}" style="margin:8px 0 0">'
+                   f'{"🎉 " if good else ""}{esc(st.goal_note)}</div>')
+    out.append('<p class="hint">Each play bets 1 contract until its record proves an edge (30+ bets, '
+               'counted cautiously). Then its bets grow with the money and shrink after losses.</p></div>')
+    return "".join(out)
 
 
 def overview_open_bets(d: dict) -> str:
@@ -946,7 +1013,8 @@ def play_form(i: int, p: dict, opt, inp) -> str:
         '<p class="hint">Renaming a play starts its score over; its old bets stay under the old name.</p></div>')
 
 
-def settings_page(app: App, raw: dict | None = None, message: str | None = None, error: str | None = None) -> str:
+def settings_page(app: App, raw: dict | None = None, message: str | None = None, error: str | None = None,
+                  secure: bool = False) -> str:
     raw = raw if raw is not None else app.raw()
     size = raw.get("size") or {}
     loss = raw.get("daily_loss_limit") or {}
@@ -966,8 +1034,11 @@ def settings_page(app: App, raw: dict | None = None, message: str | None = None,
         out.append(f'<div class="box ok">{esc(message)}</div>')
     if error:
         out.append(f'<div class="box bad"><b>Not saved:</b> {esc(error)}</div>')
-    out.append(f'<div class="box">Mode: {mode_pill(raw.get("mode", "paper"))}'
-               '<p class="hint">For safety, real-money mode can\'t be turned on from this page.</p></div>')
+    if app.flash:
+        out.append(f'<div class="box {"bad" if app.flash.startswith(("Not", "Key not")) else "ok"}">'
+                   f'{esc(app.flash)}</div>')
+        app.flash = ""
+    out.append(real_money_section(app, raw, secure))
     # The hidden first button makes Enter in a box save, instead of pressing the first Copy button.
     out.append('<form method="post" action="/settings">'
                '<button name="action" value="save" tabindex="-1" aria-hidden="true" '
@@ -993,6 +1064,7 @@ def settings_page(app: App, raw: dict | None = None, message: str | None = None,
                   'data-q="Set the pretend money to the amount above? Past bets are kept.">'
                   'Reset pretend money to this amount</button>')
     out.append(
+        goal_form(raw.get("goal") or {}, opt, inp) +
         '<h2 id="money">Money and limits (all plays)</h2><div class="box">'
         f'<label>Pretend starting money ($, paper mode)</label>{inp("paper_balance", plain(raw.get("paper_balance", 11)))}'
         f'{reset}'
@@ -1010,6 +1082,116 @@ def settings_page(app: App, raw: dict | None = None, message: str | None = None,
     out.append('<div class="savebar"><button name="action" value="save">Save settings</button></div>'
                '<p class="hint">The bot restarts with the new settings in about 15 seconds. Open bets are kept.</p></form>')
     return page("Settings", "".join(out), "settings")
+
+
+def test_key(key_id: str, pem: bytes, api_base: str):
+    """Ask Kalshi for the main account balance with this key. Returns dollars."""
+    from cryptography.hazmat.primitives import serialization
+    private_key = serialization.load_pem_private_key(pem, password=None)
+    return KalshiClient(api_base, key_id, private_key, timeout=8).balance_dollars()
+
+
+def save_kalshi_key(app: App, form: dict) -> str:
+    try:
+        key_id, pem = keystore.check_key(field(form, "key_id"), (form.get("pem") or [""])[0])
+    except keystore.KeyError_ as e:
+        return f"Key not saved: {e}"
+    s, _ = app.settings()
+    api_base = s.api_base if s else "https://external-api.kalshi.com/trade-api/v2"
+    try:
+        balance = app.key_tester(key_id, pem, api_base)
+    except KalshiError as e:
+        if e.status in (401, 403):
+            return ("Key not saved: Kalshi didn't accept it. Check the Key ID matches the private key "
+                    "(make a new key on Kalshi if unsure).")
+        keystore.save_key(key_id, pem)
+        return f"Key saved, but Kalshi gave an error when testing it ({e.status}). Try again later."
+    except Exception as e:
+        keystore.save_key(key_id, pem)
+        return f"Key saved, but Kalshi couldn't be reached to test it ({e.__class__.__name__})."
+    keystore.save_key(key_id, pem)
+    return f"Key saved and it works: your main Kalshi account has ${balance:.2f}."
+
+
+def switch_mode(app: App, mode: str, confirm: str = "") -> str:
+    raw = app.raw()
+    if mode == "live":
+        if confirm.strip() != LIVE_CONFIRM_TEXT:
+            return f'Not switched: type exactly "{LIVE_CONFIRM_TEXT}".'
+        if keystore.load_key()[0] is None:
+            return "Not switched: add your Kalshi key first."
+        raw["live_confirm"] = LIVE_CONFIRM_TEXT
+    raw["mode"] = mode
+    try:
+        save_raw(app.settings_path, raw)
+    except SettingsError as e:
+        return f"Not switched: {e}"
+    return ("Switched to REAL MONEY. The bot restarts in about 15 seconds." if mode == "live" else
+            "Switched to pretend money. The bot restarts in about 15 seconds.")
+
+
+def goal_form(g: dict, opt, inp) -> str:
+    choices = [("careful", "Careful: ¼ of the fastest-growth bet"), ("normal", "Normal: ½ of it"),
+               ("bold", "Bold: all of it (big swings)")]
+    return (
+        '<h2 id="goal">Goal mode</h2><div class="box">'
+        f'<div class="check"><input type="checkbox" name="goal_on" value="1"{" checked" if g.get("enabled") else ""}>'
+        '<span>Size bets automatically to reach a goal</span></div>'
+        f'<div class="row2"><div><label>Goal ($)</label>{inp("goal_target", plain(g.get("target", 100)))}</div>'
+        f'<div><label>Stop if money falls below ($)</label>{inp("goal_stop", plain(g.get("stop_below") or 0))}</div></div>'
+        f'<label>How bold</label><select name="goal_boldness">{opt(choices, g.get("boldness", "normal"))}</select>'
+        f'<label>Biggest bet (% of the money)</label>{inp("goal_max", plain(g.get("max_bet_pct", 25)))}'
+        '<p class="hint">Goal mode replaces the bet sizes above. Each play bets 1 contract until its record proves '
+        'an edge, then bets the share of its money that grows it fastest for that edge, and pauses at the goal. '
+        'It can\'t make a play without an edge win; it only keeps a good play from betting too little or too much. '
+        '0 = no stop.</p></div>')
+
+
+def real_money_section(app: App, raw: dict, secure: bool) -> str:
+    mode = raw.get("mode", "paper")
+    link = app.secure_link
+    key_id, _ = keystore.load_key()
+    out = ['<h2 id="real">Real money</h2><div class="box">',
+           f'Mode: {mode_pill(mode)}']
+    if not secure:
+        if link is not None and link.ready:
+            out.append(f'<p>To add your Kalshi key or switch to real money, open the 🔒 locked link: '
+                       f'<a href="{esc(link.url())}/settings?key={esc(app.key)}#real" style="color:#8fb0ff">'
+                       f'{esc(link.url())}</a></p>')
+        else:
+            out.append('<p class="hint">Adding your Kalshi key and switching to real money only work over the '
+                       '🔒 locked link. ' + esc(link.message if link else "It isn't set up on this computer.") + '</p>')
+        if mode == "live":
+            out.append('<form method="post" action="/paper"><button class="btn2">Switch back to pretend money'
+                       '</button></form>')
+        out.append("</div>")
+        return "".join(out)
+    out.append('<p class="hint">🔒 You are on the locked link, so what you type here is private.</p>')
+    if key_id:
+        out.append(f'<p>Kalshi key saved (ID {esc(keystore.hint(key_id))}).</p>'
+                   '<form method="post" action="/key/remove"><button class="btn2" onclick="return confirm('
+                   '\'Remove the saved Kalshi key?\')">Remove key</button></form>')
+    out.append('<form method="post" action="/key">'
+               f'<label>Kalshi API Key ID</label><input name="key_id" autocomplete="off" autocapitalize="none" '
+               f'spellcheck="false">'
+               '<label>Private key (the whole text of the key file)</label>'
+               '<textarea name="pem" rows="6" autocomplete="off" autocapitalize="none" spellcheck="false" '
+               'style="width:100%;padding:11px;border-radius:10px;border:1px solid #363c48;background:var(--bg);'
+               'color:var(--text);font:13px ui-monospace,monospace"></textarea>'
+               f'<button>{"Replace key" if key_id else "Save key"}</button>'
+               '<p class="hint">Make the key on kalshi.com → profile → API Keys → Create New API Key. '
+               'It is checked with Kalshi, then kept on your server where only the bot can read it.</p></form>')
+    if mode == "live":
+        out.append('<form method="post" action="/paper"><button class="btn2">Switch back to pretend money'
+                   '</button></form>')
+    else:
+        out.append('<form method="post" action="/live">'
+                   f'<label>To bet real money, type: {esc(LIVE_CONFIRM_TEXT)}</label>'
+                   '<input name="confirm" autocomplete="off" autocapitalize="none">'
+                   '<button class="danger">Switch to real money</button>'
+                   '<p class="hint">Start with one play, 1 contract, and a small daily loss limit.</p></form>')
+    out.append("</div>")
+    return "".join(out)
 
 
 def request_transfer(app: App, form: dict) -> str:
@@ -1049,6 +1231,15 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):  # keep the server quiet in the logs
         pass
 
+    def setup(self):
+        if isinstance(self.request, ssl.SSLSocket):
+            self.request.do_handshake()   # the locked (https) site
+        super().setup()
+
+    @property
+    def secure(self) -> bool:
+        return bool(getattr(self.server, "secure", False))
+
     def _authed(self, query: dict, form: dict | None = None) -> tuple[bool, bool]:
         """(allowed, came_from_link)."""
         given = (query.get("key") or [""])[0] or ((form or {}).get("key") or [""])[0]
@@ -1068,7 +1259,25 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Cache-Control", "no-store")
         self.send_header("X-Frame-Options", "DENY")
         if set_cookie:
-            self.send_header("Set-Cookie", f"{COOKIE}={self.app.key}; Max-Age=31536000; Path=/; HttpOnly; SameSite=Strict")
+            self.send_header("Set-Cookie", f"{COOKIE}={self.app.key}; Max-Age=31536000; Path=/; HttpOnly; "
+                             f"SameSite=Strict{'; Secure' if self.secure else ''}")
+        if self.secure:
+            self.send_header("Strict-Transport-Security", "max-age=86400")
+        self.end_headers()
+        self.wfile.write(data)
+
+    def _challenge(self, token: str):
+        """Let's Encrypt checks this file to confirm the server owns its IP (for the locked link)."""
+        link = self.app.secure_link
+        path = link.store.challenge_file(token) if link else None
+        try:
+            with open(path, "rb") as fh:
+                data = fh.read(4096)
+        except (OSError, TypeError):
+            return self._send(404, "not found", ctype="text/plain")
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain")
+        self.send_header("Content-Length", str(len(data)))
         self.end_headers()
         self.wfile.write(data)
 
@@ -1097,12 +1306,14 @@ class Handler(BaseHTTPRequestHandler):
 
     def _get(self):
         url = urlparse(self.path)
+        if url.path.startswith("/.well-known/acme-challenge/"):
+            return self._challenge(url.path.rsplit("/", 1)[-1])
         query = parse_qs(url.query)
         ok, from_link = self._authed(query)
         if not ok:
             return self._send(403, denied_page())
         if url.path == "/":
-            return self._send(200, overview_page(self.app), set_cookie=from_link)
+            return self._send(200, overview_page(self.app, self.secure), set_cookie=from_link)
         if url.path == "/api/live":
             name = (query.get("play") or [None])[0]
             return self._send(200, json.dumps(live_parts(self.app, name)), ctype="application/json")
@@ -1110,7 +1321,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(200, play_page(self.app, (query.get("name") or [""])[0]), set_cookie=from_link)
         if url.path == "/settings":
             done = (query.get("done") or [""])[0]
-            return self._send(200, settings_page(self.app, message=DONE_MESSAGES.get(done)), set_cookie=from_link)
+            return self._send(200, settings_page(self.app, message=DONE_MESSAGES.get(done), secure=self.secure),
+                              set_cookie=from_link)
         if url.path == "/trades.csv":
             s, _ = self.app.settings()
             path = os.path.join(mode_folder(s), "trades.csv") if s else ""
@@ -1139,11 +1351,27 @@ class Handler(BaseHTTPRequestHandler):
                     shown = form_to_raw(form, self.app.raw())
                 except SettingsError:
                     shown = None
-                return self._send(200, settings_page(self.app, raw=shown, error=str(e)))
+                return self._send(200, settings_page(self.app, raw=shown, error=str(e), secure=self.secure))
             return self._redirect(f"/settings?done={done}" + (f"#play-{focus}" if focus is not None else ""))
         if url.path == "/transfer":
             self.app.moved = request_transfer(self.app, form)
             return self._redirect("/#money")
+        if url.path in ("/key", "/live") and not self.secure:
+            self.app.flash = "Not done: open the 🔒 locked link for this."
+            return self._redirect("/settings#real")
+        if url.path == "/key":
+            self.app.flash = save_kalshi_key(self.app, form)
+            return self._redirect("/settings#real")
+        if url.path == "/key/remove":
+            keystore.remove_key()
+            self.app.flash = "Kalshi key removed."
+            return self._redirect("/settings#real")
+        if url.path == "/live":
+            self.app.flash = switch_mode(self.app, "live", field(form, "confirm"))
+            return self._redirect("/settings#real")
+        if url.path == "/paper":
+            self.app.flash = switch_mode(self.app, "paper")
+            return self._redirect("/settings#real")
         if url.path in ("/pause", "/resume"):
             self.app.set_paused(url.path == "/pause")
             return self._redirect("/")
@@ -1172,5 +1400,8 @@ def make_server(settings_path: str, port: int, key: str, host: str = "0.0.0.0") 
 def serve(settings_path: str, port: int) -> None:
     key = load_key()
     server = make_server(settings_path, port, key)
+    link = SecureLink(server.RequestHandlerClass)
+    server.RequestHandlerClass.app.secure_link = link
+    threading.Thread(target=link.run_forever, daemon=True).start()
     print(f"website running on port {port}", flush=True)
     server.serve_forever()

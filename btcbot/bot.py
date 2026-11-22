@@ -10,6 +10,7 @@ from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from zoneinfo import ZoneInfo
 
+from . import goal as G
 from . import rules
 from .broker import Fill
 from .kalshi import KalshiClient, KalshiError, coinbase_spot
@@ -74,6 +75,7 @@ class Bot:
         self.fail_streak = 0
         self.stop_file = os.path.join(ledger.folder, "STOP")  # same folder as the trade log
         self.ready_accounts = {0}
+        self._history_cache: tuple = (None, [])
         self.mismatch_streak = 0
         self.last_check = None
         self.last_accounts = None
@@ -147,10 +149,11 @@ class Bot:
         now = self.clock.now()
         self._roll_day(now)
         self._apply_paper_reset()
+        self._clear_notes_if_resumed()
         if self.broker.live:
-            self._clear_alert_if_resumed()
             self._apply_transfer_request()
             self._refresh_accounts(now)
+        self._goal_check()   # before any new bet, so the goal pauses betting in time
         quotes = self._fetch_quotes(now)
         self._share_prices(quotes, now)
         for pos in list(self.state.open_positions()):
@@ -168,6 +171,7 @@ class Bot:
             self._say("block", reason)
         self._settle(now)
         self.check_records(quotes, now)
+        self._goal_check()   # and again once bets have settled
         self._prune(quotes)
         self.ledger.save_state(self.state)
         return self._next_wait(quotes, now)
@@ -304,11 +308,79 @@ class Bot:
             self.ledger.save_state(self.state)
             log.error(text)
 
-    def _clear_alert_if_resumed(self) -> None:
-        if self.state.alert and not os.path.exists(self.stop_file):
-            log.info("resumed after a records check; watching again")
+    def _clear_notes_if_resumed(self) -> None:
+        if (self.state.alert or self.state.goal_note) and not os.path.exists(self.stop_file):
+            log.info("resumed; watching again")
             self.state.alert = ""
+            self.state.goal_note = ""
             self.mismatch_streak = 0
+
+    # ---- goal mode ----------------------------------------------------------
+    def _history(self) -> list:
+        """All finished bets (pretend and real), re-read only when a trade log changes."""
+        stamp = []
+        for path in G.history_paths(self.s, self.ledger.folder):
+            try:
+                st = os.stat(path)
+                stamp.append((st.st_mtime_ns, st.st_size))
+            except OSError:
+                stamp.append(None)
+        if self._history_cache[0] != stamp:
+            self._history_cache = (stamp, G.history(self.s, self.ledger.folder))
+        return self._history_cache[1]
+
+    def _goal_accounts(self) -> set:
+        return {p.subaccount for p in self.s.plays if p.enabled}
+
+    def _equity(self) -> Decimal | None:
+        """Money the plays have: cash plus what open bets cost. Real money counts only the plays' subaccounts."""
+        opened = self.state.open_positions()
+        if not self.broker.live:
+            return self.broker.cash + sum((p.cost for p in opened), Decimal("0"))
+        if not self.state.accounts:
+            return None
+        accts = self._goal_accounts()
+        cash = sum((Decimal(v) for k, v in self.state.accounts.items() if int(k) in accts), Decimal("0"))
+        return cash + sum((p.cost for p in opened if p.subaccount in accts), Decimal("0"))
+
+    def _goal_contracts(self, play, acct: int, balance: Decimal, price: Decimal) -> Decimal:
+        g = self.s.goal
+        e = G.edge([r for r in self._history() if r["play"] == play.name])
+        share = G.bet_share(e, g.boldness, g.max_bet_pct)
+        opened = self.state.open_positions()
+        if self.broker.live:  # each play grows its own subaccount
+            money = balance + sum((p.cost for p in opened if p.subaccount == acct), Decimal("0"))
+        else:                 # pretend money is one pot, shared evenly by the plays that are on
+            plays_on = max(1, sum(1 for p in self.s.plays if p.enabled))
+            money = (self.broker.cash + sum((p.cost for p in opened), Decimal("0"))) / plays_on
+        return G.contracts_for(money, share, price, g.max_bet_pct)
+
+    def _goal_check(self) -> None:
+        g = self.s.goal
+        if not g.enabled:
+            if self.state.goal_start or self.state.goal_note:
+                self.state.goal_start, self.state.goal_note = "", ""
+            return
+        equity = self._equity()
+        if equity is None:
+            return
+        if not self.state.goal_start:
+            self.state.goal_start = str(equity.quantize(Decimal("0.01")))
+            log.info("goal mode on: $%.2f now, aiming for $%.2f", equity, g.target)
+        if self.state.goal_note:
+            return
+        if equity >= g.target:
+            note = (f"Goal reached: ${equity:.2f} (started at ${Decimal(self.state.goal_start):.2f}). "
+                    "New bets are paused. To keep going, raise the target, then tap Resume.")
+        elif g.stop_below > 0 and equity < g.stop_below:
+            note = (f"Stopped: the money fell to ${equity:.2f}, below your ${g.stop_below:.2f} stop. "
+                    "New bets are paused.")
+        else:
+            return
+        with open(self.stop_file, "w", encoding="utf-8") as fh:
+            fh.write(note + "\n")
+        self.state.goal_note = note
+        log.warning(note)
 
     def _apply_transfer_request(self) -> None:
         path = os.path.join(self.ledger.folder, TRANSFER_FILE)
@@ -416,7 +488,8 @@ class Bot:
             return
         open_cost = sum((p.cost for p in self.state.open_positions()
                          if not self.broker.live or p.subaccount == acct), Decimal("0"))
-        n = rules.size_contracts(self.s, balance, chk.limit, open_cost, play)
+        wanted = self._goal_contracts(play, acct, balance, chk.limit) if self.s.goal.enabled else None
+        n = rules.size_contracts(self.s, balance, chk.limit, open_cost, play, wanted)
         if n <= 0:
             self._say(key, f"{play.name}: skip {q.ticker}: trade size works out to 0 contracts "
                            f"(balance ${balance:.2f}, price {chk.limit}, share and size limits)")

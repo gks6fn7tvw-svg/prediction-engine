@@ -48,6 +48,8 @@ class State:
     alert: str = ""                               # why the bot paused itself (shown in red)
     notice: str = ""                              # last money-move result
     accounts: dict = field(default_factory=dict)  # real money: subaccount -> cash, for the website
+    goal_start: str = ""                          # goal mode: money when it was switched on
+    goal_note: str = ""                           # goal mode: why it stopped (reached / fell below)
 
     def open_positions(self) -> list[Position]:
         return [Position(**p) for p in self.positions]

@@ -79,6 +79,19 @@ class Play:
         return self.take_profit is not None or self.stop_loss is not None
 
 
+BOLDNESS = {"careful": Decimal("0.25"), "normal": Decimal("0.5"), "bold": Decimal("1")}
+
+
+@dataclass
+class Goal:
+    """Goal mode: bet sizes are worked out automatically to grow the money toward a target."""
+    enabled: bool = False
+    target: Decimal = Decimal("100")
+    boldness: str = "normal"        # careful / normal / bold = 1/4, 1/2 or all of the Kelly amount
+    stop_below: Decimal = Decimal("0")
+    max_bet_pct: Decimal = Decimal("25")
+
+
 @dataclass
 class Settings:
     mode: str
@@ -98,6 +111,7 @@ class Settings:
     slow_seconds: float = 15.0
     folder: str = "data"
     api_base: str = "https://external-api.kalshi.com/trade-api/v2"
+    goal: Goal = field(default_factory=Goal)
 
     @property
     def live(self) -> bool:
@@ -203,6 +217,7 @@ def parse(raw: dict) -> Settings:
         slow_seconds=float(polling.get("slow_seconds", 15)),
         folder=str(files.get("folder", "data")),
         api_base=str(raw.get("api_base", "https://external-api.kalshi.com/trade-api/v2")),
+        goal=_goal(raw.get("goal") or {}),
     )
     if s.fast_seconds < 0.5 or s.slow_seconds < s.fast_seconds:
         raise SettingsError("polling: fast_seconds must be at least 0.5 and slow_seconds at least fast_seconds")
@@ -225,12 +240,26 @@ def load(path: str) -> Settings:
     return parse(raw)
 
 
-def mode_folder(settings: Settings) -> str:
-    """Where this mode keeps its trade log, memory and log file (paper and live never mix)."""
+def _goal(raw: dict) -> Goal:
+    boldness = str(raw.get("boldness", "normal")).lower()
+    if boldness not in BOLDNESS:
+        raise SettingsError(f"goal.boldness must be careful, normal or bold, got {boldness!r}")
+    g = Goal(enabled=bool(raw.get("enabled", False)),
+             target=_dec(raw.get("target", 100), "goal.target", 0.01),
+             boldness=boldness,
+             stop_below=_dec(raw.get("stop_below", 0) or 0, "goal.stop_below", 0),
+             max_bet_pct=_dec(raw.get("max_bet_pct", 25), "goal.max_bet_pct", 1, 100))
+    if g.enabled and g.stop_below >= g.target:
+        raise SettingsError("goal: the stop amount must be below the target")
+    return g
+
+
+def mode_folder(settings: Settings, mode: str | None = None) -> str:
+    """Where a mode keeps its trade log, memory and log file (paper and live never mix)."""
     folder = settings.folder
     if not os.path.isabs(folder):
         folder = os.path.join(PACKAGE_DIR, folder)
-    return os.path.join(folder, settings.mode)
+    return os.path.join(folder, mode or settings.mode)
 
 
 def load_raw(path: str) -> dict:

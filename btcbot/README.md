@@ -152,7 +152,16 @@ folders, so the scores never mix. To restart paper testing from zero, delete
 ## Going live (real money)
 
 Only do this after a play's score says "ahead by more than luck" over at least
-200 bets, including weekdays.
+200 bets, including weekdays. Only bet money you're OK losing.
+
+**The locked link (https).** The website's plain link isn't encrypted, so the
+Kalshi key is only accepted over a locked https link. The website gets one by
+itself: a free Let's Encrypt certificate for the server's IP address (6-day
+certificates, renewed automatically when 3 days are left; certbot runs as the
+bot's user and proves the IP through the website on port 80). One time only, in
+Google Cloud: open the server, tap **Edit**, tick **Allow HTTPS traffic**, Save.
+The Overview then shows "A locked link is ready"; open it and add it to the home
+screen.
 
 **Why subaccounts:** on Kalshi, each account holds one side per market. If one
 play holds Up and another buys Down in the same 15 minutes, Kalshi cancels them
@@ -165,30 +174,29 @@ came from the API; the bot asks for it by itself.
 
 **Step 1: one play, main account, tiny bets** (this also qualifies you for subaccounts)
 
-1. **Make a Kalshi API key:** on kalshi.com, open your profile settings
-   (kalshi.com/account/profile), find **API Keys**, and click **Create New API
-   Key**. Write down the **Key ID**. The private key file downloads only once;
-   keep it safe and never share it.
-2. On the website, turn every play off except **main**, set main to
-   **1 contract**, its Kalshi subaccount to **0**, and the daily loss limit to **$5**.
-3. In Google Cloud, open the server, tap **Edit**, and under **Metadata** add:
-   - `kalshi-key-id` = your Key ID
-   - `kalshi-private-key` = the whole text of the key file (open it in a text
-     app and copy everything, including the BEGIN and END lines)
-   - `btcbot-mode` = `live`
-
-   Save, then **Reset**. The serial log says "Kalshi key loaded" and "switched
-   to REAL MONEY"; the website shows **REAL MONEY**.
-4. Let it place a bet. Compare it with the Kalshi app's history.
+1. **Make a Kalshi API key:** on kalshi.com, open your profile settings, find
+   **API Keys**, and click **Create New API Key**. Keep the Key ID and the key
+   file; the file downloads only once.
+2. On the locked link, open **Settings → Real money**, paste the Key ID and the
+   whole text of the key file, and tap **Save key**. It is checked with Kalshi
+   (you'll see your balance) and kept on the server where only the bot can read
+   it. The website never shows it again.
+3. Turn every play off except **main**: 1 contract, Kalshi subaccount **0**,
+   daily loss limit **$5**.
+4. Type `I accept real-money risk` and tap **Switch to real money**. Compare its
+   first bets with the Kalshi app's history.
 
 **Step 2: subaccounts for every play**
 
-1. On the website, give each play you want on its own subaccount number
-   (main 1, cheap 2, ...). Leave 0 for your own bets in the Kalshi app.
+1. Give each play you want on its own subaccount number (main 1, cheap 2, ...).
+   Leave 0 for your own bets in the Kalshi app.
 2. Save. The bot restarts, upgrades the API level, and makes the subaccounts.
 3. On the Overview, under **Kalshi money**, move a little money from your main
    account into each play's subaccount. Moves stay inside your Kalshi account.
 4. Turn the plays on one at a time.
+
+(Without the website, the key can also come from the server's metadata:
+`kalshi-key-id`, `kalshi-private-key`, `btcbot-mode` = `live` or `paper`, then Reset.)
 
 **Safety check:** with real money, every 10 seconds the bot compares its open
 bets with what Kalshi shows in each subaccount (markets still open only). If they
@@ -196,7 +204,27 @@ disagree twice in a row, it pauses new bets and shows a red box saying where.
 Check the Kalshi app, then tap **Resume**. Don't place bets by hand in a
 subaccount a play uses.
 
-To go back to pretend money, set the metadata `btcbot-mode` to `paper` and Reset.
+To go back to pretend money, tap **Switch back to pretend money** on Settings.
+
+## Goal mode (automatic bet sizes)
+
+Settings → **Goal mode**: tick it, set the goal (say $100), how bold, a stop
+amount, and the biggest single bet. Goal mode replaces the bet sizes:
+
+- Each play bets **1 contract** until its record (pretend and real bets
+  together) has at least 30 bets and shows an edge even when its win rate is
+  counted cautiously (the low end of its luck range).
+- Then it bets the share of its money that grows it fastest for that edge (the
+  Kelly rule): **careful** = 1/4 of it, **normal** = 1/2, **bold** = all of it
+  (much bigger swings). No bet goes over the "biggest bet" share.
+- Bets grow as the money grows and shrink after losses. With pretend money the
+  pot is shared evenly by the plays that are on; with real money each play grows
+  its own subaccount.
+- At the goal, or below the stop amount, new bets pause and the Overview says
+  why. Raise the goal and tap Resume to keep going.
+
+It can't make a play without a real edge reach the goal; it only stops a good
+play from betting too little or too much. Try it with pretend money first.
 
 ## For reviewers (ChatGPT)
 
@@ -227,6 +255,14 @@ To go back to pretend money, set the metadata `btcbot-mode` to `paper` and Reset
   **Please check:** the Create Subaccount reply field name (code accepts
   `subaccount_number` or `subaccount`), and that netting doesn't merge
   positions across subaccounts.
+- Goal mode (`goal.py`): Kelly share p/L - q/W from each play's record, with p
+  at its Wilson lower bound (z = 1), at least 30 bets, scaled by boldness and
+  capped; unproven plays bet 1 contract. Please sanity-check the math.
+- Locked link (`secure.py`): certbot >= 5.4 `certonly --preferred-profile
+  shortlived --webroot --ip-address <IP>` as the bot user, renewed with
+  `--force-renewal` when under 3 days remain or the IP changes; served on 443 by
+  the same handler. The Kalshi key form and the real-money switch work only
+  there; keys are saved 0600 in ~/.btcbot.
 - Live settings refuse two enabled plays on one subaccount. The records check
   (`Bot.check_records`) compares net positions per subaccount for open markets
   every 10 s and pauses after two disagreements in a row.

@@ -18,11 +18,25 @@ from .ledger import Ledger, Position, State
 from .settings import Settings
 
 
+def kalshi_words(e: Exception) -> str:
+    """Kalshi's own error message, short."""
+    text = getattr(e, "text", "") or str(e)
+    try:
+        err = json.loads(text).get("error", {})
+        msg = " - ".join(x for x in (err.get("code"), err.get("message"), err.get("details")) if x)
+        if msg:
+            return f"{getattr(e, 'status', '')} {msg}".strip()[:200]
+    except (ValueError, AttributeError):
+        pass
+    return str(e)[:200]
+
+
 def account_name(n: int) -> str:
     return "your main account" if int(n) == 0 else f"subaccount {n}"
 
 PAPER_RESET_FILE = "PAPER_RESET"   # the website writes the new pretend balance here
 TRANSFER_FILE = "TRANSFER_REQUEST"  # the website asks to move money between subaccounts
+SETUP_FILE = "SETUP_REQUEST"        # the website asks to set up subaccounts again now
 CHECK_SECONDS = 10                  # real money: compare our records with Kalshi this often
 ACCOUNTS_SECONDS = 30               # real money: refresh subaccount cash for the website
 SETUP_RETRY_SECONDS = 600           # real money: try setting up missing subaccounts again this often
@@ -94,6 +108,7 @@ class Bot:
         self.ready_accounts = {0}
         self.last_setup = self.clock.now()
         upgrade_refused = False
+        problem = ""
         if needed == [0]:
             self.state.setup_note = ""
             return
@@ -115,6 +130,7 @@ class Bot:
                     log.info("Kalshi API level upgraded to Advanced (needed for subaccounts)")
                 except KalshiError as e:
                     upgrade_refused = True
+                    problem = f"Kalshi said: {kalshi_words(e)}"
                     log.error("Kalshi would not upgrade the API level (%s). It needs one bet placed by the "
                               "bot first: run a single play on subaccount 0 for one bet, then try again.", e)
             tries = 0
@@ -124,6 +140,7 @@ class Bot:
                     n = self.client.create_subaccount()
                 except Exception as e:
                     log.error("could not make a Kalshi subaccount (%s)", e)
+                    problem = problem or f"Making it failed. Kalshi said: {kalshi_words(e)}"
                     break
                 have.add(n)
                 log.info("made Kalshi subaccount %s", n)
@@ -138,7 +155,8 @@ class Bot:
                 f"Not set up on Kalshi yet: {names}. " +
                 ("Kalshi makes subaccounts only after the bot has placed one real bet from your main account. "
                  "Once a play on your main account has bet, the bot sets them up by itself within 10 minutes."
-                 if upgrade_refused else "The bot tries again every 10 minutes."))
+                 if upgrade_refused else "The bot tries again every 10 minutes.")
+                + (f" ({problem})" if problem else ""))
         else:
             self.state.setup_note = ""
             self.last_accounts = None   # show the new subaccounts soon
@@ -146,6 +164,15 @@ class Bot:
             f"{p.name}={p.subaccount}" for p in self.s.plays if p.enabled))
 
     def _retry_setup(self, now: datetime) -> None:
+        asked = os.path.join(self.ledger.folder, SETUP_FILE)
+        if os.path.exists(asked):
+            try:
+                os.remove(asked)
+            except OSError:
+                pass
+            log.info("setting up Kalshi subaccounts again (asked from the website)")
+            self.prepare_live()
+            return
         missing = any(p.enabled and p.subaccount not in self.ready_accounts for p in self.s.plays)
         if missing and self.last_setup and (now - self.last_setup).total_seconds() >= SETUP_RETRY_SECONDS:
             log.info("trying again to set up Kalshi subaccounts")

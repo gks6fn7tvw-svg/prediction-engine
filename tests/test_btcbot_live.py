@@ -385,3 +385,21 @@ class TestNotFilledReplies(LiveCase):
         self.at(7.4, 0.80, 0.82)
         self.assertEqual(len(ex.orders), 2)
         self.assertEqual(self.bot.state.open_positions(), [])
+
+
+class TestSetupMessages(LiveCase):
+    def test_kalshis_reason_is_shown_and_retry_on_request(self):
+        ex = FakeExchange(level="basic")
+
+        def refuse():
+            raise KalshiError(403, '{"error":{"code":"forbidden","message":"no API-created order found"}}')
+        ex.upgrade_api_level = refuse
+        self.make([dict(MAIN, subaccount=1)], ex)
+        self.assertIn("Kalshi said: 403 forbidden - no API-created order found", self.bot.state.setup_note)
+        ex.upgrade_api_level = lambda: setattr(ex, "level", "advanced")
+        from btcbot.bot import SETUP_FILE
+        open(os.path.join(self.dir, SETUP_FILE), "w").close()
+        self.at(14, 0.50, 0.52)
+        self.assertEqual(self.bot.ready_accounts, {0, 1})
+        self.assertEqual(self.bot.state.setup_note, "")
+        self.assertFalse(os.path.exists(os.path.join(self.dir, SETUP_FILE)))

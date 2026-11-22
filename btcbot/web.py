@@ -30,7 +30,7 @@ from . import goal as G
 from . import keystore
 from . import ledger as L
 from .kalshi import KalshiClient, KalshiError
-from .bot import PAPER_RESET_FILE, TRANSFER_FILE, account_name
+from .bot import PAPER_RESET_FILE, SETUP_FILE, TRANSFER_FILE, account_name
 from .rules import Quote, parse_time
 from .secure import SecureLink
 from .settings import (LIVE_CONFIRM_TEXT, PACKAGE_DIR, SIZE_MODES, Settings, SettingsError, load, load_raw,
@@ -863,7 +863,9 @@ def money_section(d: dict) -> str:
                          for n in numbers)
     notice = f'<p class="hint">Last money move: {esc(st.notice)}</p>' if st and st.notice else ""
     if st and st.setup_note:
-        notice = f'<div class="box warn" style="margin:8px 0">{esc(st.setup_note)}</div>' + notice
+        notice = (f'<div class="box warn" style="margin:8px 0">{esc(st.setup_note)}'
+                  '<form method="post" action="/setup"><button class="btn2">Try setting up again now</button>'
+                  '</form></div>' + notice)
     if numbers == [0]:   # nothing to move between yet
         return ('<h2 id="money">Kalshi money</h2><div class="box">' + rows + notice +
                 '<p class="hint">Every play that\'s on uses your main account, so there\'s nothing to move. '
@@ -1382,6 +1384,14 @@ class Handler(BaseHTTPRequestHandler):
             return self._redirect(f"/settings?done={done}" + (f"#play-{focus}" if focus is not None else ""))
         if url.path == "/transfer":
             self.app.moved = request_transfer(self.app, form)
+            return self._redirect("/#money")
+        if url.path == "/setup":
+            s, _ = self.app.settings()
+            if s is not None and s.mode == "live":
+                folder = mode_folder(s)
+                os.makedirs(folder, exist_ok=True)
+                open(os.path.join(folder, SETUP_FILE), "w").close()
+                self.app.moved = "Asked the bot to set up subaccounts again. Check back in a few seconds."
             return self._redirect("/#money")
         if url.path in ("/key", "/live") and not self.secure:
             self.app.flash = "Not done: open the 🔒 locked link for this."

@@ -99,7 +99,8 @@ class Base(unittest.TestCase):
 
     def start_link(self, runner=None):
         self.link = SecureLink(self.http.RequestHandlerClass, self.store, port=0,
-                               ip_fn=lambda: "127.0.0.1", runner=runner or FakeRunner(self.store))
+                               ip_fn=lambda: "127.0.0.1", runner=runner or FakeRunner(self.store),
+                               installed=lambda: True)
         self.app.secure_link = self.link
         self.link.tick()
         if self.link.server:
@@ -137,6 +138,8 @@ class TestLockedLink(Base):
         for flag in ("certonly", "--preferred-profile", "shortlived", "--webroot", "--non-interactive",
                      "--register-unsafely-without-email"):
             self.assertIn(flag, cmd)
+        self.assertNotIn("-m", cmd[:3])                      # not "python -m certbot"
+        self.assertTrue(cmd[0].endswith("certbot") or "from certbot.main import main" in " ".join(cmd[:3]))
         self.assertEqual(cmd[cmd.index("--ip-address") + 1], "127.0.0.1")
         self.assertEqual(cmd[cmd.index("--webroot-path") + 1], self.store.webroot)
         status, body, headers = self.call(f"/?key={KEY}", secure=True, cookie=False)
@@ -190,6 +193,27 @@ class TestLockedLink(Base):
         self.assertEqual((status, body), (200, "token.thumbprint"))
         self.assertEqual(self.call("/.well-known/acme-challenge/..%2Fsecrets", cookie=False)[0], 404)
         self.assertEqual(self.call("/.well-known/acme-challenge/missing-token-123", cookie=False)[0], 404)
+
+
+class TestNotInstalled(Base):
+    def test_says_how_to_install(self):
+        runner = FakeRunner(self.store)
+        link = SecureLink(self.http.RequestHandlerClass, self.store, port=0, ip_fn=lambda: "127.0.0.1",
+                          runner=runner, installed=lambda: False)
+        link.tick()
+        self.assertEqual(runner.calls, [])
+        self.assertIn("Get the newest version", link.message)
+
+    def test_real_certbot_error_is_shown(self):
+        import subprocess
+
+        def fail(cmd, **kw):
+            return subprocess.CompletedProcess(cmd, 1, "", "Saving debug log to x\nCertbot failed to authenticate "
+                                               "some domains\nAsk for help or search for solutions at https://...")
+        link = SecureLink(self.http.RequestHandlerClass, self.store, port=0, ip_fn=lambda: "127.0.0.1",
+                          runner=fail, installed=lambda: True)
+        link.tick()
+        self.assertIn("Certbot failed to authenticate some domains", link.message)
 
 
 class TestKalshiKey(Base):

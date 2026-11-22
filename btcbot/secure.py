@@ -31,6 +31,19 @@ CHECK_SECONDS = 6 * 3600      # look again every 6 hours (and right after starti
 TOKEN = re.compile(r"^[A-Za-z0-9_-]{10,200}$")
 
 
+def certbot_installed() -> bool:
+    import importlib.util
+    return importlib.util.find_spec("certbot") is not None
+
+
+def certbot_base() -> list[str]:
+    """How to start certbot from the bot's own python: its script if there is one, else its main()."""
+    script = os.path.join(os.path.dirname(sys.executable), "certbot")
+    if os.path.exists(script):
+        return [script]
+    return [sys.executable, "-c", "import sys; from certbot.main import main; sys.exit(main())"]
+
+
 def external_ip(timeout: float = 2.0) -> str | None:
     """The server's public IP from Google Cloud; None elsewhere."""
     override = os.environ.get("BTCBOT_PUBLIC_IP")
@@ -87,13 +100,16 @@ class CertStore:
         return bool(info and ip in info[1] and info[0] > now)
 
     def certbot_command(self, ip: str) -> list[str]:
-        return [sys.executable, "-m", "certbot", "certonly", "--non-interactive", "--agree-tos",
+        return certbot_base() + ["certonly", "--non-interactive", "--agree-tos",
                 "--register-unsafely-without-email", "--preferred-profile", "shortlived",
                 "--webroot", "--webroot-path", self.webroot, "--ip-address", ip,
                 "--cert-name", "btcbot", "--force-renewal",
                 "--config-dir", self.config, "--work-dir", self.work, "--logs-dir", self.logs]
 
-    def request(self, ip: str, runner=subprocess.run) -> tuple[bool, str]:
+    def request(self, ip: str, runner=subprocess.run, installed=certbot_installed) -> tuple[bool, str]:
+        if not installed():
+            return False, ('certbot isn\'t installed yet. Tap "Get the newest version" on the Overview '
+                           "(it installs it), then check back in a minute.")
         for d in (self.config, self.work, self.logs, self.webroot):
             os.makedirs(d, mode=0o700, exist_ok=True)
         os.chmod(self.webroot, 0o755)
@@ -103,9 +119,10 @@ class CertStore:
             return False, f"certbot didn't run ({e})"
         if r.returncode != 0:
             text = (r.stderr or r.stdout or "").strip()
-            if "No module named certbot" in text:
-                return False, "certbot isn't installed yet (it comes with the newest version)"
-            return False, text.splitlines()[-1][-300:] if text else f"certbot failed ({r.returncode})"
+            lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+            detail = next((ln for ln in reversed(lines) if not ln.lower().startswith(("ask for help", "see the"))),
+                          "")
+            return False, (detail[-300:] if detail else f"certbot stopped with code {r.returncode}")
         return True, "ok"
 
 
@@ -139,13 +156,15 @@ class SecureLink:
     """Keeps the https link working: gets and renews the certificate, runs the port-443 site."""
 
     def __init__(self, handler_class, store: CertStore | None = None, port: int = 443,
-                 ip_fn=external_ip, runner=subprocess.run, clock=lambda: datetime.now(timezone.utc)):
+                 ip_fn=external_ip, runner=subprocess.run, clock=lambda: datetime.now(timezone.utc),
+                 installed=certbot_installed):
         self.handler_class = handler_class
         self.store = store or CertStore()
         self.port = port
         self.ip_fn = ip_fn
         self.runner = runner
         self.clock = clock
+        self.installed = installed
         self.server: TLSServer | None = None
         self.ip: str | None = None
         self.status = "starting"     # starting | ready | failed | off
@@ -168,7 +187,7 @@ class SecureLink:
             self.ip = ip
             now = self.clock()
             if not self.store.good_for(ip, now):
-                ok, why = self.store.request(ip, self.runner)
+                ok, why = self.store.request(ip, self.runner, self.installed)
                 if not ok:
                     log.warning("secure link: %s", why)
                     if not self.store.usable_for(ip, now):

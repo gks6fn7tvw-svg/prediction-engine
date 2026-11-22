@@ -69,6 +69,29 @@ Do this once. A computer is easier, but a phone works.
    ```
    It now runs in paper mode around the clock, even after you close the window.
 
+### If SSH won't connect: set it up without SSH
+
+The server can install and start the bot by itself every time it boots.
+
+1. Open the server's page, tap **Edit**, and find **Automation**, then
+   **Startup script**. It's under **Advanced** (called **Management** on
+   some screens).
+2. Paste these two lines and tap **Save**:
+   ```
+   #!/bin/bash
+   (curl -fsSL https://raw.githubusercontent.com/gks6fn7tvw-svg/prediction-engine/btcbot/btcbot/deploy/gce_startup.sh || curl -fsSL https://raw.githubusercontent.com/gks6fn7tvw-svg/prediction-engine/main/btcbot/deploy/gce_startup.sh) | bash
+   ```
+3. On the server's page, tap **Reset** to restart it.
+4. Wait about 5 minutes. Then open **Logs**, then **Serial port 1
+   (console)**, and scroll to the bottom. Look for lines that start with
+   `BTCBOT`: the check of the current market, then
+   `DONE. The bot is running.` The bot's own log lines appear there too.
+
+To change settings without SSH: on **Edit**, under **Metadata**, add a key
+named `btcbot-settings`, paste your whole settings file as the value, save,
+and tap **Reset**. On every restart the server also downloads the newest
+code.
+
 Google's free trial runs 90 days. When Google asks, upgrade to a full account
 to keep the server. It stays free as long as you use only this one small server.
 

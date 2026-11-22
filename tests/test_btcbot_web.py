@@ -519,3 +519,24 @@ class TestGoalPages(WebCase):
         ledger.save_state(state)
         _, body, _ = self.call(f"/?key={KEY}")
         self.assertIn("🎉 Goal reached", body)
+
+
+class TestMovesToMissingSubaccounts(TestRealMoneyPages):
+    def test_refused_until_kalshi_has_it(self):
+        from btcbot.bot import TRANSFER_FILE
+        folder = self.go_live([{"name": "main", "min_price": 0.7, "max_price": 0.85, "act_from_minutes_left": 8,
+                                "act_until_minutes_left": 7},
+                               {"name": "second", "min_price": 0.88, "max_price": 0.95, "act_from_minutes_left": 1,
+                                "act_until_minutes_left": 0, "subaccount": 1}])
+        ledger = Ledger(folder)
+        state = ledger.load_state(D(0))
+        state.accounts = {"0": "11.67"}
+        state.setup_note = "Not set up on Kalshi yet: subaccount 1 (second)."
+        ledger.save_state(state)
+        _, body, _ = self.call(f"/?key={KEY}")
+        self.assertIn("not set up yet", body)
+        self.assertIn("Not set up on Kalshi yet: subaccount 1 (second)", body)
+        self.call("/transfer", data={"key": KEY, "from": "0", "to": "1", "amount": "2"})
+        self.assertFalse(os.path.exists(os.path.join(folder, TRANSFER_FILE)))
+        _, body, _ = self.call(f"/?key={KEY}")
+        self.assertIn("isn&#x27;t set up on Kalshi yet", body)

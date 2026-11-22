@@ -855,13 +855,15 @@ def money_section(d: dict) -> str:
         cash = accounts[n]
         rows += (f'<div class="bet"><div><b>{esc(account_name(n).capitalize())}</b>'
                  f'<div class="sub">{esc(names) or "no play uses it"}</div></div>'
-                 f'<div class="amt">{"$%.2f" % float(cash) if cash is not None else "—"}</div></div>')
+                 f'<div class="amt">{"$%.2f" % float(cash) if cash is not None else "not set up yet"}</div></div>')
     numbers = sorted(accounts)
     first_sub = next((n for n in numbers if n != 0), 0)
     choices = "".join(f'<option value="{n}">{esc(account_name(n))}</option>' for n in numbers)
     to_choices = "".join(f'<option value="{n}"{" selected" if n == first_sub else ""}>{esc(account_name(n))}</option>'
                          for n in numbers)
     notice = f'<p class="hint">Last money move: {esc(st.notice)}</p>' if st and st.notice else ""
+    if st and st.setup_note:
+        notice = f'<div class="box warn" style="margin:8px 0">{esc(st.setup_note)}</div>' + notice
     if numbers == [0]:   # nothing to move between yet
         return ('<h2 id="money">Kalshi money</h2><div class="box">' + rows + notice +
                 '<p class="hint">Every play that\'s on uses your main account, so there\'s nothing to move. '
@@ -1226,6 +1228,14 @@ def request_transfer(app: App, form: dict) -> str:
     if not 0 < amount <= 100_000:
         return "Not moved: type an amount above $0."
     folder = mode_folder(s)
+    try:
+        existing = {int(k) for k in L.Ledger(folder).load_state(Decimal(0)).accounts}
+    except (OSError, ValueError):
+        existing = set()
+    for n in (frm, to):
+        if existing and n not in existing:
+            return (f"Not moved: {account_name(n)} isn't set up on Kalshi yet. Kalshi makes subaccounts only "
+                    "after the bot's first real bet; the bot then sets them up by itself.")
     os.makedirs(folder, exist_ok=True)
     tmp = os.path.join(folder, TRANSFER_FILE + ".tmp")
     with open(tmp, "w", encoding="utf-8") as fh:

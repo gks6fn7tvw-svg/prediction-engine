@@ -25,6 +25,7 @@ PAPER_RESET_FILE = "PAPER_RESET"   # the website writes the new pretend balance 
 TRANSFER_FILE = "TRANSFER_REQUEST"  # the website asks to move money between subaccounts
 CHECK_SECONDS = 10                  # real money: compare our records with Kalshi this often
 ACCOUNTS_SECONDS = 30               # real money: refresh subaccount cash for the website
+SETUP_RETRY_SECONDS = 600           # real money: try setting up missing subaccounts again this often
 MISMATCH_CHECKS = 2                 # pause only if records and Kalshi disagree this many times in a row
 
 
@@ -75,6 +76,7 @@ class Bot:
         self.fail_streak = 0
         self.stop_file = os.path.join(ledger.folder, "STOP")  # same folder as the trade log
         self.ready_accounts = {0}
+        self.last_setup = None
         self._history_cache: tuple = (None, [])
         self.mismatch_streak = 0
         self.last_check = None
@@ -90,7 +92,10 @@ class Bot:
         needed = sorted({p.subaccount for p in self.s.plays if p.enabled})
         self.broker.accounts = sorted(set(needed) | {0})
         self.ready_accounts = {0}
+        self.last_setup = self.clock.now()
+        upgrade_refused = False
         if needed == [0]:
+            self.state.setup_note = ""
             return
         try:
             have = set(self.client.subaccount_balances()) | {0}
@@ -109,6 +114,7 @@ class Bot:
                     self.client.upgrade_api_level()
                     log.info("Kalshi API level upgraded to Advanced (needed for subaccounts)")
                 except KalshiError as e:
+                    upgrade_refused = True
                     log.error("Kalshi would not upgrade the API level (%s). It needs one bet placed by the "
                               "bot first: run a single play on subaccount 0 for one bet, then try again.", e)
             tries = 0
@@ -126,8 +132,24 @@ class Bot:
         if not_ready:
             log.error("Kalshi subaccount(s) %s are not set up, so plays using them won't bet",
                       ", ".join(map(str, not_ready)))
+            names = ", ".join(f"{account_name(n)} ({', '.join(p.name for p in self.s.plays if p.enabled and p.subaccount == n)})"
+                              for n in not_ready)
+            self.state.setup_note = (
+                f"Not set up on Kalshi yet: {names}. " +
+                ("Kalshi makes subaccounts only after the bot has placed one real bet from your main account. "
+                 "Once a play on your main account has bet, the bot sets them up by itself within 10 minutes."
+                 if upgrade_refused else "The bot tries again every 10 minutes."))
+        else:
+            self.state.setup_note = ""
+            self.last_accounts = None   # show the new subaccounts soon
         log.info("plays use Kalshi subaccounts: %s", ", ".join(
             f"{p.name}={p.subaccount}" for p in self.s.plays if p.enabled))
+
+    def _retry_setup(self, now: datetime) -> None:
+        missing = any(p.enabled and p.subaccount not in self.ready_accounts for p in self.s.plays)
+        if missing and self.last_setup and (now - self.last_setup).total_seconds() >= SETUP_RETRY_SECONDS:
+            log.info("trying again to set up Kalshi subaccounts")
+            self.prepare_live()
 
     def _account(self, play) -> int:
         return play.subaccount if self.broker.live else 0
@@ -151,6 +173,7 @@ class Bot:
         self._apply_paper_reset()
         self._clear_notes_if_resumed()
         if self.broker.live:
+            self._retry_setup(now)
             self._apply_transfer_request()
             self._refresh_accounts(now)
         self._goal_check()   # before any new bet, so the goal pauses betting in time
@@ -533,6 +556,8 @@ class Bot:
             self.state.paper_cash = str(self.broker.cash)
         log.info("%s: BOUGHT %s %s x%s at %s (fee $%s), %.1f min left", play.name, q.ticker,
                  rules.side_name(chk.side), fill.contracts, fill.price, fill.fee, q.minutes_left(now))
+        if self.broker.live and self.state.setup_note and self.last_setup:
+            self.last_setup = now - timedelta(seconds=SETUP_RETRY_SECONDS - 30)   # set up subaccounts soon
         if self.broker.live:
             try:
                 log.info("Kalshi now shows position %s in %s, subaccount %s (+ = Up, - = Down)",

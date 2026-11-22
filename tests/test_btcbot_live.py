@@ -328,3 +328,33 @@ class TestTooManyRequests(unittest.TestCase):
         broker.balance()
         broker.balances()
         self.assertEqual(len(calls), 1)
+
+
+class TestSetupAfterFirstBet(LiveCase):
+    def test_subaccounts_are_made_once_the_first_real_bet_is_in(self):
+        ex = FakeExchange(level="basic")
+        second = {"name": "second", "buy": "favorite", "min_price": 0.88, "max_price": 0.95,
+                  "act_from_minutes_left": 1, "act_until_minutes_left": 0, "subaccount": 1}
+        self.make([MAIN, second], ex)
+        self.assertEqual(self.bot.ready_accounts, {0})
+        self.assertIn("after the bot has placed one real bet", self.bot.state.setup_note)
+        self.at(7.5, 0.80, 0.82)                       # main bets from the main account
+        self.assertEqual(len(ex.orders), 1)
+        self.at(7.0, 0.80, 0.82)                       # 30 seconds later: tries the setup again
+        self.assertEqual(ex.level, "advanced")
+        self.assertIn(1, ex.cash)
+        self.assertEqual(self.bot.ready_accounts, {0, 1})
+        self.assertEqual(self.bot.state.setup_note, "")
+
+    def test_keeps_retrying_every_ten_minutes(self):
+        ex = FakeExchange(level="basic")
+        self.make([dict(MAIN, subaccount=1)], ex)
+        calls = []
+        real = ex.upgrade_api_level
+        ex.upgrade_api_level = lambda: calls.append(1) or real()
+        self.at(14, 0.50, 0.52)
+        self.assertEqual(calls, [])                    # not yet
+        self.clock.t += timedelta(minutes=11)
+        self.client.open = [market(0.50, 0.52, close=CLOSE + timedelta(minutes=15))]
+        self.bot.step()
+        self.assertEqual(calls, [1])

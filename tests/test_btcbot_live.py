@@ -403,3 +403,15 @@ class TestSetupMessages(LiveCase):
         self.assertEqual(self.bot.ready_accounts, {0, 1})
         self.assertEqual(self.bot.state.setup_note, "")
         self.assertFalse(os.path.exists(os.path.join(self.dir, SETUP_FILE)))
+
+
+class TestCheckAroundTheClose(LiveCase):
+    def test_kalshi_paying_out_first_is_not_a_disagreement(self):
+        ex = FakeExchange()
+        self.make([MAIN], ex)
+        self.at(7.5, 0.80, 0.82)                       # bought 1 Up
+        ex.pos.clear()                                 # Kalshi already settled and paid out
+        self.at(0, 0.99, 1.00, seconds=-5)             # 5 s after the close; market still listed
+        self.at(0, 0.99, 1.00, seconds=-20)
+        self.assertEqual(self.bot.mismatch_streak, 0)
+        self.assertEqual(self.bot.state.alert, "")

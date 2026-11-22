@@ -40,6 +40,7 @@ SETUP_FILE = "SETUP_REQUEST"        # the website asks to set up subaccounts aga
 CHECK_SECONDS = 10                  # real money: compare our records with Kalshi this often
 ACCOUNTS_SECONDS = 30               # real money: refresh subaccount cash for the website
 SETUP_RETRY_SECONDS = 600           # real money: try setting up missing subaccounts again this often
+CLOSE_MARGIN = 30                   # records check skips markets this close to (or past) their close
 MISMATCH_CHECKS = 2                 # pause only if records and Kalshi disagree this many times in a row
 
 
@@ -337,7 +338,10 @@ class Bot:
                     n = p.d("contracts") if p.side == "yes" else -p.d("contracts")
                     expected[p.ticker] = expected.get(p.ticker, Decimal("0")) + n
             for ticker in set(held) | set(expected):
-                if ticker not in quotes:
+                q = quotes.get(ticker)
+                # Only markets with time left: around the close Kalshi pays out before the bot
+                # records the result, and that's not a real disagreement.
+                if q is None or q.close_time is None or (q.close_time - now).total_seconds() < CLOSE_MARGIN:
                     continue
                 k, e = held.get(ticker, Decimal("0")), expected.get(ticker, Decimal("0"))
                 if k != e:

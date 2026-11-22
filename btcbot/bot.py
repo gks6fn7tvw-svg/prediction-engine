@@ -98,11 +98,7 @@ class Bot:
         """Save the latest prices for the website (best effort; never stops trading)."""
         if not quotes:
             return
-        rows = [{"ticker": q.ticker, "series": q.series,
-                 "close_time": q.close_time.isoformat() if q.close_time else None,
-                 "yes_bid": None if q.yes_bid is None else str(q.yes_bid),
-                 "yes_ask": None if q.yes_ask is None else str(q.yes_ask),
-                 "target": None if q.target is None else str(q.target)} for q in quotes.values()]
+        rows = [q.as_row() for q in quotes.values()]
         try:
             self.ledger.save_market(now, rows)
         except OSError as e:

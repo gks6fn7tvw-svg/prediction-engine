@@ -45,6 +45,10 @@ def good_form(**over):
     return form
 
 
+def offline(api_base, series):
+    raise OSError("no network in tests")
+
+
 class WebCase(unittest.TestCase):
     def setUp(self):
         self.dir = tempfile.mkdtemp()
@@ -57,6 +61,8 @@ class WebCase(unittest.TestCase):
             yaml.safe_dump(raw, fh)
         self.server = web.make_server(self.path, 0, KEY, host="127.0.0.1")
         self.port = self.server.server_address[1]
+        self.app = self.server.RequestHandlerClass.app
+        self.app.fetcher = offline              # tests never reach Kalshi
         threading.Thread(target=self.server.serve_forever, daemon=True).start()
         self.addCleanup(self.server.server_close)
         self.addCleanup(self.server.shutdown)
@@ -313,6 +319,67 @@ class TestPlayButtons(WebCase):
         form = self.form_from_page()
         _, body, _ = self.call("/settings", data=dict(form, action="delete:0"))
         self.assertIn("at least one play", body)
+
+
+class TestLive(WebCase):
+    def row(self, minutes=6, bid="0.20", ask="0.22"):
+        close = (datetime.now(timezone.utc) + timedelta(minutes=minutes, seconds=30)).isoformat()
+        return {"ticker": "KXBTC15M-L", "series": "KXBTC15M", "close_time": close,
+                "yes_bid": bid, "yes_ask": ask, "target": "60000"}
+
+    def live(self, path="/api/live"):
+        import json as _json
+        status, body, headers = self.call(path, cookie=f"btcbot_key={KEY}")
+        self.assertEqual(status, 200)
+        self.assertIn("application/json", headers["Content-Type"])
+        return _json.loads(body)
+
+    def test_needs_the_key(self):
+        self.assertEqual(self.call("/api/live")[0], 403)
+
+    def test_pages_poll_for_live_numbers(self):
+        _, body, _ = self.call(f"/?key={KEY}")
+        self.assertIn('data-live="/api/live"', body)
+        self.assertIn('id="live-dot"', body)
+        self.assertNotIn('http-equiv="refresh"', body)
+        _, body, _ = self.call(f"/play?name=main&key={KEY}")
+        self.assertIn('data-live="/api/live?play=main"', body)
+
+    def test_asks_kalshi_when_the_bot_has_not_saved_fresh_prices(self):
+        calls = []
+        self.app.fetcher = lambda base, series: calls.append(series) or [self.row()]
+        j = self.live()
+        self.assertIn("80¢", j["parts"]["live-markets"])          # buying Down costs 1 - Up's bid (0.20)
+        self.assertIn("6:", j["parts"]["live-markets"])           # countdown with seconds
+        self.live()
+        self.assertEqual(calls, ["KXBTC15M"])                      # second call within a second uses the cache
+
+    def test_uses_the_bots_prices_when_fresh(self):
+        self.app.fetcher = lambda base, series: self.fail("should not ask Kalshi")
+        Ledger(mode_folder(load(self.path))).save_market(datetime.now(timezone.utc), [self.row(bid="0.30", ask="0.33")])
+        j = self.live()
+        self.assertIn("70¢", j["parts"]["live-markets"])          # Down = 1 - 0.30
+
+    def test_signature_changes_when_a_bet_closes(self):
+        first = self.live()["sig"]
+        self.assertEqual(self.live()["sig"], first)
+        add_trade(Ledger(mode_folder(load(self.path))), "main", "0.18")
+        self.assertNotEqual(self.live()["sig"], first)
+
+    def test_play_view_sends_its_open_bets(self):
+        ledger = Ledger(mode_folder(load(self.path)))
+        state = ledger.load_state(D(11))
+        r = self.row(bid="0.17", ask="0.19")
+        state.set_positions([Position("main", r["ticker"], "KXBTC15M", "yes", "25", "0.12", "0.19",
+                                      datetime.now(timezone.utc).isoformat(), r["close_time"])])
+        ledger.save_state(state)
+        self.app.fetcher = lambda base, series: [r]
+        j = self.live("/api/live?play=main")
+        self.assertIn("now 17¢", j["parts"]["live-open"])
+        self.assertIn('data-k="now-main|KXBTC15M-L"', j["parts"]["live-open"])
+        self.assertIn("+$1.06", j["parts"]["live-open"])        # (0.17 - 0.12) x 25 - 0.19 fee
+        j = self.live()
+        self.assertIn("main · closes", j["parts"]["live-open"])  # overview names the play
 
 
 class TestRestartOnChange(unittest.TestCase):

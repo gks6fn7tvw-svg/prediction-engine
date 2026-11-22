@@ -8,6 +8,7 @@ Anyone without the private key in the link gets nothing.
 from __future__ import annotations
 
 import copy
+import hashlib
 import hmac
 import html
 import json
@@ -24,7 +25,8 @@ from urllib.parse import parse_qs, quote, urlparse
 from zoneinfo import ZoneInfo
 
 from . import ledger as L
-from .rules import parse_time
+from .kalshi import KalshiClient
+from .rules import Quote, parse_time
 from .settings import (PACKAGE_DIR, SIZE_MODES, Settings, SettingsError, load, load_raw, mode_folder,
                        save_raw)
 
@@ -37,6 +39,8 @@ EXIT_WORDS = {"take_profit": "take profit", "stop_loss": "stop loss"}
 REPO_DIR = os.path.dirname(PACKAGE_DIR)
 COOKIE = "btcbot_key"
 MAX_BODY = 64_000
+FRESH_SECONDS = 2.5   # the bot's saved prices count as live when newer than this
+CACHE_SECONDS = 1.0   # the website asks Kalshi at most this often per market
 ONE = Decimal("1")
 ON_PILL = '<span class="pill on-pill">ON</span>'
 OFF_PILL = '<span class="pill off-pill">OFF</span>'
@@ -265,6 +269,50 @@ class App:
         self.key = key
         self.updater = update_code
         self.restarter = restart_soon
+        self.fetcher = self._fetch_from_kalshi
+        self._client = None
+        self._lock = threading.Lock()
+        self._price_cache: dict = {}
+        self._rows_cache = (None, [])
+
+    def _fetch_from_kalshi(self, api_base: str, series: str) -> list:
+        if self._client is None or self._client.base_url != api_base.rstrip("/"):
+            self._client = KalshiClient(api_base, timeout=4)
+        return [Quote.from_market(m, series).as_row() for m in self._client.open_markets(series)]
+
+    def refresh_prices(self, d: dict) -> None:
+        """Live prices: the bot's own when fresh, otherwise straight from Kalshi (at most once a second)."""
+        age = d.get("market_age")
+        if age is not None and age < FRESH_SECONDS:
+            return
+        fetched = {}
+        with self._lock:
+            now = time.monotonic()
+            for series in d["s"].markets:
+                hit = self._price_cache.get(series)
+                if hit and now - hit[0] < CACHE_SECONDS:
+                    rows = hit[1]
+                else:
+                    try:
+                        rows = self.fetcher(d["s"].api_base, series)
+                    except Exception:
+                        continue  # keep whatever the bot saved last
+                    self._price_cache[series] = (now, rows)
+                fetched.update({r["ticker"]: r for r in rows if r.get("ticker")})
+        if fetched:
+            d["market"] = {**d["market"], **fetched}
+            d["market_age"] = 0.0
+
+    def trades(self, path: str) -> list:
+        """The trade list, read again only when the file changes."""
+        try:
+            st = os.stat(path)
+            stamp = (st.st_mtime_ns, st.st_size)
+        except OSError:
+            return []
+        if self._rows_cache[0] != stamp:
+            self._rows_cache = (stamp, L.read_trades(path))
+        return self._rows_cache[1]
 
     def settings(self) -> tuple[Settings | None, str | None]:
         try:
@@ -295,7 +343,7 @@ class App:
         except (OSError, ValueError):
             d["state"], d["age"] = None, None
         d["paused"] = os.path.exists(os.path.join(folder, "STOP"))
-        d["rows"] = L.read_trades(os.path.join(folder, "trades.csv"))
+        d["rows"] = self.trades(os.path.join(folder, "trades.csv"))
         d["market"], d["market_age"] = {}, None
         try:
             with open(os.path.join(folder, "market.json"), encoding="utf-8") as fh:
@@ -306,6 +354,14 @@ class App:
                 d["market_age"] = (datetime.now(timezone.utc) - updated).total_seconds()
         except (OSError, ValueError, KeyError, TypeError):
             pass
+        self.refresh_prices(d)
+        # When this changes (a bet opened or closed, settings saved, paused) the page reloads itself.
+        try:
+            settings_time = os.stat(self.settings_path).st_mtime_ns
+        except OSError:
+            settings_time = 0
+        held = sorted(f'{p["play"]}|{p["ticker"]}' for p in (d["state"].positions if d["state"] else []))
+        d["sig"] = hashlib.sha1(json.dumps([settings_time, len(d["rows"]), held, d["paused"]]).encode()).hexdigest()[:12]
         return d
 
     def save_form(self, form: dict) -> tuple[str, int | None]:
@@ -457,18 +513,65 @@ input,select{width:100%;padding:11px;border-radius:10px;border:1px solid #363c48
 .check{display:flex;gap:10px;align-items:center;margin:12px 0 4px}.check input{width:22px;height:22px;flex:none}
 details{margin-top:12px}summary{cursor:pointer;color:#8fb0ff}
 .savebar{position:sticky;bottom:0;padding:10px 0 6px;background:linear-gradient(transparent,var(--bg) 35%)}
+.livebadge{display:inline-flex;align-items:center;gap:6px;font-size:12px;font-weight:700;color:var(--dim);margin-left:auto}
+.dot{width:9px;height:9px;border-radius:50%;background:#555}
+.dot.on{background:var(--green);animation:pulse 2s infinite}
+@keyframes pulse{0%{box-shadow:0 0 0 0 rgba(54,211,127,.6)}70%{box-shadow:0 0 0 7px rgba(54,211,127,0)}100%{box-shadow:0 0 0 0 rgba(54,211,127,0)}}
+@keyframes fu{from{background:rgba(54,211,127,.45)}to{background:transparent}}
+@keyframes fd{from{background:rgba(255,107,107,.45)}to{background:transparent}}
+.flash-up{animation:fu 1.3s ease-out;border-radius:6px}.flash-down{animation:fd 1.3s ease-out;border-radius:6px}
 .empty{color:var(--dim);font-size:14px;padding:6px 0}.back{display:inline-block;color:#8fb0ff;text-decoration:none;margin-bottom:6px}
 """
 
 
-def page(title: str, body: str, tab: str, refresh=None) -> str:
-    meta = f'<meta http-equiv="refresh" content="{refresh}">' if refresh else ""
+LIVE_JS = """
+(function(){
+  var b = document.body, sig = b.dataset.sig, url = b.dataset.live, fails = 0, busy = false, old = {};
+  function dot(ok){ var d = document.getElementById('live-dot'); if (d) d.className = ok ? 'dot on' : 'dot'; }
+  function remember(flash){
+    document.querySelectorAll('[data-k]').forEach(function(e){
+      var k = e.dataset.k, v = parseFloat(e.dataset.v);
+      if (flash && old[k] !== undefined && !isNaN(v) && v !== old[k]) e.classList.add(v > old[k] ? 'flash-up' : 'flash-down');
+      old[k] = v;
+    });
+  }
+  function tick(){
+    if (document.hidden || busy) return;
+    busy = true;
+    fetch(url, {cache: 'no-store', credentials: 'same-origin'})
+      .then(function(r){ if (!r.ok) throw r.status; return r.json(); })
+      .then(function(j){
+        busy = false; fails = 0; dot(true);
+        if (j.sig !== sig) { location.reload(); return; }
+        for (var id in j.parts) {
+          var el = document.getElementById(id);
+          if (el && el.innerHTML !== j.parts[id]) el.innerHTML = j.parts[id];
+        }
+        remember(true);
+      })
+      .catch(function(){ busy = false; if (++fails > 3) dot(false); });
+  }
+  remember(false); dot(true);
+  setInterval(tick, 1000);
+  document.addEventListener('visibilitychange', tick);
+})();
+"""
+
+
+def page(title: str, body: str, tab: str, refresh=None, live: str | None = None, sig: str = "") -> str:
+    """A whole page. Pages with `live` update their numbers every second instead of reloading."""
+    meta = f'<meta http-equiv="refresh" content="{refresh}">' if refresh and not live else ""
     on = lambda t: ' class="on"' if t == tab else ""
+    body_attrs = f' data-live="{esc(live)}" data-sig="{esc(sig)}"' if live else ""
+    script = f"<script>{LIVE_JS}</script>" if live else ""
     return (f'<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" '
             f'content="width=device-width,initial-scale=1"><meta name="theme-color" content="#0d0f14">'
-            f'{meta}<title>{esc(title)}</title><style>{CSS}</style></head><body><main>'
+            f'{meta}<title>{esc(title)}</title><style>{CSS}</style></head><body{body_attrs}><main>'
             f'<nav><a href="/"{on("status")}>Overview</a><a href="/settings"{on("settings")}>Settings</a></nav>'
-            f'{body}</main></body></html>')
+            f'{body}</main>{script}</body></html>')
+
+
+LIVE_BADGE = '<span class="livebadge"><span id="live-dot" class="dot"></span>LIVE</span>'
 
 
 def mode_pill(mode: str) -> str:
@@ -486,6 +589,11 @@ def running_box(d: dict) -> str:
     return f'<div class="box bad">⚠️ Not running · last price check {int(age // 60)} minutes ago</div>'
 
 
+def countdown(seconds: float) -> str:
+    seconds = max(0, int(seconds))
+    return f"{seconds // 60}:{seconds % 60:02d}"
+
+
 def side_tag(side_word: str) -> str:
     up = side_word.upper() in ("UP", "YES")
     return f'<span class="side {"up" if up else "down"}">{"▲ UP" if up else "▼ DOWN"}</span>'
@@ -500,14 +608,16 @@ def now_bid(pos: dict, market: dict) -> Decimal | None:
     return ONE - Decimal(m["yes_ask"]) if m.get("yes_ask") else None
 
 
-def open_bet(pos: dict, play, d: dict) -> str:
+def open_bet(pos: dict, play, d: dict, show_play: bool = False) -> str:
     zone = d["zone"]
     n = Decimal(pos["contracts"])
     paid = Decimal(pos["entry_price"])
     close = parse_time(pos["close_time"])
     mins = (close - datetime.now(timezone.utc)).total_seconds() / 60 if close else None
-    when = (f"closes {clock(close, zone)} · {max(mins, 0):.0f} min left" if mins is not None and mins > 0
+    when = (f"closes {clock(close, zone)} · {countdown(mins * 60)} left" if mins is not None and mins > 0
             else "closed · waiting for the result")
+    if show_play:
+        when = f"{pos['play']} · {when}"
     plan = []
     if play is not None and play.take_profit is not None:
         plan.append(f"sells at {cents_text(play.take_profit)}")
@@ -517,7 +627,9 @@ def open_bet(pos: dict, play, d: dict) -> str:
     bid = now_bid(pos, d["market"]) if fresh else None
     if bid is not None and (mins is None or mins > 0):
         change = (bid - paid) * n - Decimal(pos["entry_fee"])
-        right = f'now {cents_text(bid)}<div class="sub">{money(change)} if sold</div>'
+        key = esc(f'{pos["play"]}|{pos["ticker"]}')
+        right = (f'<span data-k="now-{key}" data-v="{bid}">now {cents_text(bid)}</span>'
+                 f'<div class="sub">{money(change)} if sold</div>')
     else:
         right = '<span class="dim">open</span>'
     return (f'<div class="bet"><div>{side_tag(pos["side"])}<b>{n:g} × {cents_text(paid)}</b>'
@@ -551,9 +663,10 @@ def market_cards(d: dict) -> str:
             soonest[m["series"]] = m
     names = dict(MARKETS)
 
-    def box(word, arrow, p, fav):
+    def box(series, word, arrow, p, fav):
+        value = f' data-k="{esc(series)}-{word}" data-v="{p}"' if p is not None else ""
         return (f'<div class="price{" fav" if fav else ""}">{arrow} {word}'
-                f'<b>{cents_text(p) if p is not None else "—"}</b></div>')
+                f'<b{value}>{cents_text(p) if p is not None else "—"}</b></div>')
 
     out = []
     for series, m in soonest.items():
@@ -563,11 +676,12 @@ def market_cards(d: dict) -> str:
         down = ONE - Decimal(m["yes_bid"]) if m.get("yes_bid") else None
         fav_up = up is not None and down is not None and up >= down
         target = f' · target ${float(m["target"]):,.2f}' if m.get("target") else ""
-        stale = f' · prices {int(age)}s old' if age > 30 else ""
+        stale = f' · prices {int(age)}s old' if age > 10 else ""
         out.append(f'<div class="box market"><div class="top"><span><b style="color:var(--text)">'
                    f'{esc(names.get(series, series))}</b> · closes {clock(t, zone)}</span>'
-                   f'<span>{mins:.0f} min left</span></div>'
-                   f'<div class="prices">{box("Up", "▲", up, fav_up)}{box("Down", "▼", down, not fav_up)}</div>'
+                   f'<span>{countdown(mins * 60)} left</span></div>'
+                   f'<div class="prices">{box(series, "Up", "▲", up, fav_up)}'
+                   f'{box(series, "Down", "▼", down, not fav_up)}</div>'
                    f'<p class="hint">Price to buy right now{target}{stale}</p></div>')
     return "".join(out)
 
@@ -598,7 +712,8 @@ def overview_page(app: App) -> str:
                 'Fix it on the Settings page. The bot can\'t start until then.</div>')
         return page("Kalshi bot", body, "status", refresh=60)
     st = d["state"]
-    parts = [f"<h1>Kalshi bot {mode_pill(s.mode)}</h1>", running_box(d)]
+    parts = [f"<h1>Kalshi bot {mode_pill(s.mode)}{LIVE_BADGE}</h1>",
+             f'<div id="live-running">{running_box(d)}</div>']
     if d["paused"]:
         parts.append('<div class="box warn"><b>Paused:</b> no new bets. Open bets still finish.'
                      '<form method="post" action="/resume"><button>Resume betting</button></form></div>')
@@ -611,7 +726,10 @@ def overview_page(app: App) -> str:
             f'<div class="card"><span>Today</span><b>{money(st.day_profit)}</b><span>{bets(st.day_trades)}</span></div>'
             f'<div class="card"><span>All time</span><b>{money(total["profit"])}</b><span>{bets(total["trades"])}</span></div>'
             '</div>')
-    parts.append(market_cards(d))
+    parts.append(f'<div id="live-markets">{market_cards(d)}</div>')
+    if st is not None and st.positions:
+        parts.append(f'<h2>Open bets · {len(st.positions)}</h2>'
+                     f'<div class="box" id="live-open">{overview_open_bets(d)}</div>')
     parts.append("<h2>Your plays</h2>")
     by_name = {p.name: p for p in s.plays}
     positions = st.positions if st is not None else []
@@ -639,8 +757,33 @@ def overview_page(app: App) -> str:
                  '<form method="post" action="/update"><button class="btn2">Get the newest version</button></form>'
                  '<p class="hint">Only needed when Claude tells you there\'s an update. Takes about a minute. '
                  'Open bets are kept.</p></div>'
-                 '<p class="hint">This page refreshes by itself every 30 seconds.</p>')
-    return page("Kalshi bot", "".join(parts), "status", refresh=30)
+                 '<p class="hint">Numbers update live while this page is open.</p>')
+    return page("Kalshi bot", "".join(parts), "status", live="/api/live", sig=d["sig"])
+
+
+def overview_open_bets(d: dict) -> str:
+    by_name = {p.name: p for p in d["s"].plays}
+    return "".join(open_bet(p, by_name.get(p["play"]), d, show_play=True) for p in d["state"].positions)
+
+
+def play_open_bets(d: dict, name: str, play) -> str:
+    positions = [p for p in (d["state"].positions if d.get("state") else []) if p["play"] == name]
+    return "".join(open_bet(p, play, d) for p in positions) or '<div class="empty">None right now.</div>'
+
+
+def live_parts(app: App, name: str | None) -> dict:
+    """The parts of a page that change every second, for /api/live."""
+    d = app.snapshot()
+    if d["s"] is None:
+        return {"sig": "settings-problem", "parts": {}}
+    parts = {"live-running": running_box(d), "live-markets": market_cards(d)}
+    if name is None:
+        if d["state"] is not None and d["state"].positions:
+            parts["live-open"] = overview_open_bets(d)
+    else:
+        play = {p.name: p for p in d["s"].plays}.get(name)
+        parts["live-open"] = play_open_bets(d, name, play)
+    return {"sig": d["sig"], "parts": parts}
 
 
 def play_page(app: App, name: str) -> str:
@@ -656,7 +799,7 @@ def play_page(app: App, name: str) -> str:
     zone = d["zone"]
     rows = [r for r in d["rows"] if r["play"] == name]
     ps = L.stats(rows)
-    parts = ['<a class="back" href="/">‹ All plays</a>', f"<h1>{esc(name)} {status_pill(play)}</h1>"]
+    parts = ['<a class="back" href="/">‹ All plays</a>', f"<h1>{esc(name)} {status_pill(play)}{LIVE_BADGE}</h1>"]
     if play is not None:
         parts.append(f'<p class="dim" style="margin-top:0">{describe_play(play, s)}</p>')
     else:
@@ -673,9 +816,8 @@ def play_page(app: App, name: str) -> str:
                      f'<p class="hint">"Needs" is the win rate this play must beat to make money. Luck can move a '
                      f'win rate about ±{100 * ps["luck"]:.0f} points at {bets(ps["trades"])}.</p></div>')
     positions = [p for p in (d["state"].positions if d.get("state") else []) if p["play"] == name]
-    parts.append(f'<h2>Open bets · {len(positions)}</h2><div class="box">')
-    parts.append("".join(open_bet(p, play, d) for p in positions) or '<div class="empty">None right now.</div>')
-    parts.append("</div>")
+    parts.append(f'<h2>Open bets · {len(positions)}</h2><div class="box" id="live-open">'
+                 f'{play_open_bets(d, name, play)}</div>')
     parts.append(f'<h2>Closed bets · {len(rows)}</h2><div class="box">')
     parts.append("".join(closed_bet(r, zone) for r in reversed(rows[-60:])) or '<div class="empty">None yet.</div>')
     if len(rows) > 60:
@@ -686,7 +828,7 @@ def play_page(app: App, name: str) -> str:
         parts.append('<h2>What it did lately</h2><div class="box log">' + esc("\n".join(log)) + "</div>")
     if play is not None:
         parts.append(f'<a class="btn btn2" href="/settings#play-{s.plays.index(play)}">Edit this play</a>')
-    return page(name, "".join(parts), "status", refresh=30)
+    return page(name, "".join(parts), "status", live="/api/live?play=" + quote(name, safe=""), sig=d["sig"])
 
 
 def play_form(i: int, p: dict, opt, inp) -> str:
@@ -854,6 +996,9 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(403, denied_page())
         if url.path == "/":
             return self._send(200, overview_page(self.app), set_cookie=from_link)
+        if url.path == "/api/live":
+            name = (query.get("play") or [None])[0]
+            return self._send(200, json.dumps(live_parts(self.app, name)), ctype="application/json")
         if url.path == "/play":
             return self._send(200, play_page(self.app, (query.get("name") or [""])[0]), set_cookie=from_link)
         if url.path == "/settings":

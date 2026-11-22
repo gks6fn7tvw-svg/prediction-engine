@@ -63,6 +63,13 @@ class Quote:
             target=Decimal(str(strike)) if strike not in (None, "") else None,
         )
 
+    def as_row(self) -> dict:
+        """Plain prices for the website."""
+        text = lambda v: None if v is None else str(v)
+        return {"ticker": self.ticker, "series": self.series,
+                "close_time": self.close_time.isoformat() if self.close_time else None,
+                "yes_bid": text(self.yes_bid), "yes_ask": text(self.yes_ask), "target": text(self.target)}
+
     # Buying NO matches someone's YES bid, so NO ask = 1 - YES bid (and the reverse).
     def ask(self, side: str) -> Decimal | None:
         if side == "yes":

@@ -98,6 +98,14 @@ class Quote:
         return Decimal(str((self.close_time - now).total_seconds())) / 60
 
 
+def position_words(n) -> str:
+    """+3 -> "3 Up", -2 -> "2 Down", 0 -> "nothing"."""
+    n = Decimal(n)
+    if n == 0:
+        return "nothing"
+    return f"{format(abs(n).normalize(), 'f')} {'Up' if n > 0 else 'Down'}"
+
+
 def side_name(side: str) -> str:
     return "UP" if side == "yes" else "DOWN"
 

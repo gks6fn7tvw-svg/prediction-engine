@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from dataclasses import dataclass
 from decimal import Decimal, ROUND_FLOOR
 
@@ -30,10 +31,11 @@ class PaperBroker:
     def __init__(self, cash: Decimal):
         self.cash = cash
 
-    def balance(self) -> Decimal:
-        return self.cash
+    def balance(self, account: int | None = None) -> Decimal:
+        return self.cash  # pretend money is one shared pot
 
-    def buy(self, q: Quote, side: str, contracts: Decimal, limit: Decimal, multiplier: Decimal) -> Fill | None:
+    def buy(self, q: Quote, side: str, contracts: Decimal, limit: Decimal, multiplier: Decimal,
+            account: int = 0) -> Fill | None:
         ask = q.ask(side)
         if ask is None or ask > limit:
             return None
@@ -46,7 +48,8 @@ class PaperBroker:
         self.cash -= n * ask + fee
         return Fill(n, ask, fee)
 
-    def sell(self, q: Quote, side: str, contracts: Decimal, min_price: Decimal, multiplier: Decimal) -> Fill | None:
+    def sell(self, q: Quote, side: str, contracts: Decimal, min_price: Decimal, multiplier: Decimal,
+             account: int = 0) -> Fill | None:
         bid = q.bid(side)
         if bid is None or bid < min_price:
             return None
@@ -62,28 +65,56 @@ class PaperBroker:
 
 
 class LiveBroker:
-    """Real orders on Kalshi. Every order fills right away or cancels (no waiting orders)."""
+    """Real orders on Kalshi. Every order fills right away or cancels (no waiting orders).
+
+    Each play trades in its own Kalshi subaccount (`account`), so one play's Up
+    contracts and another play's Down contracts in the same market don't cancel
+    out. Subaccount 0 is the main account.
+    """
 
     live = True
+    BALANCE_CACHE_SECONDS = 1.5
 
-    def __init__(self, client: KalshiClient):
+    def __init__(self, client: KalshiClient, accounts=(0,)):
         self.client = client
+        self.accounts = sorted(set(accounts)) or [0]
+        self._cache: tuple[float, dict] = (0.0, {})
 
-    def balance(self) -> Decimal:
-        return self.client.balance_dollars()
+    def balances(self) -> dict[int, Decimal]:
+        """Cash per subaccount. One call covers all of them (Kalshi limits balance calls to 1 a second)."""
+        if self.accounts == [0]:
+            return {0: self.client.balance_dollars()}
+        now = time.monotonic()
+        if self._cache[1] and now - self._cache[0] < self.BALANCE_CACHE_SECONDS:
+            return self._cache[1]
+        b = self.client.subaccount_balances()
+        self._cache = (now, b)
+        return b
 
-    def buy(self, q: Quote, side: str, contracts: Decimal, limit: Decimal, multiplier: Decimal) -> Fill | None:
+    def balance(self, account: int | None = None) -> Decimal:
+        b = self.balances()
+        if account is None:
+            return sum((b.get(a, Decimal("0")) for a in self.accounts), Decimal("0"))
+        return b.get(account, Decimal("0"))
+
+    def buy(self, q: Quote, side: str, contracts: Decimal, limit: Decimal, multiplier: Decimal,
+            account: int = 0) -> Fill | None:
+        self._cache = (0.0, {})  # the balance is about to change
         if side == "yes":
-            resp = self.client.place_ioc(q.ticker, "bid", contracts, limit)
+            resp = self.client.place_ioc(q.ticker, "bid", contracts, limit, subaccount=account)
         else:  # buying Down at `limit` = selling Up at 1 - limit
-            resp = self.client.place_ioc(q.ticker, "ask", contracts, ONE - limit)
+            resp = self.client.place_ioc(q.ticker, "ask", contracts, ONE - limit, subaccount=account)
         return self._fill(resp, side, limit, multiplier, buying=True)
 
-    def sell(self, q: Quote, side: str, contracts: Decimal, min_price: Decimal, multiplier: Decimal) -> Fill | None:
+    def sell(self, q: Quote, side: str, contracts: Decimal, min_price: Decimal, multiplier: Decimal,
+             account: int = 0) -> Fill | None:
+        self._cache = (0.0, {})
         if side == "yes":
-            resp = self.client.place_ioc(q.ticker, "ask", contracts, min_price, reduce_only=True)
+            resp = self.client.place_ioc(q.ticker, "ask", contracts, min_price, reduce_only=True,
+                                         subaccount=account)
         else:  # selling Down at `min_price` = buying Up at 1 - min_price
-            resp = self.client.place_ioc(q.ticker, "bid", contracts, ONE - min_price, reduce_only=True)
+            resp = self.client.place_ioc(q.ticker, "bid", contracts, ONE - min_price, reduce_only=True,
+                                         subaccount=account)
         return self._fill(resp, side, min_price, multiplier, buying=False)
 
     def collect(self, payout: Decimal) -> None:

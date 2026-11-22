@@ -74,10 +74,14 @@ def cmd_run(settings, path: str = DEFAULT_PATH) -> None:
     state = ledger.load_state(settings.paper_balance)
     if settings.live:
         broker = LiveBroker(client)
-        logging.getLogger("btcbot").warning("LIVE MODE: real money. Balance now $%.2f", broker.balance())
+        logging.getLogger("btcbot").warning("LIVE MODE: real money. Main account balance $%.2f",
+                                            broker.balance(0))
     else:
         broker = PaperBroker(Decimal(state.paper_cash))
-    Bot(settings, client, broker, ledger, state, RealClock()).run_forever(settings_watcher(path))
+    bot = Bot(settings, client, broker, ledger, state, RealClock())
+    if settings.live:
+        bot.prepare_live()
+    bot.run_forever(settings_watcher(path))
 
 
 def cmd_check(settings) -> None:
@@ -112,6 +116,14 @@ def cmd_check(settings) -> None:
                     print(f"    {p.name}: {said}")
     if settings.live:
         print(f"\nKalshi balance: ${client.balance_dollars():.2f} (key works)")
+        if any(p.subaccount for p in settings.plays if p.enabled):
+            try:
+                print(f"Kalshi API level: {client.api_level() or 'unknown'}")
+                for n, cash in sorted(client.subaccount_balances().items()):
+                    names = [p.name for p in settings.plays if p.enabled and p.subaccount == n]
+                    print(f"  subaccount {n}: ${cash:.2f}" + (f" ({', '.join(names)})" if names else ""))
+            except Exception as e:
+                print(f"Could not list subaccounts yet ({e}); the bot sets them up when it starts.")
     print("\nNo orders were placed.")
 
 

@@ -1,4 +1,5 @@
 """Offline tests for the bot's private website."""
+import json
 import os
 import shutil
 import tempfile
@@ -429,3 +430,59 @@ class TestKey(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestRealMoneyPages(WebCase):
+    def go_live(self, plays):
+        with open(self.path) as fh:
+            raw = yaml.safe_load(fh)
+        raw.update(mode="live", live_confirm="I accept real-money risk", plays=plays)
+        with open(self.path, "w") as fh:
+            yaml.safe_dump(raw, fh)
+        return mode_folder(load(self.path))
+
+    def test_money_panel_alert_and_transfer(self):
+        from btcbot.bot import TRANSFER_FILE
+        folder = self.go_live([{"name": "main", "min_price": 0.7, "max_price": 0.85, "act_from_minutes_left": 8,
+                                "act_until_minutes_left": 7, "subaccount": 1},
+                               {"name": "cheap", "buy": "underdog", "min_price": 0.08, "max_price": 0.2,
+                                "act_from_minutes_left": 15, "act_until_minutes_left": 11, "subaccount": 2}])
+        ledger = Ledger(folder)
+        state = ledger.load_state(D(0))
+        state.accounts = {"0": "20.00", "1": "5.00", "2": "3.50"}
+        state.alert = "Paused: the bot's records don't match your Kalshi account."
+        state.notice = "Moved $5.00 from your main account to subaccount 1."
+        ledger.save_state(state)
+        with open(os.path.join(folder, "STOP"), "w") as fh:
+            fh.write("x")
+        _, body, _ = self.call(f"/?key={KEY}")
+        self.assertIn("REAL MONEY", body)
+        self.assertIn("$28.50", body)                              # all subaccounts together
+        self.assertIn("records don&#x27;t match", body)
+        self.assertIn("Kalshi money", body)
+        self.assertIn("Subaccount 2", body)
+        self.assertIn("Uses subaccount 1.", body)
+        self.assertIn("Last money move: Moved $5.00", body)
+        status, _, headers = self.call("/transfer", data={"key": KEY, "from": "0", "to": "2", "amount": "4.25"})
+        self.assertEqual(status, 303)
+        with open(os.path.join(folder, TRANSFER_FILE)) as fh:
+            req = json.load(fh)
+        self.assertEqual((req["from"], req["to"], req["amount_cents"]), (0, 2, 425))
+        _, body, _ = self.call(f"/?key={KEY}")
+        self.assertIn("Asked the bot to move $4.25", body)
+        self.call("/transfer", data={"key": KEY, "from": "1", "to": "1", "amount": "1"})
+        _, body, _ = self.call(f"/?key={KEY}")
+        self.assertIn("two different subaccounts", body)
+
+    def test_transfers_refused_in_paper_mode(self):
+        from btcbot.bot import TRANSFER_FILE
+        self.call("/transfer", data={"key": KEY, "from": "0", "to": "1", "amount": "1"})
+        self.assertFalse(os.path.exists(os.path.join(mode_folder(load(self.path)), TRANSFER_FILE)))
+
+    def test_subaccount_field_saves(self):
+        form = TestPlayButtons.form_from_page(self)
+        form["p0_sub"] = "3"
+        self.call("/settings", data=dict(form, action="save"))
+        self.assertEqual(load(self.path).plays[0].subaccount, 3)
+        _, body, _ = self.call("/settings", cookie=f"btcbot_key={KEY}")
+        self.assertIn('name="p0_sub" value="3"', body)

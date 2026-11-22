@@ -122,22 +122,74 @@ class KalshiClient:
         return self._request("GET", f"/series/{series_ticker}").get("series", {})
 
     # ---- account (needs key) --------------------------------------------
-    def balance_dollars(self) -> Decimal:
-        data = self._request("GET", "/portfolio/balance", signed=True)
+    # `subaccount` 0 is the main account; 1-63 are numbered subaccounts, which
+    # keep their own money and positions (so two plays can hold opposite sides).
+    def balance_dollars(self, subaccount: int = 0) -> Decimal:
+        params = {"subaccount": subaccount} if subaccount else None
+        data = self._request("GET", "/portfolio/balance", params=params, signed=True)
         if data.get("balance_dollars") not in (None, ""):
             return Decimal(str(data["balance_dollars"]))
         return Decimal(int(data.get("balance", 0))) / 100
 
-    def position(self, ticker: str) -> Decimal:
+    def position(self, ticker: str, subaccount: int = 0) -> Decimal:
         """Contracts held in one market: positive = YES, negative = NO."""
-        data = self._request("GET", "/portfolio/positions", params={"ticker": ticker}, signed=True)
+        params = {"ticker": ticker}
+        if subaccount:
+            params["subaccount"] = subaccount
+        data = self._request("GET", "/portfolio/positions", params=params, signed=True)
         for p in data.get("market_positions", []):
             if p.get("ticker") == ticker:
                 return Decimal(str(p.get("position_fp", "0")))
         return Decimal("0")
 
+    def positions(self, subaccount: int = 0) -> dict[str, Decimal]:
+        """Every open (unsettled) position in one subaccount: ticker -> contracts (+ YES, - NO)."""
+        params = {"count_filter": "position", "settlement_status": "unsettled", "limit": 1000}
+        if subaccount:
+            params["subaccount"] = subaccount
+        data = self._request("GET", "/portfolio/positions", params=params, signed=True)
+        out = {}
+        for p in data.get("market_positions", []):
+            n = Decimal(str(p.get("position_fp", "0")))
+            if p.get("ticker") and n != 0:
+                out[p["ticker"]] = out.get(p["ticker"], Decimal("0")) + n
+        return out
+
+    def subaccount_balances(self) -> dict[int, Decimal]:
+        """Cash in every subaccount (0 = main account), in dollars."""
+        data = self._request("GET", "/portfolio/subaccounts/balances", signed=True)
+        out: dict[int, Decimal] = {}
+        for b in data.get("subaccount_balances", []):
+            n = int(b.get("subaccount_number", b.get("subaccount", 0)))
+            out[n] = out.get(n, Decimal("0")) + (dollars(b.get("balance")) or Decimal("0"))
+        return out
+
+    def create_subaccount(self) -> int:
+        """Make the next numbered subaccount (needs the Advanced API level). Returns its number."""
+        data = self._request("POST", "/portfolio/subaccounts", body={}, signed=True)
+        for key in ("subaccount_number", "subaccount"):
+            if data.get(key) is not None:
+                return int(data[key])
+        raise KalshiError(0, f"Kalshi did not say which subaccount it made: {data}")
+
+    def transfer(self, from_subaccount: int, to_subaccount: int, amount_cents: int,
+                 transfer_id: str | None = None) -> dict:
+        """Move cash between your own subaccounts. Nothing leaves your Kalshi account."""
+        return self._request("POST", "/portfolio/subaccounts/transfer", signed=True, body={
+            "client_transfer_id": transfer_id or str(uuid.uuid4()),
+            "from_subaccount": int(from_subaccount), "to_subaccount": int(to_subaccount),
+            "amount_cents": int(amount_cents)})
+
+    def api_level(self) -> str:
+        """basic, advanced, expert, premier, ..."""
+        return str(self._request("GET", "/account/limits", signed=True).get("usage_tier", "")).lower()
+
+    def upgrade_api_level(self) -> None:
+        """Ask for the free Advanced level (granted once one of the last 100 orders came from the API)."""
+        self._request("POST", "/account/api_usage_level/upgrade", signed=True)
+
     def place_ioc(self, ticker: str, yes_side: str, count: Decimal, yes_price: Decimal,
-                  reduce_only: bool = False) -> dict:
+                  reduce_only: bool = False, subaccount: int = 0) -> dict:
         """Place an order that fills right now (up to `count`) or cancels the rest.
 
         yes_side: "bid" buys YES (or closes NO); "ask" sells YES (or buys NO).
@@ -154,6 +206,8 @@ class KalshiClient:
         }
         if reduce_only:
             body["reduce_only"] = True
+        if subaccount:
+            body["subaccount"] = int(subaccount)
         return self._request("POST", "/portfolio/events/orders", body=body, signed=True)
 
 

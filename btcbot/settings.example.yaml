@@ -45,6 +45,7 @@ plays:
     min_price: 0.70        # only buy if it costs at least 70c
     max_price: 0.85        # and at most 85c
     slippage_cents: 0      # pay up to this many cents more than the price you see
+    subaccount: 0          # real money only: Kalshi subaccount for this play (0 = main account)
 
     # When it may act (minutes left before the market closes)
     act_from_minutes_left: 8

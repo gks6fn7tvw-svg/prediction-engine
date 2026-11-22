@@ -18,6 +18,7 @@ import subprocess
 import sys
 import threading
 import time
+import uuid
 from datetime import datetime, timezone
 from decimal import Decimal
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -26,7 +27,7 @@ from zoneinfo import ZoneInfo
 
 from . import ledger as L
 from .kalshi import KalshiClient
-from .bot import PAPER_RESET_FILE
+from .bot import PAPER_RESET_FILE, TRANSFER_FILE, account_name
 from .rules import Quote, parse_time
 from .settings import (PACKAGE_DIR, SIZE_MODES, Settings, SettingsError, load, load_raw, mode_folder,
                        save_raw)
@@ -272,6 +273,7 @@ class App:
         self.key = key
         self.updater = update_code
         self.restarter = restart_soon
+        self.moved = ""
         self.fetcher = self._fetch_from_kalshi
         self._client = None
         self._lock = threading.Lock()
@@ -364,7 +366,9 @@ class App:
         except OSError:
             settings_time = 0
         held = sorted(f'{p["play"]}|{p["ticker"]}' for p in (d["state"].positions if d["state"] else []))
-        d["sig"] = hashlib.sha1(json.dumps([settings_time, len(d["rows"]), held, d["paused"]]).encode()).hexdigest()[:12]
+        extra = [d["state"].alert, d["state"].notice] if d["state"] else []
+        d["sig"] = hashlib.sha1(json.dumps([settings_time, len(d["rows"]), held, d["paused"], extra])
+                                .encode()).hexdigest()[:12]
         return d
 
     def save_form(self, form: dict) -> tuple[str, int | None]:
@@ -477,6 +481,9 @@ def form_to_raw(form: dict, current: dict) -> dict:
                 "value": number(form, p + "size_value", f"{label} bet size"),
                 "max_contracts": number(form, p + "size_max", f"{label} most contracts", blank_ok=True) or 0,
             }
+        sub = number(form, p + "sub", f"{label} Kalshi subaccount", blank_ok=True)
+        if sub:
+            play["subaccount"] = sub
         plays.append(play)
     raw["plays"] = plays
     return raw
@@ -726,16 +733,27 @@ def overview_page(app: App) -> str:
     st = d["state"]
     parts = [f"<h1>Kalshi bot {mode_pill(s.mode)}{LIVE_BADGE}</h1>",
              f'<div id="live-running">{running_box(d)}</div>']
-    if d["paused"]:
+    if st is not None and st.alert:
+        parts.append(f'<div class="box bad"><b>⚠️ {esc(st.alert)}</b> Open bets still finish.'
+                     '<form method="post" action="/resume"><button>Resume betting</button></form></div>')
+    elif d["paused"]:
         parts.append('<div class="box warn"><b>Paused:</b> no new bets. Open bets still finish.'
                      '<form method="post" action="/resume"><button>Resume betting</button></form></div>')
+    if app.moved:
+        parts.append(f'<div class="box ok">{esc(app.moved)}</div>')
+        app.moved = ""
     total = L.stats(d["rows"])
     if st is not None and s.mode == "paper" and Decimal(st.paper_cash) < LOW_MONEY:
         parts.append(f'<div class="box bad"><b>Pretend money is almost gone (${float(st.paper_cash):.2f}),</b> '
                      'so the plays can\'t place new bets. '
                      '<a href="/settings#money" style="color:#8fb0ff">Reset it on the Settings page</a>.</div>')
     if st is not None:
-        bal = f"${float(st.paper_cash):.2f}" if s.mode == "paper" else "Kalshi app"
+        if s.mode == "paper":
+            bal = f"${float(st.paper_cash):.2f}"
+        elif st.accounts:
+            bal = f"${sum(float(v) for v in st.accounts.values()):.2f}"
+        else:
+            bal = "Kalshi app"
         parts.append(
             '<div class="cards">'
             f'<div class="card"><span>Balance</span><b>{bal}</b></div>'
@@ -754,6 +772,8 @@ def overview_page(app: App) -> str:
         ps = L.stats([r for r in d["rows"] if r["play"] == name])
         opened = sum(1 for p in positions if p["play"] == name)
         desc = describe_play(play, s) if play else "Removed or renamed. Its past bets are kept here."
+        if play and s.mode == "live":
+            desc += f" Uses {esc(account_name(play.subaccount))}."
         if ps["trades"]:
             mini = (f'<span><b>{ps["trades"]}</b> bet{"" if ps["trades"] == 1 else "s"}</span><span><b>{100 * ps["win_rate"]:.0f}%</b> won</span>'
                     f'<span><b>{money(ps["profit"])}</b></span>')
@@ -764,6 +784,8 @@ def overview_page(app: App) -> str:
         parts.append(f'<a class="play" href="{play_link(name)}"><div class="head"><span class="name">{esc(name)}</span>'
                      f'{status_pill(play)}</div><div class="desc">{desc}</div><div class="mini">{mini}</div></a>')
     parts.append('<a class="btn btn2" href="/settings#add">+ Add or change plays</a>')
+    if s.mode == "live":
+        parts.append(money_section(d))
     log = tail_log(os.path.join(d["folder"], "bot.log"), 15)
     if log:
         parts.append('<h2>Recent activity</h2><div class="box log">' + esc("\n".join(log)) + "</div>")
@@ -775,6 +797,36 @@ def overview_page(app: App) -> str:
                  'Open bets are kept.</p></div>'
                  '<p class="hint">Numbers update live while this page is open.</p>')
     return page("Kalshi bot", "".join(parts), "status", live="/api/live", sig=d["sig"])
+
+
+def money_section(d: dict) -> str:
+    """Real money: cash in each Kalshi subaccount, and a form to move money between them."""
+    s, st = d["s"], d["state"]
+    accounts = {int(k): v for k, v in (st.accounts if st else {}).items()}
+    for p in s.plays:
+        if p.enabled:
+            accounts.setdefault(p.subaccount, None)
+    rows = ""
+    for n in sorted(accounts):
+        names = ", ".join(p.name for p in s.plays if p.enabled and p.subaccount == n)
+        cash = accounts[n]
+        rows += (f'<div class="bet"><div><b>{esc(account_name(n).capitalize())}</b>'
+                 f'<div class="sub">{esc(names) or "no play uses it"}</div></div>'
+                 f'<div class="amt">{"$%.2f" % float(cash) if cash is not None else "—"}</div></div>')
+    numbers = sorted(accounts)
+    first_sub = next((n for n in numbers if n != 0), 0)
+    choices = "".join(f'<option value="{n}">{esc(account_name(n))}</option>' for n in numbers)
+    to_choices = "".join(f'<option value="{n}"{" selected" if n == first_sub else ""}>{esc(account_name(n))}</option>'
+                         for n in numbers)
+    notice = f'<p class="hint">Last money move: {esc(st.notice)}</p>' if st and st.notice else ""
+    return ('<h2 id="money">Kalshi money</h2><div class="box">' + rows + notice +
+            '<form method="post" action="/transfer">'
+            f'<div class="row2"><div><label>Move from</label><select name="from">{choices}</select></div>'
+            f'<div><label>To</label><select name="to">{to_choices}</select></div></div>'
+            '<label>Amount ($)</label><input name="amount" inputmode="decimal" placeholder="5">'
+            '<button class="btn2">Move money</button></form>'
+            '<p class="hint">Each play bets only with the money in its own subaccount. Moves stay inside your '
+            'Kalshi account. The Kalshi app shows only your main account.</p></div>')
 
 
 def overview_open_bets(d: dict) -> str:
@@ -878,6 +930,9 @@ def play_form(i: int, p: dict, opt, inp) -> str:
         f'<div class="row2"><div><label>Amount</label>{inp(pre + "size_value", size_value)}</div>'
         f'<div><label>Most contracts</label>{inp(pre + "size_max", size_max, "numeric")}</div></div>'
         '<p class="hint">Example: Dollars and 3 means it spends about $3 on each bet. Most contracts blank = no cap.</p>'
+        f'<label>Kalshi subaccount (real money only)</label>{inp(pre + "sub", plain(p.get("subaccount") or 0), "numeric")}'
+        '<p class="hint">0 = your main account. With real money, give each play that\'s on its own number '
+        '(1, 2, 3…), so their bets can\'t cancel each other. The bot makes them on Kalshi.</p>'
         '<details><summary>Extra conditions</summary>'
         f'<label>Extra cents it may pay above the price on screen</label>{inp(pre + "slip", plain(p.get("slippage_cents", 0)))}'
         f'<label>Skip if the gap between buy and sell price is wider than (¢)</label>{inp(pre + "spread", plain(c.get("max_spread_cents")))}'
@@ -955,6 +1010,30 @@ def settings_page(app: App, raw: dict | None = None, message: str | None = None,
     out.append('<div class="savebar"><button name="action" value="save">Save settings</button></div>'
                '<p class="hint">The bot restarts with the new settings in about 15 seconds. Open bets are kept.</p></form>')
     return page("Settings", "".join(out), "settings")
+
+
+def request_transfer(app: App, form: dict) -> str:
+    """Hand a money move to the bot (it holds the Kalshi key). Returns a message for the page."""
+    s, _ = app.settings()
+    if s is None or s.mode != "live":
+        return "Money moves are only for real-money mode."
+    try:
+        frm, to = int(field(form, "from")), int(field(form, "to"))
+        amount = float(field(form, "amount").replace("$", ""))
+    except ValueError:
+        return "Not moved: please pick both subaccounts and type an amount."
+    if frm == to or not (0 <= frm <= 63 and 0 <= to <= 63):
+        return "Not moved: pick two different subaccounts."
+    if not 0 < amount <= 100_000:
+        return "Not moved: type an amount above $0."
+    folder = mode_folder(s)
+    os.makedirs(folder, exist_ok=True)
+    tmp = os.path.join(folder, TRANSFER_FILE + ".tmp")
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump({"id": str(uuid.uuid4()), "from": frm, "to": to, "amount_cents": round(amount * 100)}, fh)
+    os.replace(tmp, os.path.join(folder, TRANSFER_FILE))
+    return (f"Asked the bot to move ${amount:.2f} from {account_name(frm)} to {account_name(to)}. "
+            "The result shows below in a few seconds.")
 
 
 def denied_page() -> str:
@@ -1062,6 +1141,9 @@ class Handler(BaseHTTPRequestHandler):
                     shown = None
                 return self._send(200, settings_page(self.app, raw=shown, error=str(e)))
             return self._redirect(f"/settings?done={done}" + (f"#play-{focus}" if focus is not None else ""))
+        if url.path == "/transfer":
+            self.app.moved = request_transfer(self.app, form)
+            return self._redirect("/#money")
         if url.path in ("/pause", "/resume"):
             self.app.set_paused(url.path == "/pause")
             return self._redirect("/")

@@ -512,16 +512,16 @@ class FlakyLiveBroker(PaperBroker):
         super().__init__(cash)
         self.fail_buy, self.fail_sell, self.buys = fail_buy, fail_sell, 0
 
-    def buy(self, *a):
+    def buy(self, *a, **kw):
         self.buys += 1
         if self.fail_buy:
             raise ConnectionError("reply lost")
-        return super().buy(*a)
+        return super().buy(*a, **kw)
 
-    def sell(self, *a):
+    def sell(self, *a, **kw):
         if self.fail_sell:
             raise ConnectionError("reply lost")
-        return super().sell(*a)
+        return super().sell(*a, **kw)
 
 
 class TestLostReplies(BotCase):
@@ -536,7 +536,8 @@ class TestLostReplies(BotCase):
         state = ledger.load_state(D(11))
         self.client = FakeClient()
         self.client.held = held
-        self.client.position = lambda ticker: self.client.held
+        self.client.position = lambda ticker, subaccount=0: self.client.held
+        self.client.positions = lambda subaccount=0: {}
         self.clock = Clock(T0)
         self.broker = FlakyLiveBroker(D(11), **kw)
         self.bot = Bot(s, self.client, self.broker, ledger, state, self.clock)

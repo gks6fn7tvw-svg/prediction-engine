@@ -151,33 +151,52 @@ folders, so the scores never mix. To restart paper testing from zero, delete
 
 ## Going live (real money)
 
-Only do this after `score` says "ahead by more than luck" over at least 200 trades.
+Only do this after a play's score says "ahead by more than luck" over at least
+200 bets, including weekdays.
+
+**Why subaccounts:** on Kalshi, each account holds one side per market. If one
+play holds Up and another buys Down in the same 15 minutes, Kalshi cancels them
+against each other. So with real money every play that's on gets its own Kalshi
+**subaccount** (its own money and bets). Subaccount 0 is your main account.
+Subaccounts are made through the API only; the Kalshi app shows only the main
+account, and the bot's website shows them all. Making them needs Kalshi's
+Advanced API level, which Kalshi grants for free once one of your last 100 orders
+came from the API; the bot asks for it by itself.
+
+**Step 1: one play, main account, tiny bets** (this also qualifies you for subaccounts)
 
 1. **Make a Kalshi API key:** on kalshi.com, open your profile settings
-   (kalshi.com/account/profile), find **API Keys**, and click **Create New
-   API Key**. Write down the **Key ID**. The private key file downloads only
-   once, so keep it safe and never share it.
-2. **Put the key file on the server:** in the SSH window, use the
-   **Upload file** button at the top and upload the key file. Then rename it
-   and lock it, using your file's real name:
-   ```
-   mv ~/YOUR-KEY-FILE-NAME ~/kalshi_key.pem && chmod 600 ~/kalshi_key.pem
-   ```
-3. **Tell the bot about the key**, using your real Key ID:
-   ```
-   echo "KALSHI_API_KEY_ID=YOUR-KEY-ID" >> ~/.btcbot.env
-   echo "KALSHI_PRIVATE_KEY_PATH=$HOME/kalshi_key.pem" >> ~/.btcbot.env
-   ```
-4. **Switch the settings:** in `btcbot/settings.yaml`, set `mode: live`
-   and `live_confirm: "I accept real-money risk"`.
-5. **Test the key without trading:**
-   ```
-   set -a; . ~/.btcbot.env; set +a; .venv/bin/python -m btcbot check
-   ```
-   It should print your Kalshi balance.
-6. **Restart:** `sudo systemctl restart btcbot`. The log will say LIVE MODE.
+   (kalshi.com/account/profile), find **API Keys**, and click **Create New API
+   Key**. Write down the **Key ID**. The private key file downloads only once;
+   keep it safe and never share it.
+2. On the website, turn every play off except **main**, set main to
+   **1 contract**, its Kalshi subaccount to **0**, and the daily loss limit to **$5**.
+3. In Google Cloud, open the server, tap **Edit**, and under **Metadata** add:
+   - `kalshi-key-id` = your Key ID
+   - `kalshi-private-key` = the whole text of the key file (open it in a text
+     app and copy everything, including the BEGIN and END lines)
+   - `btcbot-mode` = `live`
 
-To go back to pretend money, set `mode: paper` and restart.
+   Save, then **Reset**. The serial log says "Kalshi key loaded" and "switched
+   to REAL MONEY"; the website shows **REAL MONEY**.
+4. Let it place a bet. Compare it with the Kalshi app's history.
+
+**Step 2: subaccounts for every play**
+
+1. On the website, give each play you want on its own subaccount number
+   (main 1, cheap 2, ...). Leave 0 for your own bets in the Kalshi app.
+2. Save. The bot restarts, upgrades the API level, and makes the subaccounts.
+3. On the Overview, under **Kalshi money**, move a little money from your main
+   account into each play's subaccount. Moves stay inside your Kalshi account.
+4. Turn the plays on one at a time.
+
+**Safety check:** with real money, every 10 seconds the bot compares its open
+bets with what Kalshi shows in each subaccount (markets still open only). If they
+disagree twice in a row, it pauses new bets and shows a red box saying where.
+Check the Kalshi app, then tap **Resume**. Don't place bets by hand in a
+subaccount a play uses.
+
+To go back to pretend money, set the metadata `btcbot-mode` to `paper` and Reset.
 
 ## For reviewers (ChatGPT)
 
@@ -196,6 +215,21 @@ To go back to pretend money, set `mode: paper` and restart.
 - The settlement result comes from `GET /markets/{ticker}` (`result` yes/no).
   "Up" is treated as YES. Please confirm on kalshi.com that KXBTC15M's YES
   side means "Up".
-- Tests: `python -m unittest tests.test_btcbot`. They run offline with fake
-  markets. A 200-market simulation also checked that paper cash equals the
+- Subaccounts (checked 2026-11-22): orders send `subaccount` (omitted for 0);
+  `GET /portfolio/positions` and `GET /portfolio/balance` take `subaccount`;
+  cash per subaccount comes from `GET /portfolio/subaccounts/balances` (one
+  call, since `/portfolio/balance` is limited to 1 call a second on Basic and
+  Advanced); `POST /portfolio/subaccounts` makes the next number;
+  `POST /portfolio/subaccounts/transfer` moves cash (`client_transfer_id`,
+  `from_subaccount`, `to_subaccount`, `amount_cents`); `POST
+  /account/api_usage_level/upgrade` grants Advanced when one of the last 100
+  orders came from the API. Netting settings are left as Kalshi has them.
+  **Please check:** the Create Subaccount reply field name (code accepts
+  `subaccount_number` or `subaccount`), and that netting doesn't merge
+  positions across subaccounts.
+- Live settings refuse two enabled plays on one subaccount. The records check
+  (`Bot.check_records`) compares net positions per subaccount for open markets
+  every 10 s and pauses after two disagreements in a row.
+- Tests: `python -m unittest discover -s tests`. They run offline with fake
+  markets and a pretend Kalshi exchange that keeps subaccounts apart. A 200-market simulation also checked that paper cash equals the
   starting balance plus every trade's profit.

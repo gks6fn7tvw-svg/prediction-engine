@@ -1,6 +1,7 @@
 """The main loop: watch prices, buy when a play's rules say so, sell or settle."""
 from __future__ import annotations
 
+import json
 import logging
 import os
 import time
@@ -15,7 +16,15 @@ from .kalshi import KalshiClient, KalshiError, coinbase_spot
 from .ledger import Ledger, Position, State
 from .settings import Settings
 
+
+def account_name(n: int) -> str:
+    return "your main account" if int(n) == 0 else f"subaccount {n}"
+
 PAPER_RESET_FILE = "PAPER_RESET"   # the website writes the new pretend balance here
+TRANSFER_FILE = "TRANSFER_REQUEST"  # the website asks to move money between subaccounts
+CHECK_SECONDS = 10                  # real money: compare our records with Kalshi this often
+ACCOUNTS_SECONDS = 30               # real money: refresh subaccount cash for the website
+MISMATCH_CHECKS = 2                 # pause only if records and Kalshi disagree this many times in a row
 
 
 def plain(n) -> str:
@@ -64,6 +73,62 @@ class Bot:
         self.last_settle_check: dict[str, datetime] = {}
         self.fail_streak = 0
         self.stop_file = os.path.join(ledger.folder, "STOP")  # same folder as the trade log
+        self.ready_accounts = {0}
+        self.mismatch_streak = 0
+        self.last_check = None
+        self.last_accounts = None
+
+    # ---- real money: subaccounts ------------------------------------------
+    def prepare_live(self) -> None:
+        """Make sure every play's Kalshi subaccount exists, making any that are missing.
+
+        Making subaccounts needs Kalshi's Advanced API level, which Kalshi grants for
+        free once one of your last 100 orders came from the API (the bot's first bet).
+        """
+        needed = sorted({p.subaccount for p in self.s.plays if p.enabled})
+        self.broker.accounts = sorted(set(needed) | {0})
+        self.ready_accounts = {0}
+        if needed == [0]:
+            return
+        try:
+            have = set(self.client.subaccount_balances()) | {0}
+        except Exception as e:
+            log.error("could not list your Kalshi subaccounts (%s)", e)
+            have = {0}
+        missing = [n for n in needed if n not in have]
+        if missing:
+            try:
+                level = self.client.api_level()
+            except Exception as e:
+                log.warning("could not read your Kalshi API level (%s)", e)
+                level = ""
+            if level in ("", "basic"):
+                try:
+                    self.client.upgrade_api_level()
+                    log.info("Kalshi API level upgraded to Advanced (needed for subaccounts)")
+                except KalshiError as e:
+                    log.error("Kalshi would not upgrade the API level (%s). It needs one bet placed by the "
+                              "bot first: run a single play on subaccount 0 for one bet, then try again.", e)
+            tries = 0
+            while missing and max(missing) not in have and tries < 63:
+                tries += 1
+                try:
+                    n = self.client.create_subaccount()
+                except Exception as e:
+                    log.error("could not make a Kalshi subaccount (%s)", e)
+                    break
+                have.add(n)
+                log.info("made Kalshi subaccount %s", n)
+        self.ready_accounts = {n for n in needed if n in have} | {0}
+        not_ready = [n for n in needed if n not in have]
+        if not_ready:
+            log.error("Kalshi subaccount(s) %s are not set up, so plays using them won't bet",
+                      ", ".join(map(str, not_ready)))
+        log.info("plays use Kalshi subaccounts: %s", ", ".join(
+            f"{p.name}={p.subaccount}" for p in self.s.plays if p.enabled))
+
+    def _account(self, play) -> int:
+        return play.subaccount if self.broker.live else 0
 
     # ---- setup ------------------------------------------------------------
     def load_fees(self) -> None:
@@ -82,6 +147,10 @@ class Bot:
         now = self.clock.now()
         self._roll_day(now)
         self._apply_paper_reset()
+        if self.broker.live:
+            self._clear_alert_if_resumed()
+            self._apply_transfer_request()
+            self._refresh_accounts(now)
         quotes = self._fetch_quotes(now)
         self._share_prices(quotes, now)
         for pos in list(self.state.open_positions()):
@@ -98,6 +167,7 @@ class Bot:
         else:
             self._say("block", reason)
         self._settle(now)
+        self.check_records(quotes, now)
         self._prune(quotes)
         self.ledger.save_state(self.state)
         return self._next_wait(quotes, now)
@@ -190,6 +260,99 @@ class Bot:
         self.state.day_trades = 0
         log.info("new day %s: starting balance $%.2f", day, bal + open_cost)
 
+    # ---- real money: safety check, money moves, balances --------------------
+    def check_records(self, quotes: dict, now: datetime) -> None:
+        """Compare our open bets with what Kalshi holds, per subaccount, in markets still open.
+
+        If they disagree twice in a row, pause new bets (STOP file) and say why.
+        Closed markets are skipped: Kalshi may take a moment to settle them.
+        """
+        if not self.broker.live or (self.last_check and (now - self.last_check).total_seconds() < CHECK_SECONDS):
+            return
+        self.last_check = now
+        problems = []
+        for acct in getattr(self.broker, "accounts", [0]):
+            try:
+                held = self.client.positions(acct)
+            except Exception as e:
+                log.warning("could not read Kalshi positions for subaccount %s (%s)", acct, e)
+                return
+            expected: dict = {}
+            for p in self.state.open_positions():
+                if p.subaccount == acct:
+                    n = p.d("contracts") if p.side == "yes" else -p.d("contracts")
+                    expected[p.ticker] = expected.get(p.ticker, Decimal("0")) + n
+            for ticker in set(held) | set(expected):
+                if ticker not in quotes:
+                    continue
+                k, e = held.get(ticker, Decimal("0")), expected.get(ticker, Decimal("0"))
+                if k != e:
+                    problems.append(f"{ticker} in subaccount {acct}: Kalshi shows {rules.position_words(k)}, "
+                                    f"the bot's records show {rules.position_words(e)}")
+        if not problems:
+            self.mismatch_streak = 0
+            return
+        self.mismatch_streak += 1
+        log.warning("records and Kalshi disagree (check %d of %d): %s", self.mismatch_streak,
+                    MISMATCH_CHECKS, "; ".join(problems))
+        if self.mismatch_streak >= MISMATCH_CHECKS and not self.state.alert:
+            text = ("Paused: the bot's records don't match your Kalshi account. " + "; ".join(problems)
+                    + ". Check the Kalshi app, then tap Resume.")
+            with open(self.stop_file, "w", encoding="utf-8") as fh:
+                fh.write(text + "\n")
+            self.state.alert = text
+            self.ledger.save_state(self.state)
+            log.error(text)
+
+    def _clear_alert_if_resumed(self) -> None:
+        if self.state.alert and not os.path.exists(self.stop_file):
+            log.info("resumed after a records check; watching again")
+            self.state.alert = ""
+            self.mismatch_streak = 0
+
+    def _apply_transfer_request(self) -> None:
+        path = os.path.join(self.ledger.folder, TRANSFER_FILE)
+        if not os.path.exists(path):
+            return
+        try:
+            with open(path, encoding="utf-8") as fh:
+                req = json.load(fh)
+            os.remove(path)
+            frm, to, cents = int(req["from"]), int(req["to"]), int(req["amount_cents"])
+        except (OSError, ValueError, KeyError, TypeError) as e:
+            self.state.notice = f"Money move ignored: the request was unreadable ({e})"
+            log.warning(self.state.notice)
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+            return
+        try:
+            self.client.transfer(frm, to, cents, req.get("id"))
+            self.state.notice = f"Moved ${cents / 100:.2f} from {account_name(frm)} to {account_name(to)}."
+            log.info(self.state.notice)
+            self.last_accounts = None   # show the new amounts soon
+            if hasattr(self.broker, "_cache"):
+                self.broker._cache = (0.0, {})
+        except Exception as e:
+            self.state.notice = f"Money move failed: {e}"
+            log.error(self.state.notice)
+        self.ledger.save_state(self.state)
+
+    def _refresh_accounts(self, now: datetime) -> None:
+        if self.last_accounts and (now - self.last_accounts).total_seconds() < ACCOUNTS_SECONDS:
+            return
+        self.last_accounts = now
+        try:
+            if getattr(self.broker, "accounts", [0]) == [0]:
+                cash = {0: self.client.balance_dollars()}
+            else:
+                cash = self.client.subaccount_balances()
+        except Exception as e:
+            log.warning("could not read Kalshi balances (%s)", e)
+            return
+        self.state.accounts = {str(k): str(v) for k, v in sorted(cash.items())}
+
     def _apply_paper_reset(self) -> None:
         """Paper mode only: set the pretend money to the amount the website asked for.
 
@@ -222,6 +385,8 @@ class Bot:
         log.info("pretend money reset to $%.2f; past bets are kept", amount)
 
     def _entry_block_reason(self) -> str | None:
+        if self.state.alert:
+            return "paused by the records check; see the website"
         if os.path.exists(self.stop_file):
             return f"STOP file found, so no new trades (delete {self.stop_file} to resume)"
         limit = rules.daily_loss_limit(self.s, Decimal(self.state.day_start_balance))
@@ -240,12 +405,17 @@ class Bot:
             if chk.reason != "outside time window":
                 self._say(key, f"{play.name}: skip {q.ticker}: {chk.reason}")
             return
+        acct = self._account(play)
+        if self.broker.live and acct not in self.ready_accounts:
+            self._say(key, f"{play.name}: skip {q.ticker}: its Kalshi subaccount {acct} isn't set up")
+            return
         try:
-            balance = self.broker.balance()
+            balance = self.broker.balance(acct)
         except Exception as e:
             log.warning("could not read balance (%s); not trading this second", e)
             return
-        open_cost = sum((p.cost for p in self.state.open_positions()), Decimal("0"))
+        open_cost = sum((p.cost for p in self.state.open_positions()
+                         if not self.broker.live or p.subaccount == acct), Decimal("0"))
         n = rules.size_contracts(self.s, balance, chk.limit, open_cost, play)
         if n <= 0:
             self._say(key, f"{play.name}: skip {q.ticker}: trade size works out to 0 contracts "
@@ -254,7 +424,7 @@ class Bot:
         self.state.attempts[key] = self.state.attempts.get(key, 0) + 1
         mult = self.multipliers.get(q.series, Decimal("1"))
         try:
-            fill = self.broker.buy(q, chk.side, n, chk.limit, mult)
+            fill = self.broker.buy(q, chk.side, n, chk.limit, mult, account=acct)
         except KalshiError as e:
             log.error("%s: buy order rejected: %s", play.name, e)
             return
@@ -263,7 +433,7 @@ class Bot:
                 raise
             # The order may or may not have reached Kalshi. Never resend it; ask Kalshi what we hold.
             log.error("%s: lost contact while buying in %s (%s); not retrying this market", play.name, q.ticker, e)
-            fill = self._recover_buy(q, chk.side, chk.limit, mult)
+            fill = self._recover_buy(q, chk.side, chk.limit, mult, acct)
             if fill is None:
                 self.state.entered.append(key)
                 self.ledger.save_state(self.state)
@@ -272,7 +442,7 @@ class Bot:
             self._say(key, f"{play.name}: {q.ticker}: price moved before the order filled; will retry")
             return
         pos = Position(play.name, q.ticker, q.series, chk.side, plain(fill.contracts), str(fill.price),
-                       str(fill.fee), now.isoformat(), q.close_time.isoformat() if q.close_time else "")
+                       str(fill.fee), now.isoformat(), q.close_time.isoformat() if q.close_time else "", acct)
         positions = self.state.open_positions() + [pos]
         self.state.set_positions(positions)
         self.state.entered.append(key)
@@ -284,8 +454,8 @@ class Bot:
                  rules.side_name(chk.side), fill.contracts, fill.price, fill.fee, q.minutes_left(now))
         if self.broker.live:
             try:
-                log.info("Kalshi now shows position %s in %s (+ = Up, - = Down)",
-                         self.client.position(q.ticker), q.ticker)
+                log.info("Kalshi now shows position %s in %s, subaccount %s (+ = Up, - = Down)",
+                         self.client.position(q.ticker, subaccount=acct), q.ticker, acct)
             except Exception as e:
                 log.warning("could not double-check the position (%s)", e)
         self.ledger.save_state(self.state)
@@ -300,7 +470,7 @@ class Bot:
         kind, bid = signal
         mult = self.multipliers.get(pos.series, Decimal("1"))
         try:
-            fill = self.broker.sell(q, pos.side, pos.d("contracts"), bid, mult)
+            fill = self.broker.sell(q, pos.side, pos.d("contracts"), bid, mult, account=pos.subaccount)
         except KalshiError as e:
             log.error("%s: sell order rejected: %s", pos.play, e)
             return
@@ -314,23 +484,23 @@ class Bot:
         self._close(pos, fill.contracts, kind, fill, None)
 
     # ---- live only: work out what happened when a reply got lost ------------
-    def _held_on_kalshi(self, ticker: str, side: str) -> Decimal | None:
+    def _held_on_kalshi(self, ticker: str, side: str, account: int = 0) -> Decimal | None:
         try:
-            pos = self.client.position(ticker)  # + = Up contracts, - = Down contracts
+            pos = self.client.position(ticker, subaccount=account)  # + = Up contracts, - = Down contracts
         except Exception as e:
             log.error("could not check Kalshi for %s (%s); check the Kalshi app", ticker, e)
             return None
         return max(pos, Decimal("0")) if side == "yes" else max(-pos, Decimal("0"))
 
-    def _recorded(self, ticker: str, side: str) -> Decimal:
+    def _recorded(self, ticker: str, side: str, account: int = 0) -> Decimal:
         return sum((p.d("contracts") for p in self.state.open_positions()
-                    if p.ticker == ticker and p.side == side), Decimal("0"))
+                    if p.ticker == ticker and p.side == side and p.subaccount == account), Decimal("0"))
 
-    def _recover_buy(self, q, side: str, limit: Decimal, mult: Decimal) -> Fill | None:
-        held = self._held_on_kalshi(q.ticker, side)
+    def _recover_buy(self, q, side: str, limit: Decimal, mult: Decimal, account: int = 0) -> Fill | None:
+        held = self._held_on_kalshi(q.ticker, side, account)
         if held is None:
             return None
-        new = held - self._recorded(q.ticker, side)
+        new = held - self._recorded(q.ticker, side, account)
         if new <= 0:
             log.info("Kalshi shows the order did not fill")
             return None
@@ -338,10 +508,10 @@ class Bot:
         return Fill(new, limit, rules.taker_fee(new, limit, mult))
 
     def _recover_sell(self, pos: Position, price: Decimal, mult: Decimal) -> Fill | None:
-        held = self._held_on_kalshi(pos.ticker, pos.side)
+        held = self._held_on_kalshi(pos.ticker, pos.side, pos.subaccount)
         if held is None:
             return None
-        sold = min(self._recorded(pos.ticker, pos.side) - held, pos.d("contracts"))
+        sold = min(self._recorded(pos.ticker, pos.side, pos.subaccount) - held, pos.d("contracts"))
         if sold <= 0:
             log.info("Kalshi shows the sale did not happen; will try again")
             return None

@@ -66,6 +66,44 @@ fi
 rm -f /tmp/btcbot-settings.yaml
 
 touch /etc/btcbot.env && chmod 600 /etc/btcbot.env   # Kalshi key details go here for live mode
+
+# Real money, with no SSH: add these to the server's metadata (Edit > Metadata), then Reset.
+#   kalshi-key-id       your Kalshi API Key ID
+#   kalshi-private-key  the whole text of the private key file Kalshi gave you
+#   btcbot-mode         live (real money) or paper (pretend money)
+# The key file is saved where only the bot can read it.
+KEY_ID=$(curl -fs -H "Metadata-Flavor: Google" "$META/kalshi-key-id" || true)
+if [ -n "$KEY_ID" ]; then
+  if curl -fs -H "Metadata-Flavor: Google" "$META/kalshi-private-key" -o /tmp/kalshi_key.pem \
+      && grep -q "PRIVATE KEY" /tmp/kalshi_key.pem; then
+    install -o "$RUN_AS" -g "$RUN_AS" -m 600 /tmp/kalshi_key.pem /var/lib/btcbot/kalshi_key.pem
+    printf 'KALSHI_API_KEY_ID=%s\nKALSHI_PRIVATE_KEY_PATH=/var/lib/btcbot/kalshi_key.pem\n' "$KEY_ID" \
+      > /etc/btcbot.env
+    say "Kalshi key loaded from the server's metadata"
+  else
+    say "kalshi-key-id is set, but kalshi-private-key is missing or isn't a key file's text; not using it"
+  fi
+  rm -f /tmp/kalshi_key.pem
+fi
+MODE=$(curl -fs -H "Metadata-Flavor: Google" "$META/btcbot-mode" || true)
+if [ "$MODE" = live ] || [ "$MODE" = paper ]; then
+  (cd "$REPO" && as_bot "$REPO/.venv/bin/python" - "$SETTINGS" "$MODE" <<'PY'
+import sys
+from btcbot.settings import LIVE_CONFIRM_TEXT, SettingsError, load_raw, save_raw
+path, mode = sys.argv[1], sys.argv[2]
+raw = load_raw(path)
+if raw.get("mode") != mode:
+    raw["mode"] = mode
+    if mode == "live":
+        raw["live_confirm"] = LIVE_CONFIRM_TEXT
+    try:
+        save_raw(path, raw)
+        print(f"BTCBOT SETUP: switched to {'REAL MONEY' if mode == 'live' else 'pretend money'}")
+    except SettingsError as e:
+        print(f"BTCBOT SETUP: did NOT switch to {mode}: {e}")
+PY
+  )
+fi
 cat > /etc/systemd/system/btcbot.service <<EOF
 [Unit]
 Description=Kalshi 15-minute bot

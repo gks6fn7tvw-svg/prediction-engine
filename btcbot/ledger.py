@@ -25,6 +25,7 @@ class Position:
     entry_fee: str
     opened_at: str
     close_time: str
+    subaccount: int = 0     # Kalshi subaccount holding it (real money only)
 
     def d(self, name: str) -> Decimal:
         return Decimal(getattr(self, name))
@@ -44,6 +45,9 @@ class State:
     day_start_balance: str = "0"
     day_profit: str = "0"
     day_trades: int = 0
+    alert: str = ""                               # why the bot paused itself (shown in red)
+    notice: str = ""                              # last money-move result
+    accounts: dict = field(default_factory=dict)  # real money: subaccount -> cash, for the website
 
     def open_positions(self) -> list[Position]:
         return [Position(**p) for p in self.positions]

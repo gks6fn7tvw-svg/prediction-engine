@@ -72,6 +72,7 @@ class Play:
     stop_loss: Decimal | None
     conditions: Conditions
     size: Size | None = None      # None = use the default size
+    subaccount: int = 0           # Kalshi subaccount for real money (0 = main account)
 
     @property
     def has_exits(self) -> bool:
@@ -140,9 +141,12 @@ def _play(raw: dict, i: int) -> Play:
         btc_distance_min_dollars=_dec(c.get("btc_distance_min_dollars"), f"{p}.btc_distance_min_dollars", 0, None, True),
     )
     size = raw.get("size")
+    sub = _dec(raw.get("subaccount", 0) or 0, f"{p}.subaccount", 0, 63)
+    if sub != sub.to_integral_value():
+        raise SettingsError(f"{p}.subaccount must be a whole number from 0 to 63")
     return Play(name, bool(raw.get("enabled", True)), buy, lo, hi, start, end,
                 _dec(raw.get("slippage_cents", 0), f"{p}.slippage_cents", 0, 20), tp, sl, conditions,
-                _size(size, f"{p}.size", 0) if isinstance(size, dict) and size else None)
+                _size(size, f"{p}.size", 0) if isinstance(size, dict) and size else None, int(sub))
 
 
 def parse(raw: dict) -> Settings:
@@ -168,6 +172,17 @@ def parse(raw: dict) -> Settings:
         raise SettingsError("each play needs its own name")
     if not any(p.enabled for p in plays):
         raise SettingsError("turn on at least one play (enabled: true)")
+    if mode == "live":
+        # Kalshi keeps one side per market in each subaccount: two plays sharing one
+        # would cancel each other's opposite bets and leave the records wrong.
+        used: dict[int, str] = {}
+        for p in plays:
+            if p.enabled and p.subaccount in used:
+                raise SettingsError(
+                    f"with real money, every play that's on needs its own Kalshi subaccount: "
+                    f"'{p.name}' and '{used[p.subaccount]}' both use subaccount {p.subaccount}")
+            if p.enabled:
+                used[p.subaccount] = p.name
     polling = raw.get("polling") or {}
     files = raw.get("files") or {}
     s = Settings(

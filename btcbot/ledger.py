@@ -81,12 +81,34 @@ class Ledger:
             w.writerow({k: row.get(k, "") for k in TRADE_COLUMNS})
 
 
+def read_trades(trades_path: str, mode: str | None = None) -> list[dict]:
+    if not os.path.exists(trades_path):
+        return []
+    with open(trades_path, newline="", encoding="utf-8") as fh:
+        return [r for r in csv.DictReader(fh) if mode is None or r["mode"] == mode]
+
+
+def stats(rows: list[dict]) -> dict:
+    """Numbers for a group of finished trades (see score() for the words)."""
+    n = len(rows)
+    wins = sum(1 for r in rows if Decimal(r["profit"]) > 0)
+    profit = sum((Decimal(r["profit"]) for r in rows), Decimal("0"))
+    fees = sum((Decimal(r["entry_fee"] or "0") + Decimal(r["exit_fee"] or "0") for r in rows), Decimal("0"))
+    contracts = sum((Decimal(r["contracts"]) for r in rows), Decimal("0"))
+    cost = sum((Decimal(r["contracts"]) * Decimal(r["entry_price"]) for r in rows), Decimal("0"))
+    rate = wins / n if n else 0.0
+    need = float((cost + fees) / contracts) if contracts else 0.0
+    luck = luck_margin(rate, n) if n else 0.0
+    return {
+        "trades": n, "wins": wins, "losses": n - wins, "win_rate": rate, "profit": profit,
+        "fees": fees, "avg_price": (cost / contracts) if contracts else Decimal("0"),
+        "need": need, "luck": luck, "verdict": verdict(rate, need, luck, n) if n else "No finished trades yet.",
+    }
+
+
 def score(trades_path: str, mode: str | None = None) -> str:
     """Plain-language report card for finished trades."""
-    if not os.path.exists(trades_path):
-        return "No finished trades yet."
-    with open(trades_path, newline="", encoding="utf-8") as fh:
-        rows = [r for r in csv.DictReader(fh) if mode is None or r["mode"] == mode]
+    rows = read_trades(trades_path, mode)
     if not rows:
         return "No finished trades yet."
     lines = []
@@ -94,24 +116,16 @@ def score(trades_path: str, mode: str | None = None) -> str:
     for r in rows:
         groups.setdefault(r["play"], []).append(r)
     for name, rs in groups.items():
-        n = len(rs)
-        wins = sum(1 for r in rs if Decimal(r["profit"]) > 0)
-        profit = sum((Decimal(r["profit"]) for r in rs), Decimal("0"))
-        fees = sum((Decimal(r["entry_fee"] or "0") + Decimal(r["exit_fee"] or "0") for r in rs), Decimal("0"))
-        contracts = sum((Decimal(r["contracts"]) for r in rs), Decimal("0"))
-        cost = sum((Decimal(r["contracts"]) * Decimal(r["entry_price"]) for r in rs), Decimal("0"))
-        avg_price = cost / contracts if contracts else Decimal("0")
-        need = (cost + fees) / contracts if contracts else Decimal("0")
-        rate = wins / n
-        luck = luck_margin(rate, n)
+        st = stats(rs)
+        n = st["trades"]
         lines += [
             f"== {name} ==",
-            f"Trades: {n}   Wins: {wins}   Losses: {n - wins}   Win rate: {100 * rate:.1f}%",
-            f"Average price paid: {avg_price * 100:.1f}c   Fees paid: ${fees:.2f}",
-            f"To break even you need to win about {need * 100:.1f}% of contracts (price + fees).",
-            f"Total profit after fees: ${profit:+.2f}",
-            f"Luck can move a win rate this much with {n} trades: about +/-{100 * luck:.1f} points.",
-            verdict(rate, float(need), luck, n),
+            f"Trades: {n}   Wins: {st['wins']}   Losses: {st['losses']}   Win rate: {100 * st['win_rate']:.1f}%",
+            f"Average price paid: {st['avg_price'] * 100:.1f}c   Fees paid: ${st['fees']:.2f}",
+            f"To break even you need to win about {st['need'] * 100:.1f}% of contracts (price + fees).",
+            f"Total profit after fees: ${st['profit']:+.2f}",
+            f"Luck can move a win rate this much with {n} trades: about +/-{100 * st['luck']:.1f} points.",
+            st["verdict"],
         ]
         lines.append("")
     return "\n".join(lines)

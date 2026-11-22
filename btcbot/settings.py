@@ -1,12 +1,15 @@
 """Read and check settings.yaml. Every setting has a safe default."""
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass, field
 from decimal import Decimal
 
 import yaml
 
 LIVE_CONFIRM_TEXT = "I accept real-money risk"
+PACKAGE_DIR = os.path.dirname(os.path.abspath(__file__))
+DEFAULT_PATH = os.path.join(PACKAGE_DIR, "settings.yaml")
 
 
 class SettingsError(Exception):
@@ -178,3 +181,29 @@ def load(path: str) -> Settings:
     except yaml.YAMLError as e:
         raise SettingsError(f"settings file has a typo: {e}")
     return parse(raw)
+
+
+def mode_folder(settings: Settings) -> str:
+    """Where this mode keeps its trade log, memory and log file (paper and live never mix)."""
+    folder = settings.folder
+    if not os.path.isabs(folder):
+        folder = os.path.join(PACKAGE_DIR, folder)
+    return os.path.join(folder, settings.mode)
+
+
+def load_raw(path: str) -> dict:
+    """The settings file as plain data, without checking it."""
+    with open(path, "r", encoding="utf-8") as fh:
+        raw = yaml.safe_load(fh)
+    return raw if isinstance(raw, dict) else {}
+
+
+def save_raw(path: str, raw: dict) -> Settings:
+    """Check new settings, then write them in one step. Raises SettingsError if they are bad."""
+    checked = parse(raw)
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        fh.write("# Saved by the bot's website. Prices are in dollars (0.70 = 70 cents).\n")
+        yaml.safe_dump(raw, fh, sort_keys=False, default_flow_style=False)
+    os.replace(tmp, path)
+    return checked

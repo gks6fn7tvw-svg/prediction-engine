@@ -95,7 +95,31 @@ code.
 Google's free trial runs 90 days. When Google asks, upgrade to a full account
 to keep the server. It stays free as long as you use only this one small server.
 
-## Everyday use
+## The bot's website (phone friendly)
+
+The bot comes with a small private website. It shows whether the bot is
+running, the balance, today's result, the score and verdict, open and recent
+trades, and recent activity. The Settings page changes every setting, and there
+is a Pause button. Saved settings are checked first; the bot then restarts with
+them in about 15 seconds and keeps its open trades.
+
+On the Google Cloud server (startup-script setup):
+
+1. On the server's page tap **Edit**, tick **Allow HTTP traffic**, and **Save**.
+2. Tap **Reset**. After about 5 minutes open **Logs > Serial port 1** and
+   search for `BTCBOT WEBSITE`. That line is your private link.
+3. Open it on your phone and add it to the home screen. The link logs the phone
+   in for a year, so the home-screen icon keeps working.
+
+Keep the link private: anyone with it can change settings. The site is plain
+http, so for safety it can't switch the bot to real money, and it never sees
+Kalshi keys. The link changes only if the server is stopped and started (its
+address changes); a Reset keeps it. Each boot prints it again.
+
+Elsewhere: `python -m btcbot web --port 8080` runs it on any computer; the key
+is made in `btcbot/data/web.key` (or the file named by `BTCBOT_WEB_KEY_FILE`).
+
+## Everyday use (SSH)
 
 Open the SSH window, then run `cd prediction-engine` first.
 

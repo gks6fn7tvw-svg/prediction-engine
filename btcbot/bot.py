@@ -103,10 +103,11 @@ class Bot:
                             if "|" not in k or k.split("|", 1)[-1] in live}
         self.last_settle_check = {k: v for k, v in self.last_settle_check.items() if k in live}
 
-    def run_forever(self) -> None:
+    def run_forever(self, should_stop=None) -> None:
+        """Run until should_stop() says so (used to restart when the settings change)."""
         self.load_fees()
         log.info("bot started in %s mode, watching %s", self.s.mode.upper(), ", ".join(self.s.markets))
-        while True:
+        while not (should_stop and should_stop()):
             try:
                 wait = self.step()
             except Exception:

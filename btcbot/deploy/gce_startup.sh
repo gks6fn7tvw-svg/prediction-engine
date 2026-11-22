@@ -7,13 +7,16 @@
 #   (curl -fsSL https://raw.githubusercontent.com/gks6fn7tvw-svg/prediction-engine/btcbot/btcbot/deploy/gce_startup.sh || curl -fsSL https://raw.githubusercontent.com/gks6fn7tvw-svg/prediction-engine/main/btcbot/deploy/gce_startup.sh) | bash
 #
 # Progress and the bot's log show up in the server page under
-# Logs > Serial port 1 (console).
+# Logs > Serial port 1 (console). So does the private website link
+# (search for "BTCBOT WEBSITE"); tick "Allow HTTP traffic" on the server once.
 set -uo pipefail
 
 URL="https://github.com/gks6fn7tvw-svg/prediction-engine.git"
 REPO=/opt/prediction-engine
 RUN_AS=btcbot
 META="http://metadata.google.internal/computeMetadata/v1/instance/attributes"
+IP_URL="http://metadata.google.internal/computeMetadata/v1/instance/network-interfaces/0/access-configs/0/external-ip"
+KEY_FILE=/var/lib/btcbot/web.key
 say() { echo "BTCBOT SETUP: $*"; }
 as_bot() { runuser -u "$RUN_AS" -- "$@"; }
 
@@ -49,7 +52,8 @@ as_bot "$REPO/.venv/bin/pip" install -q -r "$REPO/btcbot/requirements.txt" \
   || { say "FAILED to install python packages"; exit 1; }
 
 # Optional: settings pasted into the server's metadata as key "btcbot-settings"
-# replace settings.yaml on every boot, so settings can change without SSH.
+# replace settings.yaml on every boot. Leave it unset when using the website,
+# or website changes are replaced at the next boot.
 SETTINGS="$REPO/btcbot/settings.yaml"
 if curl -fs -H "Metadata-Flavor: Google" "$META/btcbot-settings" -o /tmp/btcbot-settings.yaml \
     && [ -s /tmp/btcbot-settings.yaml ]; then
@@ -82,13 +86,46 @@ StandardError=journal+console
 [Install]
 WantedBy=multi-user.target
 EOF
+# The private website (status + settings). Its key is made once and kept.
+if [ ! -s "$KEY_FILE" ]; then
+  as_bot "$REPO/.venv/bin/python" -c "import secrets;print(secrets.token_urlsafe(18))" > "$KEY_FILE.new" \
+    && install -o "$RUN_AS" -g "$RUN_AS" -m 600 "$KEY_FILE.new" "$KEY_FILE"
+  rm -f "$KEY_FILE.new"
+fi
+cat > /etc/systemd/system/btcbot-web.service <<EOF
+[Unit]
+Description=Kalshi bot website
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=$RUN_AS
+WorkingDirectory=$REPO
+Environment=BTCBOT_WEB_KEY_FILE=$KEY_FILE
+ExecStart=$REPO/.venv/bin/python -m btcbot web --port 80
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
 systemctl daemon-reload
-systemctl enable btcbot >/dev/null 2>&1
-systemctl restart btcbot
+systemctl enable btcbot btcbot-web >/dev/null 2>&1
+systemctl restart btcbot btcbot-web
 
 say "checking the connection to Kalshi (no orders)"
 (cd "$REPO" && as_bot "$REPO/.venv/bin/python" -m btcbot check 2>&1) | sed 's/^/BTCBOT CHECK: /'
 sleep 3
+IP=$(curl -fs -H "Metadata-Flavor: Google" "$IP_URL")
+if systemctl is-active --quiet btcbot-web && [ -n "$IP" ]; then
+  echo "BTCBOT WEBSITE: http://$IP/?key=$(cat "$KEY_FILE")"
+  say "open that link on your phone (keep it private). If it won't load, tick Allow HTTP traffic on the server."
+else
+  say "the website did not start; last lines:"
+  journalctl -u btcbot-web -n 20 --no-pager
+fi
 if systemctl is-active --quiet btcbot; then
   say "DONE. The bot is running. Its log lines follow below as they happen."
 else

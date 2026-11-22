@@ -3,6 +3,7 @@
     python -m btcbot check    # read settings, show today's market and what each play would do
     python -m btcbot run      # run the bot (paper or live, from settings.yaml)
     python -m btcbot score    # report card for finished trades
+    python -m btcbot web      # the private website (status and settings)
 """
 from __future__ import annotations
 
@@ -22,16 +23,7 @@ from .bot import Bot, RealClock
 from .broker import LiveBroker, PaperBroker
 from .kalshi import KalshiClient, KalshiError, load_private_key
 from .ledger import Ledger, score
-from .settings import SettingsError, load
-
-HERE = os.path.dirname(os.path.abspath(__file__))
-
-
-def mode_folder(settings) -> str:
-    folder = settings.folder
-    if not os.path.isabs(folder):
-        folder = os.path.join(HERE, folder)
-    return os.path.join(folder, settings.mode)  # paper and live never mix
+from .settings import DEFAULT_PATH, SettingsError, load, mode_folder
 
 
 def setup_logging(folder: str, tz: str) -> None:
@@ -57,7 +49,24 @@ def make_client(settings, need_key: bool) -> KalshiClient:
     return KalshiClient(settings.api_base, key_id if private_key is not None else None, private_key)
 
 
-def cmd_run(settings) -> None:
+def settings_watcher(path: str):
+    """True once the settings file changes, so the bot restarts with the new settings."""
+    def mtime():
+        try:
+            return os.stat(path).st_mtime
+        except OSError:
+            return None
+    start = mtime()
+
+    def changed() -> bool:
+        if mtime() != start:
+            logging.getLogger("btcbot").info("settings changed; restarting to use them")
+            return True
+        return False
+    return changed
+
+
+def cmd_run(settings, path: str = DEFAULT_PATH) -> None:
     folder = mode_folder(settings)
     setup_logging(folder, settings.day_timezone)
     client = make_client(settings, need_key=settings.live)
@@ -68,7 +77,7 @@ def cmd_run(settings) -> None:
         logging.getLogger("btcbot").warning("LIVE MODE: real money. Balance now $%.2f", broker.balance())
     else:
         broker = PaperBroker(Decimal(state.paper_cash))
-    Bot(settings, client, broker, ledger, state, RealClock()).run_forever()
+    Bot(settings, client, broker, ledger, state, RealClock()).run_forever(settings_watcher(path))
 
 
 def cmd_check(settings) -> None:
@@ -106,9 +115,14 @@ def cmd_check(settings) -> None:
 
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(prog="btcbot", description="Kalshi 15-minute market bot")
-    ap.add_argument("command", choices=["run", "check", "score"])
-    ap.add_argument("--settings", default=os.path.join(HERE, "settings.yaml"))
+    ap.add_argument("command", choices=["run", "check", "score", "web"])
+    ap.add_argument("--settings", default=DEFAULT_PATH)
+    ap.add_argument("--port", type=int, default=8080, help="website port (web only)")
     args = ap.parse_args(argv)
+    if args.command == "web":  # the website must start even when the settings are broken
+        from .web import serve
+        serve(args.settings, args.port)
+        return 0
     try:
         settings = load(args.settings)
     except SettingsError as e:
@@ -121,7 +135,7 @@ def main(argv=None) -> int:
         if args.command == "check":
             cmd_check(settings)
         else:
-            cmd_run(settings)
+            cmd_run(settings, args.settings)
     except SettingsError as e:
         print(f"Settings problem: {e}")
         return 2

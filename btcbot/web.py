@@ -1,36 +1,51 @@
-"""The bot's private website: status, score, trades and every setting, from a phone.
+"""The bot's private website: status, every play's bets and score, and every setting.
 
 Runs as its own small service next to the bot. It only reads the bot's files,
-writes settings.yaml (the bot notices and restarts with the new settings) and
-creates or removes the STOP file. Anyone without the private key in the link
-gets nothing.
+writes settings.yaml (the bot notices and restarts with the new settings),
+creates or removes the STOP file, and can download the newest bot code.
+Anyone without the private key in the link gets nothing.
 """
 from __future__ import annotations
 
+import copy
 import hmac
 import html
+import json
 import os
 import secrets
 import subprocess
 import sys
 import threading
 import time
+from datetime import datetime, timezone
 from decimal import Decimal
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, quote, urlparse
 from zoneinfo import ZoneInfo
 
 from . import ledger as L
 from .rules import parse_time
-from .settings import (PACKAGE_DIR, Settings, SettingsError, load, load_raw, mode_folder,
+from .settings import (PACKAGE_DIR, SIZE_MODES, Settings, SettingsError, load, load_raw, mode_folder,
                        save_raw)
 
 KEY_FILE_ENV = "BTCBOT_WEB_KEY_FILE"
 MARKETS = [("KXBTC15M", "Bitcoin"), ("KXETH15M", "Ethereum"), ("KXSOL15M", "Solana"), ("KXXRP15M", "XRP")]
 BUY_CHOICES = [("favorite", "The favorite"), ("underdog", "The underdog"), ("up", "Always Up"), ("down", "Always Down")]
+SIZE_CHOICES = [("contracts", "Contracts"), ("dollars", "Dollars"), ("percent", "% of balance")]
+LOSS_CHOICES = [("dollars", "Dollars"), ("percent", "% of the day's balance")]
+EXIT_WORDS = {"take_profit": "take profit", "stop_loss": "stop loss"}
 REPO_DIR = os.path.dirname(PACKAGE_DIR)
 COOKIE = "btcbot_key"
 MAX_BODY = 64_000
+ONE = Decimal("1")
+ON_PILL = '<span class="pill on-pill">ON</span>'
+OFF_PILL = '<span class="pill off-pill">OFF</span>'
+DONE_MESSAGES = {
+    "saved": "Saved. The bot restarts with the new settings in about 15 seconds.",
+    "added": "Added a new play. It starts switched off: set it up, tick \"This play is on\", then Save.",
+    "copied": "Copied. The copy starts switched off: change it, tick \"This play is on\", then Save.",
+    "deleted": "Deleted. Its past bets stay in the trade list.",
+}
 
 
 def load_key(path: str | None = None) -> str:
@@ -104,7 +119,7 @@ def restart_soon(settings_path: str) -> bool:
     return True
 
 
-# ---------------------------------------------------------------- helpers
+# ---------------------------------------------------------------- small helpers
 def esc(value) -> str:
     return html.escape("" if value is None else str(value))
 
@@ -113,12 +128,40 @@ def cents(dollars) -> str:
     """0.7 -> "70" for the form; None -> ""."""
     if dollars in (None, ""):
         return ""
-    value = float(dollars) * 100
-    return f"{value:g}"
+    return f"{float(dollars) * 100:g}"
+
+
+def cents_text(dollars) -> str:
+    return f"{float(dollars) * 100:.0f}¢"
 
 
 def plain(value) -> str:
     return "" if value in (None, "") else f"{float(value):g}"
+
+
+def bets(n: int) -> str:
+    return f"{n} bet{'' if n == 1 else 's'}"
+
+
+def money(d) -> str:
+    d = Decimal(str(d))
+    cls = "pos" if d > 0 else "neg" if d < 0 else ""
+    sign = "+" if d > 0 else "−" if d < 0 else ""
+    return f'<span class="{cls}">{sign}${abs(d):.2f}</span>'
+
+
+def clock(t: datetime, zone: ZoneInfo) -> str:
+    return t.astimezone(zone).strftime("%I:%M %p").lstrip("0").lower()
+
+
+def local_time(iso: str | None, zone: ZoneInfo) -> str:
+    t = parse_time(iso)
+    if t is None:
+        return ""
+    lt = t.astimezone(zone)
+    today = datetime.now(zone).date()
+    day = "Today" if lt.date() == today else f"{lt.strftime('%b')} {lt.day}"
+    return f"{day} {clock(t, zone)}"
 
 
 def number(form: dict, name: str, label: str, blank_ok: bool = False, scale: float = 1.0):
@@ -139,6 +182,81 @@ def field(form: dict, name: str, default: str = "") -> str:
     return (form.get(name, [default])[0] or default).strip()
 
 
+def unique_name(base: str, names: list) -> str:
+    if base not in names:
+        return base
+    i = 2
+    while f"{base} {i}" in names:
+        i += 1
+    return f"{base} {i}"
+
+
+def new_play(names: list) -> dict:
+    return {
+        "name": unique_name("new play", names), "enabled": False, "buy": "favorite",
+        "min_price": 0.7, "max_price": 0.85, "act_from_minutes_left": 8, "act_until_minutes_left": 7,
+        "slippage_cents": 0, "take_profit": None, "stop_loss": None,
+        "conditions": {"max_spread_cents": None, "min_contracts_at_price": None,
+                       "favorite_rising_seconds": None, "btc_distance_min_dollars": None},
+    }
+
+
+def size_words(size) -> str:
+    v = f"{float(size.value):g}"
+    if size.mode == "dollars":
+        text = f"${v}"
+    elif size.mode == "percent":
+        text = f"{v}% of the balance"
+    else:
+        text = f"{v} contract{'' if v == '1' else 's'}"
+    if size.mode != "contracts" and size.max_contracts > 0:
+        text += f" (at most {float(size.max_contracts):g} contracts)"
+    return text
+
+
+def describe_play(p, s: Settings) -> str:
+    buy = dict(BUY_CHOICES).get(p.buy, p.buy).lower()
+    exits = []
+    if p.take_profit is not None:
+        exits.append(f"sells at {cents_text(p.take_profit)} or more")
+    if p.stop_loss is not None:
+        exits.append(f"sells if it drops to {cents_text(p.stop_loss)}")
+    end = " and ".join(exits) if exits else "holds to the end"
+    return (f"Buys {esc(buy)} at {cents_text(p.min_price)}–{cents_text(p.max_price)}, "
+            f"from {float(p.act_from_minutes_left):g} to {float(p.act_until_minutes_left):g} minutes "
+            f"before each close, bets {esc(size_words(s.size_for(p)))}, then {esc(end)}.")
+
+
+def tail_log(path: str, lines: int = 25, play: str | None = None) -> list[str]:
+    """Newest log lines first, with the time shown as 5:07 pm. Optionally one play's lines."""
+    try:
+        with open(path, "rb") as fh:
+            fh.seek(0, 2)
+            size = fh.tell()
+            fh.seek(max(0, size - 200_000))
+            text = fh.read().decode("utf-8", "replace")
+    except OSError:
+        return []
+    out = []
+    for line in reversed(text.splitlines()):
+        if len(line) > 20 and line[4] == "-" and line[13] == ":":
+            msg, warn = line[20:], False
+            for level in ("INFO ", "WARNING ", "ERROR "):
+                if msg.startswith(level):
+                    msg, warn = msg[len(level):], level != "INFO "
+            if play is not None and not msg.startswith(f"{play}:"):
+                continue
+            hh, mm = int(line[11:13]), line[14:16]
+            line = f"{(hh % 12) or 12}:{mm} {'pm' if hh >= 12 else 'am'}  {'⚠️ ' if warn else ''}{msg}"
+        elif play is not None:
+            continue
+        out.append(line)
+        if len(out) >= lines:
+            break
+    return out
+
+
+# ---------------------------------------------------------------- data
 class App:
     """Everything the pages need: where the files are and the private key."""
 
@@ -148,7 +266,6 @@ class App:
         self.updater = update_code
         self.restarter = restart_soon
 
-    # -- reading
     def settings(self) -> tuple[Settings | None, str | None]:
         try:
             return load(self.settings_path), None
@@ -162,19 +279,72 @@ class App:
             return {}
         return raw if isinstance(raw, dict) else {}
 
-    def folder(self, s: Settings | None) -> str | None:
-        return mode_folder(s) if s else None
+    def snapshot(self) -> dict:
+        """One read of everything the status pages show."""
+        s, error = self.settings()
+        d = {"s": s, "error": error}
+        if s is None:
+            return d
+        folder = mode_folder(s)
+        d["folder"] = folder
+        d["zone"] = ZoneInfo(s.day_timezone)
+        state_path = os.path.join(folder, "state.json")
+        try:
+            d["state"] = L.Ledger(folder).load_state(s.paper_balance)
+            d["age"] = time.time() - os.stat(state_path).st_mtime
+        except (OSError, ValueError):
+            d["state"], d["age"] = None, None
+        d["paused"] = os.path.exists(os.path.join(folder, "STOP"))
+        d["rows"] = L.read_trades(os.path.join(folder, "trades.csv"))
+        d["market"], d["market_age"] = {}, None
+        try:
+            with open(os.path.join(folder, "market.json"), encoding="utf-8") as fh:
+                m = json.load(fh)
+            d["market"] = {r["ticker"]: r for r in m.get("markets", [])}
+            updated = parse_time(m.get("updated"))
+            if updated:
+                d["market_age"] = (datetime.now(timezone.utc) - updated).total_seconds()
+        except (OSError, ValueError, KeyError, TypeError):
+            pass
+        return d
 
-    # -- writing
-    def save_form(self, form: dict) -> Settings:
+    def save_form(self, form: dict) -> tuple[str, int | None]:
+        """Apply the settings form and the button that was pressed. Returns (done, play to show)."""
         raw = form_to_raw(form, self.raw())
-        return save_raw(self.settings_path, raw)
+        plays = raw["plays"]
+        names = [p["name"] for p in plays]
+        action = field(form, "action", "save")
+        focus = None
+        done = "saved"
+        try:
+            if action == "add":
+                plays.append(new_play(names))
+                focus, done = len(plays) - 1, "added"
+            elif action.startswith("copy:"):
+                i = int(action[5:])
+                c = copy.deepcopy(plays[i])
+                c["name"] = unique_name(f"{plays[i]['name']} copy", names)
+                c["enabled"] = False
+                plays.insert(i + 1, c)
+                focus, done = i + 1, "copied"
+            elif action.startswith("delete:"):
+                i = int(action[7:])
+                if len(plays) == 1:
+                    raise SettingsError("you need at least one play, so this one can't be deleted")
+                plays.pop(i)
+                done = "deleted"
+            elif action != "save":
+                raise SettingsError("that button didn't work; please try again")
+        except (ValueError, IndexError):
+            raise SettingsError("that button didn't work; please reload the page and try again")
+        save_raw(self.settings_path, raw)
+        return done, focus
 
     def set_paused(self, paused: bool) -> None:
         s, _ = self.settings()
         if s is None:
             return
-        folder = self.folder(s)
+        folder = mode_folder(s)
         os.makedirs(folder, exist_ok=True)
         stop = os.path.join(folder, "STOP")
         if paused:
@@ -196,23 +366,25 @@ def form_to_raw(form: dict, current: dict) -> dict:
         raise SettingsError("Markets: tick at least one market")
     raw["markets"] = list(dict.fromkeys(markets))
     raw["paper_balance"] = number(form, "paper_balance", "Pretend starting money")
-    raw["balance_share_pct"] = number(form, "balance_share_pct", "How much of your Kalshi it can use")
+    raw["balance_share_pct"] = number(form, "balance_share_pct", "Most of your money in open bets")
     raw["size"] = {
         "mode": field(form, "size_mode", "contracts"),
-        "value": number(form, "size_value", "Size per trade"),
-        "max_contracts": number(form, "max_contracts", "Most contracts per trade"),
+        "value": number(form, "size_value", "Default bet size"),
+        "max_contracts": number(form, "max_contracts", "Most contracts per bet"),
     }
     raw["daily_loss_limit"] = {
         "mode": field(form, "loss_mode", "dollars"),
         "value": number(form, "loss_value", "Daily loss limit"),
     }
-    raw["max_trades_per_day"] = number(form, "max_trades_per_day", "Most trades per day")
+    raw["max_trades_per_day"] = number(form, "max_trades_per_day", "Most bets per day")
     plays = []
     for i in range(int(field(form, "play_count", "0") or 0)):
         p = f"p{i}_"
-        name = field(form, p + "name") or f"play{i + 1}"
+        name = field(form, p + "name")
+        if not name:
+            raise SettingsError(f"Play {i + 1}: every play needs a name")
         label = f"Play '{name}'"
-        plays.append({
+        play = {
             "name": name,
             "enabled": bool(field(form, p + "enabled")),
             "buy": field(form, p + "buy", "favorite"),
@@ -220,7 +392,7 @@ def form_to_raw(form: dict, current: dict) -> dict:
             "max_price": number(form, p + "max", f"{label} highest price", scale=100),
             "slippage_cents": number(form, p + "slip", f"{label} extra cents"),
             "act_from_minutes_left": number(form, p + "from", f"{label} start minute"),
-            "act_until_minutes_left": number(form, p + "until", f"{label} end minute"),
+            "act_until_minutes_left": number(form, p + "until", f"{label} stop minute"),
             "take_profit": number(form, p + "tp", f"{label} take profit", blank_ok=True, scale=100),
             "stop_loss": number(form, p + "sl", f"{label} stop loss", blank_ok=True, scale=100),
             "conditions": {
@@ -229,170 +401,336 @@ def form_to_raw(form: dict, current: dict) -> dict:
                 "favorite_rising_seconds": number(form, p + "rising", f"{label} rising seconds", blank_ok=True),
                 "btc_distance_min_dollars": number(form, p + "dist", f"{label} distance", blank_ok=True),
             },
-        })
+        }
+        size_mode = field(form, p + "size_mode", "default")
+        if size_mode in SIZE_MODES:
+            play["size"] = {
+                "mode": size_mode,
+                "value": number(form, p + "size_value", f"{label} bet size"),
+                "max_contracts": number(form, p + "size_max", f"{label} most contracts", blank_ok=True) or 0,
+            }
+        plays.append(play)
     raw["plays"] = plays
     return raw
 
 
-# ---------------------------------------------------------------- pages
+# ---------------------------------------------------------------- page parts
 CSS = """
-*{box-sizing:border-box}body{margin:0;font:16px/1.45 -apple-system,system-ui,sans-serif;background:#0f1115;color:#e8eaed}
-main{max-width:720px;margin:0 auto;padding:16px}h1{font-size:22px;margin:4px 0 12px}h2{font-size:17px;margin:22px 0 8px;color:#9aa0a6}
-nav{display:flex;gap:8px;margin-bottom:14px}nav a{flex:1;text-align:center;padding:10px;border-radius:10px;background:#1c1f26;color:#e8eaed;text-decoration:none}
-nav a.on{background:#2b5cff}.badge{display:inline-block;padding:2px 10px;border-radius:99px;font-size:13px;margin-left:6px;vertical-align:middle}
-.paper{background:#1f3b2b;color:#7ee2a8}.live{background:#4a1f1f;color:#ff9b9b}
-.box{background:#1c1f26;border-radius:14px;padding:14px;margin:10px 0}.ok{border-left:4px solid #34c37a}.bad{border-left:4px solid #ff5c5c}.warn{border-left:4px solid #f4b740}
-.cards{display:grid;grid-template-columns:repeat(3,1fr);gap:8px}.card{background:#1c1f26;border-radius:14px;padding:12px}.card b{display:block;font-size:20px}.card span{color:#9aa0a6;font-size:13px}
-.pos{color:#5ee08f}.neg{color:#ff7b7b}table{width:100%;border-collapse:collapse;font-size:14px}td,th{padding:7px 4px;border-bottom:1px solid #2a2e37;text-align:left}th{color:#9aa0a6;font-weight:500}
-.log{font:13px/1.5 ui-monospace,Menlo,monospace;white-space:pre-wrap;color:#c4c7cc}button,.btn{display:block;text-align:center;text-decoration:none;background:#2b5cff;color:#fff;border:0;border-radius:10px;padding:12px 16px;font-size:16px;width:100%;margin-top:8px}
-.btn2{background:#30343d}label{display:block;margin:10px 0 4px;color:#c4c7cc;font-size:14px}input,select{width:100%;padding:10px;border-radius:10px;border:1px solid #3a3f4a;background:#0f1115;color:#e8eaed;font-size:16px}
-.row{display:grid;grid-template-columns:1fr 1fr;gap:10px}.check{display:flex;gap:10px;align-items:center;margin:8px 0}.check input{width:22px;height:22px}
-.hint{color:#9aa0a6;font-size:13px;margin:2px 0}details{margin-top:10px}summary{cursor:pointer;color:#8ab4ff}
+:root{--bg:#0d0f14;--card:#171a21;--card2:#1f232c;--line:#2a2f3a;--text:#eceef2;--dim:#9aa1ad;--blue:#3d6bff;
+--green:#36d37f;--red:#ff6b6b;--amber:#f4b740}
+*{box-sizing:border-box}body{margin:0;font:16px/1.45 -apple-system,system-ui,Segoe UI,sans-serif;background:var(--bg);color:var(--text)}
+main{max-width:720px;margin:0 auto;padding:14px 14px 40px}a{color:inherit}
+nav{display:flex;gap:6px;margin-bottom:14px;background:var(--card);padding:5px;border-radius:14px}
+nav a{flex:1;text-align:center;padding:9px;border-radius:10px;text-decoration:none;color:var(--dim);font-weight:600}
+nav a.on{background:var(--blue);color:#fff}
+h1{font-size:24px;margin:2px 0 10px;display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+h2{font-size:13px;letter-spacing:.08em;text-transform:uppercase;margin:22px 0 8px;color:var(--dim)}
+.pill{display:inline-block;padding:3px 10px;border-radius:99px;font-size:12px;font-weight:700;letter-spacing:.03em}
+.paper{background:#173626;color:#7ee2a8}.live{background:#4a1f1f;color:#ff9b9b}.on-pill{background:#173626;color:#7ee2a8}
+.off-pill{background:#2a2f3a;color:var(--dim)}.old-pill{background:#3a2f1a;color:var(--amber)}
+.box{background:var(--card);border-radius:16px;padding:14px;margin:10px 0}
+.ok{border-left:4px solid var(--green)}.bad{border-left:4px solid var(--red)}.warn{border-left:4px solid var(--amber)}
+.cards{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin:10px 0}
+.card{background:var(--card);border-radius:16px;padding:12px}.card>span{color:var(--dim);font-size:12px;display:block}
+.card b{display:block;font-size:20px;margin:2px 0}
+.pos{color:var(--green)}.neg{color:var(--red)}.dim,.hint{color:var(--dim)}.hint{font-size:13px;margin:6px 0 0}
+.market .top{display:flex;justify-content:space-between;color:var(--dim);font-size:14px}
+.prices{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:10px}
+.price{background:var(--card2);border-radius:12px;padding:10px;text-align:center;border:2px solid transparent}
+.price b{display:block;font-size:24px}.price.fav{border-color:var(--blue)}
+.play{display:block;text-decoration:none;background:var(--card);border-radius:16px;padding:14px;margin:10px 0}
+.play .head{display:flex;justify-content:space-between;align-items:center;gap:8px}
+.play .name{font-size:18px;font-weight:700}.play .desc{color:var(--dim);font-size:14px;margin:6px 0 10px}
+.mini{display:flex;gap:14px;flex-wrap:wrap;align-items:center;font-size:14px}.mini b{font-size:16px}
+.bet{display:flex;justify-content:space-between;gap:10px;padding:11px 0;border-bottom:1px solid var(--line)}
+.bet:last-of-type{border-bottom:0}.bet .sub{color:var(--dim);font-size:13px;margin-top:2px}
+.bet .amt{text-align:right;font-weight:700;white-space:nowrap}.bet .amt .sub{font-weight:400}
+.side{display:inline-block;font-size:12px;font-weight:800;padding:2px 8px;border-radius:6px;margin-right:6px}
+.side.up{background:#163a2a;color:#7ee2a8}.side.down{background:#3d1d22;color:#ff9da4}
+.log{font:12.5px/1.55 ui-monospace,Menlo,monospace;white-space:pre-wrap;color:#c4c9d2}
+button,.btn{display:block;text-align:center;text-decoration:none;background:var(--blue);color:#fff;border:0;border-radius:12px;
+padding:13px 16px;font-size:16px;font-weight:600;width:100%;margin-top:8px;cursor:pointer}
+.btn2{background:var(--card2);color:var(--text)}.danger{background:#3d1d22;color:#ff9da4}
+.row2{display:grid;grid-template-columns:1fr 1fr;gap:8px}.row2 button{margin-top:10px}
+label{display:block;margin:12px 0 4px;color:#c4c9d2;font-size:14px}
+input,select{width:100%;padding:11px;border-radius:10px;border:1px solid #363c48;background:var(--bg);color:var(--text);font-size:16px}
+.check{display:flex;gap:10px;align-items:center;margin:12px 0 4px}.check input{width:22px;height:22px;flex:none}
+details{margin-top:12px}summary{cursor:pointer;color:#8fb0ff}
+.savebar{position:sticky;bottom:0;padding:10px 0 6px;background:linear-gradient(transparent,var(--bg) 35%)}
+.empty{color:var(--dim);font-size:14px;padding:6px 0}.back{display:inline-block;color:#8fb0ff;text-decoration:none;margin-bottom:6px}
 """
 
 
-def page(title: str, body: str, tab: str, refresh: int | None = None) -> str:
+def page(title: str, body: str, tab: str, refresh=None) -> str:
     meta = f'<meta http-equiv="refresh" content="{refresh}">' if refresh else ""
     on = lambda t: ' class="on"' if t == tab else ""
     return (f'<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" '
-            f'content="width=device-width,initial-scale=1">{meta}<title>{esc(title)}</title>'
-            f'<style>{CSS}</style></head><body><main>'
-            f'<nav><a href="/"{on("status")}>Status</a><a href="/settings"{on("settings")}>Settings</a></nav>'
+            f'content="width=device-width,initial-scale=1"><meta name="theme-color" content="#0d0f14">'
+            f'{meta}<title>{esc(title)}</title><style>{CSS}</style></head><body><main>'
+            f'<nav><a href="/"{on("status")}>Overview</a><a href="/settings"{on("settings")}>Settings</a></nav>'
             f'{body}</main></body></html>')
 
 
-def money(d) -> str:
-    cls = "pos" if d > 0 else "neg" if d < 0 else ""
-    sign = "+" if d > 0 else "−" if d < 0 else ""
-    return f'<span class="{cls}">{sign}${abs(d):.2f}</span>'
+def mode_pill(mode: str) -> str:
+    return ('<span class="pill live">REAL MONEY</span>' if mode == "live"
+            else '<span class="pill paper">PAPER · pretend money</span>')
 
 
-def local_time(iso: str | None, zone: ZoneInfo) -> str:
-    t = parse_time(iso)
-    if t is None:
-        return ""
-    t = t.astimezone(zone)
-    return f"{t.strftime('%b')} {t.day} {t.strftime('%I:%M %p').lstrip('0').lower()}"
-
-
-def describe_play(p) -> str:
-    buy = dict(BUY_CHOICES).get(p.buy, p.buy).lower()
-    c = lambda price: f"{float(price) * 100:g}"
-    exits = []
-    if p.take_profit is not None:
-        exits.append(f"sells at {c(p.take_profit)}¢ or more")
-    if p.stop_loss is not None:
-        exits.append(f"sells if it drops to {c(p.stop_loss)}¢")
-    end = "; ".join(exits) if exits else "holds to the end"
-    return (f"<b>{esc(p.name)}</b>: buys {esc(buy)} at {c(p.min_price)}–{c(p.max_price)}¢, "
-            f"from {float(p.act_from_minutes_left):g} to {float(p.act_until_minutes_left):g} min before each close; "
-            f"{esc(end)}.")
-
-
-def tail_log(path: str, lines: int = 25) -> list[str]:
-    try:
-        with open(path, "rb") as fh:
-            fh.seek(0, 2)
-            size = fh.tell()
-            fh.seek(max(0, size - 40_000))
-            text = fh.read().decode("utf-8", "replace")
-    except OSError:
-        return []
-    out = []
-    for line in text.splitlines()[-lines:]:
-        if len(line) > 20 and line[4] == "-" and line[13] == ":":
-            hh, mm = int(line[11:13]), line[14:16]
-            line = f"{(hh % 12) or 12}:{mm} {'pm' if hh >= 12 else 'am'}  {line[20:]}".replace("INFO ", "")
-        out.append(line)
-    return list(reversed(out))
-
-
-def status_page(app: App) -> str:
-    s, error = app.settings()
-    zone = ZoneInfo(s.day_timezone if s else "Pacific/Honolulu")
-    parts = []
-    mode = s.mode if s else "?"
-    parts.append(f'<h1>Kalshi bot <span class="badge {"live" if mode == "live" else "paper"}">'
-                 f'{"REAL MONEY" if mode == "live" else "PAPER (pretend money)"}</span></h1>')
-    if error:
-        parts.append(f'<div class="box bad"><b>Settings problem:</b> {esc(error)}<br>'
-                     f'Fix it on the Settings page. The bot can\'t start until then.</div>')
-        return page("Kalshi bot", "".join(parts), "status", refresh=60)
-    folder = app.folder(s)
-    state_path = os.path.join(folder, "state.json")
-    try:
-        st = L.Ledger(folder).load_state(s.paper_balance)
-        age = time.time() - os.stat(state_path).st_mtime
-    except OSError:
-        st, age = None, None
+def running_box(d: dict) -> str:
+    s, age = d["s"], d.get("age")
     if age is None:
-        parts.append('<div class="box warn">Starting up. Nothing saved yet. Check back in a minute.</div>')
-    elif age < max(90, s.slow_seconds * 4):
+        return '<div class="box warn">Starting up. Nothing saved yet; check back in a minute.</div>'
+    if age < max(90, s.slow_seconds * 4):
         secs = int(age)
-        parts.append(f'<div class="box ok">✅ Running. Last price check {secs} second{"" if secs == 1 else "s"} ago.</div>')
+        return f'<div class="box ok">✅ Running · last price check {secs} second{"" if secs == 1 else "s"} ago</div>'
+    return f'<div class="box bad">⚠️ Not running · last price check {int(age // 60)} minutes ago</div>'
+
+
+def side_tag(side_word: str) -> str:
+    up = side_word.upper() in ("UP", "YES")
+    return f'<span class="side {"up" if up else "down"}">{"▲ UP" if up else "▼ DOWN"}</span>'
+
+
+def now_bid(pos: dict, market: dict) -> Decimal | None:
+    m = market.get(pos["ticker"])
+    if not m:
+        return None
+    if pos["side"] == "yes":
+        return Decimal(m["yes_bid"]) if m.get("yes_bid") else None
+    return ONE - Decimal(m["yes_ask"]) if m.get("yes_ask") else None
+
+
+def open_bet(pos: dict, play, d: dict) -> str:
+    zone = d["zone"]
+    n = Decimal(pos["contracts"])
+    paid = Decimal(pos["entry_price"])
+    close = parse_time(pos["close_time"])
+    mins = (close - datetime.now(timezone.utc)).total_seconds() / 60 if close else None
+    when = (f"closes {clock(close, zone)} · {max(mins, 0):.0f} min left" if mins is not None and mins > 0
+            else "closed · waiting for the result")
+    plan = []
+    if play is not None and play.take_profit is not None:
+        plan.append(f"sells at {cents_text(play.take_profit)}")
+    if play is not None and play.stop_loss is not None:
+        plan.append(f"or {cents_text(play.stop_loss)}")
+    fresh = d.get("market_age") is not None and d["market_age"] < 120
+    bid = now_bid(pos, d["market"]) if fresh else None
+    if bid is not None and (mins is None or mins > 0):
+        change = (bid - paid) * n - Decimal(pos["entry_fee"])
+        right = f'now {cents_text(bid)}<div class="sub">{money(change)} if sold</div>'
     else:
-        parts.append(f'<div class="box bad">⚠️ Not running. Last price check {int(age // 60)} minutes ago.</div>')
-    paused = os.path.exists(os.path.join(folder, "STOP"))
-    if paused:
-        parts.append('<div class="box warn"><b>Paused:</b> no new trades. Open trades still finish.'
-                     '<form method="post" action="/resume"><button>Resume trading</button></form></div>')
-    rows = L.read_trades(os.path.join(folder, "trades.csv"))
-    total = L.stats(rows)
+        right = '<span class="dim">open</span>'
+    return (f'<div class="bet"><div>{side_tag(pos["side"])}<b>{n:g} × {cents_text(paid)}</b>'
+            f'<div class="sub">{esc(when)}{" · " + esc(" ".join(plan)) if plan else ""}</div></div>'
+            f'<div class="amt">{right}</div></div>')
+
+
+def closed_bet(r: dict, zone: ZoneInfo) -> str:
+    profit = Decimal(r["profit"])
+    if r["exit_type"] == "settled":
+        how = f"{r['result']} won" if r["result"] else "settled"
+    else:
+        how = f"sold at {cents_text(r['exit_price'])} ({EXIT_WORDS.get(r['exit_type'], r['exit_type'])})"
+    return (f'<div class="bet"><div>{side_tag(r["side"])}<b>{float(r["contracts"]):g} × {cents_text(r["entry_price"])}</b>'
+            f'<div class="sub">{esc(how)} · {esc(local_time(r["closed_at"] or r["opened_at"], zone))}</div></div>'
+            f'<div class="amt">{money(profit)}</div></div>')
+
+
+def market_cards(d: dict) -> str:
+    age = d.get("market_age")
+    if age is None or age > 300 or not d["market"]:
+        return ""
+    zone = d["zone"]
+    now = datetime.now(timezone.utc)
+    soonest: dict = {}
+    for m in d["market"].values():
+        t = parse_time(m.get("close_time"))
+        if t is None or t <= now:
+            continue
+        if m["series"] not in soonest or t < parse_time(soonest[m["series"]]["close_time"]):
+            soonest[m["series"]] = m
+    names = dict(MARKETS)
+
+    def box(word, arrow, p, fav):
+        return (f'<div class="price{" fav" if fav else ""}">{arrow} {word}'
+                f'<b>{cents_text(p) if p is not None else "—"}</b></div>')
+
+    out = []
+    for series, m in soonest.items():
+        t = parse_time(m["close_time"])
+        mins = (t - now).total_seconds() / 60
+        up = Decimal(m["yes_ask"]) if m.get("yes_ask") else None
+        down = ONE - Decimal(m["yes_bid"]) if m.get("yes_bid") else None
+        fav_up = up is not None and down is not None and up >= down
+        target = f' · target ${float(m["target"]):,.2f}' if m.get("target") else ""
+        stale = f' · prices {int(age)}s old' if age > 30 else ""
+        out.append(f'<div class="box market"><div class="top"><span><b style="color:var(--text)">'
+                   f'{esc(names.get(series, series))}</b> · closes {clock(t, zone)}</span>'
+                   f'<span>{mins:.0f} min left</span></div>'
+                   f'<div class="prices">{box("Up", "▲", up, fav_up)}{box("Down", "▼", down, not fav_up)}</div>'
+                   f'<p class="hint">Price to buy right now{target}{stale}</p></div>')
+    return "".join(out)
+
+
+def play_names(d: dict) -> list:
+    """Plays in the settings first, then old plays that still have bets on record."""
+    names = [p.name for p in d["s"].plays]
+    held = [p["play"] for p in (d["state"].positions if d.get("state") else [])]
+    return names + [n for n in dict.fromkeys([r["play"] for r in d["rows"]] + held) if n not in names]
+
+
+def play_link(name: str) -> str:
+    return "/play?name=" + quote(name, safe="")
+
+
+def status_pill(play) -> str:
+    if play is None:
+        return '<span class="pill old-pill">REMOVED</span>'
+    return ON_PILL if play.enabled else OFF_PILL
+
+
+# ---------------------------------------------------------------- pages
+def overview_page(app: App) -> str:
+    d = app.snapshot()
+    s = d["s"]
+    if s is None:
+        body = (f'<h1>Kalshi bot</h1><div class="box bad"><b>Settings problem:</b> {esc(d["error"])}<br>'
+                'Fix it on the Settings page. The bot can\'t start until then.</div>')
+        return page("Kalshi bot", body, "status", refresh=60)
+    st = d["state"]
+    parts = [f"<h1>Kalshi bot {mode_pill(s.mode)}</h1>", running_box(d)]
+    if d["paused"]:
+        parts.append('<div class="box warn"><b>Paused:</b> no new bets. Open bets still finish.'
+                     '<form method="post" action="/resume"><button>Resume betting</button></form></div>')
+    total = L.stats(d["rows"])
     if st is not None:
-        bal = f"${float(st.paper_cash):.2f}" if mode == "paper" else "see Kalshi app"
+        bal = f"${float(st.paper_cash):.2f}" if s.mode == "paper" else "Kalshi app"
         parts.append(
             '<div class="cards">'
             f'<div class="card"><span>Balance</span><b>{bal}</b></div>'
-            f'<div class="card"><span>Today</span><b>{money(Decimal(st.day_profit))}</b><span>{st.day_trades} trades</span></div>'
-            f'<div class="card"><span>All time</span><b>{money(total["profit"])}</b><span>{total["trades"]} trades</span></div>'
+            f'<div class="card"><span>Today</span><b>{money(st.day_profit)}</b><span>{bets(st.day_trades)}</span></div>'
+            f'<div class="card"><span>All time</span><b>{money(total["profit"])}</b><span>{bets(total["trades"])}</span></div>'
             '</div>')
-    if total["trades"]:
-        parts.append(
-            f'<div class="box"><b>Win rate {100 * total["win_rate"]:.0f}%</b> · needs about '
-            f'{100 * total["need"]:.0f}% to break even · luck range ±{100 * total["luck"]:.0f} points'
-            f'<p class="hint">{esc(total["verdict"])}</p></div>')
-    plays_seen = list(dict.fromkeys(r["play"] for r in rows))
-    if plays_seen:
-        items = ""
-        for name in plays_seen:
-            ps = L.stats([r for r in rows if r["play"] == name])
-            items += (f"<tr><td>{esc(name)}</td><td>{ps['trades']}</td><td>{100 * ps['win_rate']:.0f}%</td>"
-                      f"<td>{100 * ps['need']:.0f}%</td><td>{money(ps['profit'])}</td></tr>")
-        parts.append("<h2>Score for each play</h2><div class=\"box\"><table><tr><th>Play</th><th>Trades</th>"
-                     f"<th>Wins</th><th>Needs</th><th>Profit</th></tr>{items}</table>"
-                     '<p class="hint">"Needs" is the win rate that play must beat to make money at the prices it paid.</p></div>')
-    parts.append("<h2>What it's doing</h2><div class=\"box\">" +
-                 "<br>".join(describe_play(p) for p in s.plays if p.enabled) +
-                 f'<p class="hint">Watching: {esc(", ".join(s.markets))}. Closes are at :00, :15, :30 and :45.</p></div>')
-    if st is not None and st.positions:
-        items = "".join(
-            f"<tr><td>{esc(local_time(p['close_time'], zone))}</td>"
-            f"<td>{'UP' if p['side'] == 'yes' else 'DOWN'}</td><td>{float(p['contracts']):g}</td>"
-            f"<td>{float(p['entry_price']) * 100:.0f}¢</td><td>{esc(p['play'])}</td></tr>"
-            for p in st.positions)
-        parts.append("<h2>Open trades</h2><div class=\"box\"><table><tr><th>Closes</th><th>Side</th>"
-                     f"<th>Qty</th><th>Paid</th><th>Play</th></tr>{items}</table></div>")
-    if rows:
-        items = "".join(
-            f"<tr><td>{esc(local_time(r['closed_at'], zone))}</td><td>{esc(r['side'])}</td>"
-            f"<td>{float(r['entry_price']) * 100:.0f}¢</td>"
-            f"<td>{esc(r['result'] + ' won' if r['exit_type'] == 'settled' else 'sold early')}</td>"
-            f"<td>{money(Decimal(r['profit']))}</td></tr>"
-            for r in reversed(rows[-20:]))
-        parts.append("<h2>Recent trades</h2><div class=\"box\"><table><tr><th>When</th><th>Side</th>"
-                     f"<th>Paid</th><th>Result</th><th>Profit</th></tr>{items}</table>"
-                     '<p class="hint"><a href="/trades.csv" style="color:#8ab4ff">Download every trade</a></p></div>')
-    log = tail_log(os.path.join(folder, "bot.log"))
+    parts.append(market_cards(d))
+    parts.append("<h2>Your plays</h2>")
+    by_name = {p.name: p for p in s.plays}
+    positions = st.positions if st is not None else []
+    for name in play_names(d):
+        play = by_name.get(name)
+        ps = L.stats([r for r in d["rows"] if r["play"] == name])
+        opened = sum(1 for p in positions if p["play"] == name)
+        desc = describe_play(play, s) if play else "Removed or renamed. Its past bets are kept here."
+        if ps["trades"]:
+            mini = (f'<span><b>{ps["trades"]}</b> bet{"" if ps["trades"] == 1 else "s"}</span><span><b>{100 * ps["win_rate"]:.0f}%</b> won</span>'
+                    f'<span><b>{money(ps["profit"])}</b></span>')
+        else:
+            mini = '<span class="dim">No finished bets yet</span>'
+        if opened:
+            mini += f'<span class="pill on-pill">{opened} open</span>'
+        parts.append(f'<a class="play" href="{play_link(name)}"><div class="head"><span class="name">{esc(name)}</span>'
+                     f'{status_pill(play)}</div><div class="desc">{desc}</div><div class="mini">{mini}</div></a>')
+    parts.append('<a class="btn btn2" href="/settings#add">+ Add or change plays</a>')
+    log = tail_log(os.path.join(d["folder"], "bot.log"), 15)
     if log:
         parts.append('<h2>Recent activity</h2><div class="box log">' + esc("\n".join(log)) + "</div>")
-    if not paused:
-        parts.append('<form method="post" action="/pause"><button class="btn btn2">Pause new trades</button></form>')
+    if not d["paused"]:
+        parts.append('<form method="post" action="/pause"><button class="btn2">Pause new bets</button></form>')
     parts.append(f'<h2>Bot version</h2><div class="box">Version {esc(code_version())}'
-                 '<form method="post" action="/update"><button class="btn btn2">Get the newest version</button></form>'
+                 '<form method="post" action="/update"><button class="btn2">Get the newest version</button></form>'
                  '<p class="hint">Only needed when Claude tells you there\'s an update. Takes about a minute. '
-                 'Open trades are kept.</p></div>')
-    parts.append('<p class="hint">This page refreshes by itself every 30 seconds.</p>')
+                 'Open bets are kept.</p></div>'
+                 '<p class="hint">This page refreshes by itself every 30 seconds.</p>')
     return page("Kalshi bot", "".join(parts), "status", refresh=30)
+
+
+def play_page(app: App, name: str) -> str:
+    d = app.snapshot()
+    s = d["s"]
+    if s is None:
+        return overview_page(app)
+    by_name = {p.name: p for p in s.plays}
+    play = by_name.get(name)
+    if play is None and name not in play_names(d):
+        return page("Not found", '<a class="back" href="/">‹ All plays</a><div class="box">No play called '
+                    f'"{esc(name)}".</div>', "status")
+    zone = d["zone"]
+    rows = [r for r in d["rows"] if r["play"] == name]
+    ps = L.stats(rows)
+    parts = ['<a class="back" href="/">‹ All plays</a>', f"<h1>{esc(name)} {status_pill(play)}</h1>"]
+    if play is not None:
+        parts.append(f'<p class="dim" style="margin-top:0">{describe_play(play, s)}</p>')
+    else:
+        parts.append('<p class="dim">This play was removed or renamed. Its past bets are kept here.</p>')
+    parts.append(
+        '<div class="cards">'
+        f'<div class="card"><span>Bets</span><b>{ps["trades"]}</b><span>{ps["wins"]} won · {ps["losses"]} lost</span></div>'
+        f'<div class="card"><span>Won</span><b>{100 * ps["win_rate"]:.0f}%</b><span>needs ~{100 * ps["need"]:.0f}%</span></div>'
+        f'<div class="card"><span>Profit</span><b>{money(ps["profit"])}</b><span>after fees</span></div>'
+        '</div>')
+    if ps["trades"]:
+        verdict = ps["verdict"].replace("Verdict: ", "")
+        parts.append(f'<div class="box"><b>{esc(verdict[:1].upper() + verdict[1:])}</b>'
+                     f'<p class="hint">"Needs" is the win rate this play must beat to make money. Luck can move a '
+                     f'win rate about ±{100 * ps["luck"]:.0f} points at {bets(ps["trades"])}.</p></div>')
+    positions = [p for p in (d["state"].positions if d.get("state") else []) if p["play"] == name]
+    parts.append(f'<h2>Open bets · {len(positions)}</h2><div class="box">')
+    parts.append("".join(open_bet(p, play, d) for p in positions) or '<div class="empty">None right now.</div>')
+    parts.append("</div>")
+    parts.append(f'<h2>Closed bets · {len(rows)}</h2><div class="box">')
+    parts.append("".join(closed_bet(r, zone) for r in reversed(rows[-60:])) or '<div class="empty">None yet.</div>')
+    if len(rows) > 60:
+        parts.append(f'<p class="hint">Showing the newest 60 of {len(rows)}.</p>')
+    parts.append('<p class="hint"><a href="/trades.csv" style="color:#8fb0ff">Download every bet</a></p></div>')
+    log = tail_log(os.path.join(d["folder"], "bot.log"), 15, play=name)
+    if log:
+        parts.append('<h2>What it did lately</h2><div class="box log">' + esc("\n".join(log)) + "</div>")
+    if play is not None:
+        parts.append(f'<a class="btn btn2" href="/settings#play-{s.plays.index(play)}">Edit this play</a>')
+    return page(name, "".join(parts), "status", refresh=30)
+
+
+def play_form(i: int, p: dict, opt, inp) -> str:
+    c = p.get("conditions") or {}
+    psize = p.get("size") if isinstance(p.get("size"), dict) else None
+    pre = f"p{i}_"
+    name = p.get("name", f"play{i + 1}")
+    on = p.get("enabled", True)
+    size_mode = psize.get("mode") if psize else "default"
+    size_value = plain(psize.get("value")) if psize else ""
+    size_max = plain(psize.get("max_contracts") or None) if psize else ""
+    confirm = esc(f"Delete the play {name}? Its past bets are kept.")
+    return (
+        f'<h2 id="play-{i}">Play {i + 1}</h2><div class="box">'
+        f'<div style="display:flex;justify-content:space-between;align-items:center">'
+        f'<b style="font-size:18px">{esc(name)}</b>{ON_PILL if on else OFF_PILL}</div>'
+        f'<label>Name</label><input name="{pre}name" value="{esc(name)}" maxlength="40">'
+        f'<div class="check"><input type="checkbox" name="{pre}enabled" value="1"'
+        f'{" checked" if on else ""}><span>This play is on</span></div>'
+        f'<label>What it buys</label><select name="{pre}buy">{opt(BUY_CHOICES, p.get("buy", "favorite"))}</select>'
+        f'<div class="row2"><div><label>Lowest price (¢)</label>{inp(pre + "min", cents(p.get("min_price", 0.7)))}</div>'
+        f'<div><label>Highest price (¢)</label>{inp(pre + "max", cents(p.get("max_price", 0.85)))}</div></div>'
+        f'<div class="row2"><div><label>Start (minutes left)</label>{inp(pre + "from", plain(p.get("act_from_minutes_left", 8)))}</div>'
+        f'<div><label>Stop (minutes left)</label>{inp(pre + "until", plain(p.get("act_until_minutes_left", 7)))}</div></div>'
+        '<p class="hint">Example: 8 and 7 means it buys between 8 and 7 minutes before the market closes.</p>'
+        f'<div class="row2"><div><label>Take profit at (¢)</label>{inp(pre + "tp", cents(p.get("take_profit")))}</div>'
+        f'<div><label>Stop loss at (¢)</label>{inp(pre + "sl", cents(p.get("stop_loss")))}</div></div>'
+        '<p class="hint">Blank = off. Both blank = hold to the end and get $1 per contract if it wins.</p>'
+        f'<label>Bet size</label><select name="{pre}size_mode">'
+        f'{opt([("default", "Same as the default size")] + SIZE_CHOICES, size_mode)}</select>'
+        f'<div class="row2"><div><label>Amount</label>{inp(pre + "size_value", size_value)}</div>'
+        f'<div><label>Most contracts</label>{inp(pre + "size_max", size_max, "numeric")}</div></div>'
+        '<p class="hint">Example: Dollars and 3 means it spends about $3 on each bet. Most contracts blank = no cap.</p>'
+        '<details><summary>Extra conditions</summary>'
+        f'<label>Extra cents it may pay above the price on screen</label>{inp(pre + "slip", plain(p.get("slippage_cents", 0)))}'
+        f'<label>Skip if the gap between buy and sell price is wider than (¢)</label>{inp(pre + "spread", plain(c.get("max_spread_cents")))}'
+        f'<label>Skip if fewer contracts are offered than</label>{inp(pre + "depth", plain(c.get("min_contracts_at_price")))}'
+        f'<label>Only buy if its side rose over the last N seconds</label>{inp(pre + "rising", plain(c.get("favorite_rising_seconds")))}'
+        f'<label>Only buy if the price is this many $ past the target</label>{inp(pre + "dist", plain(c.get("btc_distance_min_dollars")))}'
+        '<p class="hint">Blank = off.</p></details>'
+        f'<div class="row2"><button class="btn2" name="action" value="copy:{i}">Copy this play</button>'
+        f'<button class="danger" name="action" value="delete:{i}" onclick="return confirm(this.dataset.q)" '
+        f'data-q="{confirm}">Delete</button></div>'
+        '<p class="hint">Renaming a play starts its score over; its old bets stay under the old name.</p></div>')
 
 
 def settings_page(app: App, raw: dict | None = None, message: str | None = None, error: str | None = None) -> str:
@@ -415,55 +753,37 @@ def settings_page(app: App, raw: dict | None = None, message: str | None = None,
         out.append(f'<div class="box ok">{esc(message)}</div>')
     if error:
         out.append(f'<div class="box bad"><b>Not saved:</b> {esc(error)}</div>')
-    mode = raw.get("mode", "paper")
-    out.append(f'<div class="box">Mode: <b>{"REAL MONEY" if mode == "live" else "Paper (pretend money)"}</b>'
+    out.append(f'<div class="box">Mode: {mode_pill(raw.get("mode", "paper"))}'
                '<p class="hint">For safety, real-money mode can\'t be turned on from this page.</p></div>')
-    out.append('<form method="post" action="/settings">')
-    out.append("<h2>Markets</h2><div class=\"box\">" + "".join(
-        f'<div class="check"><input type="checkbox" name="market_{m}" value="1"'
-        f'{" checked" if m in markets else ""}><span>{esc(n)} 15-minute ({m})</span></div>'
-        for m, n in MARKETS) + f'<label>Other series (comma separated)</label>{inp("market_other", other, "text")}</div>')
-    out.append(
-        "<h2>Money and limits</h2><div class=\"box\">"
-        f'<label>Pretend starting money ($, paper mode)</label>{inp("paper_balance", plain(raw.get("paper_balance", 11)))}'
-        f'<label>How much of your Kalshi it can use (%)</label>{inp("balance_share_pct", plain(raw.get("balance_share_pct", 50)))}'
-        f'<div class="row"><div><label>Size per trade is</label><select name="size_mode">'
-        f'{opt([("contracts", "Contracts"), ("percent", "% of balance"), ("dollars", "Dollars")], size.get("mode", "contracts"))}'
-        f'</select></div><div><label>Amount</label>{inp("size_value", plain(size.get("value", 1)))}</div></div>'
-        f'<label>Most contracts per trade (0 = no cap)</label>{inp("max_contracts", plain(size.get("max_contracts", 1)), "numeric")}'
-        f'<div class="row"><div><label>Daily loss limit in</label><select name="loss_mode">'
-        f'{opt([("dollars", "Dollars"), ("percent", "% of the day\'s balance")], loss.get("mode", "dollars"))}'
-        f'</select></div><div><label>Stop after losing</label>{inp("loss_value", plain(loss.get("value", 5)))}</div></div>'
-        f'<label>Most trades per day (0 = no cap)</label>{inp("max_trades_per_day", plain(raw.get("max_trades_per_day", 0)), "numeric")}'
-        "</div>")
+    # The hidden first button makes Enter in a box save, instead of pressing the first Copy button.
+    out.append('<form method="post" action="/settings">'
+               '<button name="action" value="save" tabindex="-1" aria-hidden="true" '
+               'style="position:absolute;left:-9999px;width:1px">Save</button>')
     plays = raw.get("plays") or []
     out.append(f'<input type="hidden" name="play_count" value="{len(plays)}">')
-    for i, p in enumerate(plays):
-        c = p.get("conditions") or {}
-        pre = f"p{i}_"
-        out.append(
-            f'<h2>Play: {esc(p.get("name", f"play{i + 1}"))}</h2><div class="box">'
-            f'<input type="hidden" name="{pre}name" value="{esc(p.get("name", f"play{i + 1}"))}">'
-            f'<div class="check"><input type="checkbox" name="{pre}enabled" value="1"'
-            f'{" checked" if p.get("enabled", True) else ""}><span>This play is on</span></div>'
-            f'<label>What it buys</label><select name="{pre}buy">{opt(BUY_CHOICES, p.get("buy", "favorite"))}</select>'
-            f'<div class="row"><div><label>Lowest price (¢)</label>{inp(pre + "min", cents(p.get("min_price", 0.7)))}</div>'
-            f'<div><label>Highest price (¢)</label>{inp(pre + "max", cents(p.get("max_price", 0.85)))}</div></div>'
-            f'<div class="row"><div><label>Start (minutes left)</label>{inp(pre + "from", plain(p.get("act_from_minutes_left", 8)))}</div>'
-            f'<div><label>Stop (minutes left)</label>{inp(pre + "until", plain(p.get("act_until_minutes_left", 7)))}</div></div>'
-            f'<p class="hint">Example: 8 and 7 means it buys between 8 and 7 minutes before the market closes.</p>'
-            f'<div class="row"><div><label>Take profit at (¢, blank = off)</label>{inp(pre + "tp", cents(p.get("take_profit")))}</div>'
-            f'<div><label>Stop loss at (¢, blank = off)</label>{inp(pre + "sl", cents(p.get("stop_loss")))}</div></div>'
-            f'<p class="hint">Both blank = hold to the end and get $1 per contract if it wins.</p>'
-            f'<details><summary>Extra conditions</summary>'
-            f'<label>Extra cents it may pay above the price on screen</label>{inp(pre + "slip", plain(p.get("slippage_cents", 0)))}'
-            f'<label>Skip if the spread is wider than (¢, blank = off)</label>{inp(pre + "spread", plain(c.get("max_spread_cents")))}'
-            f'<label>Skip if fewer contracts are offered than (blank = off)</label>{inp(pre + "depth", plain(c.get("min_contracts_at_price")))}'
-            f'<label>Only buy if the side rose over the last N seconds (blank = off)</label>{inp(pre + "rising", plain(c.get("favorite_rising_seconds")))}'
-            f'<label>Only buy if the price is this many $ past the target (blank = off)</label>{inp(pre + "dist", plain(c.get("btc_distance_min_dollars")))}'
-            "</details></div>")
-    out.append('<button>Save settings</button>'
-               '<p class="hint">The bot restarts with the new settings in about 15 seconds. Open trades are kept.</p></form>')
+    out.extend(play_form(i, p, opt, inp) for i, p in enumerate(plays))
+    out.append('<div id="add"></div><button class="btn2" name="action" value="add">+ Add a play</button>')
+    out.append(
+        "<h2>Markets</h2><div class=\"box\">" + "".join(
+            f'<div class="check"><input type="checkbox" name="market_{m}" value="1"'
+            f'{" checked" if m in markets else ""}><span>{esc(n)} 15-minute</span></div>'
+            for m, n in MARKETS) + f'<label>Other series (comma separated)</label>{inp("market_other", other, "text")}</div>')
+    out.append(
+        '<h2>Money and limits (all plays)</h2><div class="box">'
+        f'<label>Pretend starting money ($, paper mode)</label>{inp("paper_balance", plain(raw.get("paper_balance", 11)))}'
+        f'<label>Most of your money in open bets at once (%)</label>{inp("balance_share_pct", plain(raw.get("balance_share_pct", 50)))}'
+        f'<div class="row2"><div><label>Default bet size</label><select name="size_mode">'
+        f'{opt(SIZE_CHOICES, size.get("mode", "contracts"))}</select></div>'
+        f'<div><label>Amount</label>{inp("size_value", plain(size.get("value", 1)))}</div></div>'
+        f'<label>Most contracts per bet (0 = no cap)</label>{inp("max_contracts", plain(size.get("max_contracts", 1)), "numeric")}'
+        '<p class="hint">Plays set to "Same as the default size" use these.</p>'
+        f'<div class="row2"><div><label>Daily loss limit in</label><select name="loss_mode">'
+        f'{opt(LOSS_CHOICES, loss.get("mode", "dollars"))}</select></div>'
+        f'<div><label>Stop after losing</label>{inp("loss_value", plain(loss.get("value", 5)))}</div></div>'
+        f'<label>Most bets per day (0 = no cap)</label>{inp("max_trades_per_day", plain(raw.get("max_trades_per_day", 0)), "numeric")}'
+        "</div>")
+    out.append('<div class="savebar"><button name="action" value="save">Save settings</button></div>'
+               '<p class="hint">The bot restarts with the new settings in about 15 seconds. Open bets are kept.</p></form>')
     return page("Settings", "".join(out), "settings")
 
 
@@ -533,13 +853,15 @@ class Handler(BaseHTTPRequestHandler):
         if not ok:
             return self._send(403, denied_page())
         if url.path == "/":
-            return self._send(200, status_page(self.app), set_cookie=from_link)
+            return self._send(200, overview_page(self.app), set_cookie=from_link)
+        if url.path == "/play":
+            return self._send(200, play_page(self.app, (query.get("name") or [""])[0]), set_cookie=from_link)
         if url.path == "/settings":
-            msg = "Saved. The bot is restarting with the new settings." if "saved" in query else None
-            return self._send(200, settings_page(self.app, message=msg), set_cookie=from_link)
+            done = (query.get("done") or [""])[0]
+            return self._send(200, settings_page(self.app, message=DONE_MESSAGES.get(done)), set_cookie=from_link)
         if url.path == "/trades.csv":
             s, _ = self.app.settings()
-            path = os.path.join(self.app.folder(s), "trades.csv") if s else ""
+            path = os.path.join(mode_folder(s), "trades.csv") if s else ""
             try:
                 with open(path, encoding="utf-8") as fh:
                     text = fh.read()
@@ -559,14 +881,14 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(403, denied_page())
         if url.path == "/settings":
             try:
-                self.app.save_form(form)
+                done, focus = self.app.save_form(form)
             except SettingsError as e:
                 try:
                     shown = form_to_raw(form, self.app.raw())
                 except SettingsError:
                     shown = None
                 return self._send(200, settings_page(self.app, raw=shown, error=str(e)))
-            return self._redirect("/settings?saved=1")
+            return self._redirect(f"/settings?done={done}" + (f"#play-{focus}" if focus is not None else ""))
         if url.path in ("/pause", "/resume"):
             self.app.set_paused(url.path == "/pause")
             return self._redirect("/")

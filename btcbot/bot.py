@@ -75,6 +75,7 @@ class Bot:
         now = self.clock.now()
         self._roll_day(now)
         quotes = self._fetch_quotes(now)
+        self._share_prices(quotes, now)
         for pos in list(self.state.open_positions()):
             q = quotes.get(pos.ticker)
             if q is not None:
@@ -92,6 +93,20 @@ class Bot:
         self._prune(quotes)
         self.ledger.save_state(self.state)
         return self._next_wait(quotes, now)
+
+    def _share_prices(self, quotes: dict, now: datetime) -> None:
+        """Save the latest prices for the website (best effort; never stops trading)."""
+        if not quotes:
+            return
+        rows = [{"ticker": q.ticker, "series": q.series,
+                 "close_time": q.close_time.isoformat() if q.close_time else None,
+                 "yes_bid": None if q.yes_bid is None else str(q.yes_bid),
+                 "yes_ask": None if q.yes_ask is None else str(q.yes_ask),
+                 "target": None if q.target is None else str(q.target)} for q in quotes.values()]
+        try:
+            self.ledger.save_market(now, rows)
+        except OSError as e:
+            self._say("market-file", f"could not save prices for the website ({e})")
 
     def _prune(self, quotes: dict) -> None:
         """Forget bookkeeping for markets that have closed, so files stay small."""
@@ -196,7 +211,7 @@ class Bot:
             log.warning("could not read balance (%s); not trading this second", e)
             return
         open_cost = sum((p.cost for p in self.state.open_positions()), Decimal("0"))
-        n = rules.size_contracts(self.s, balance, chk.limit, open_cost)
+        n = rules.size_contracts(self.s, balance, chk.limit, open_cost, play)
         if n <= 0:
             self._say(key, f"{play.name}: skip {q.ticker}: trade size works out to 0 contracts "
                            f"(balance ${balance:.2f}, price {chk.limit}, share and size limits)")

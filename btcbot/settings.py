@@ -41,6 +41,24 @@ class Conditions:
 
 
 @dataclass
+class Size:
+    mode: str                     # contracts | dollars | percent (of balance)
+    value: Decimal
+    max_contracts: Decimal        # 0 = no cap
+
+
+SIZE_MODES = ("percent", "contracts", "dollars")
+
+
+def _size(raw: dict, name: str, default_max) -> Size:
+    mode = str(raw.get("mode", "contracts")).lower()
+    if mode not in SIZE_MODES:
+        raise SettingsError(f"{name}.mode must be percent, contracts or dollars, got {mode!r}")
+    return Size(mode, _dec(raw.get("value", 1), f"{name}.value", 0),
+                _dec(raw.get("max_contracts", default_max) or 0, f"{name}.max_contracts", 0))
+
+
+@dataclass
 class Play:
     name: str
     enabled: bool
@@ -53,6 +71,7 @@ class Play:
     take_profit: Decimal | None
     stop_loss: Decimal | None
     conditions: Conditions
+    size: Size | None = None      # None = use the default size
 
     @property
     def has_exits(self) -> bool:
@@ -83,10 +102,19 @@ class Settings:
     def live(self) -> bool:
         return self.mode == "live"
 
+    @property
+    def default_size(self) -> Size:
+        return Size(self.size_mode, self.size_value, self.max_contracts)
+
+    def size_for(self, play: Play | None) -> Size:
+        return play.size if play is not None and play.size is not None else self.default_size
+
 
 def _play(raw: dict, i: int) -> Play:
-    name = str(raw.get("name") or f"play{i + 1}")
+    name = str(raw.get("name") or f"play{i + 1}").strip()
     p = f"plays[{name}]"
+    if "|" in name or len(name) > 40:
+        raise SettingsError(f"play name {name!r}: use up to 40 characters and no | sign")
     buy = str(raw.get("buy", "favorite")).lower()
     if buy not in ("favorite", "underdog", "up", "down", "yes", "no"):
         raise SettingsError(f"{p}.buy must be favorite, underdog, up or down, got {buy!r}")
@@ -111,8 +139,10 @@ def _play(raw: dict, i: int) -> Play:
         favorite_rising_seconds=_dec(c.get("favorite_rising_seconds"), f"{p}.favorite_rising_seconds", 1, 900, True),
         btc_distance_min_dollars=_dec(c.get("btc_distance_min_dollars"), f"{p}.btc_distance_min_dollars", 0, None, True),
     )
+    size = raw.get("size")
     return Play(name, bool(raw.get("enabled", True)), buy, lo, hi, start, end,
-                _dec(raw.get("slippage_cents", 0), f"{p}.slippage_cents", 0, 20), tp, sl, conditions)
+                _dec(raw.get("slippage_cents", 0), f"{p}.slippage_cents", 0, 20), tp, sl, conditions,
+                _size(size, f"{p}.size", 0) if isinstance(size, dict) and size else None)
 
 
 def parse(raw: dict) -> Settings:
@@ -127,10 +157,7 @@ def parse(raw: dict) -> Settings:
     markets = raw.get("markets") or ["KXBTC15M"]
     if not isinstance(markets, list) or not all(isinstance(m, str) and m for m in markets):
         raise SettingsError("markets must be a list like [KXBTC15M]")
-    size = raw.get("size") or {}
-    size_mode = str(size.get("mode", "contracts")).lower()
-    if size_mode not in ("percent", "contracts", "dollars"):
-        raise SettingsError(f"size.mode must be percent, contracts or dollars, got {size_mode!r}")
+    size = _size(raw.get("size") or {}, "size", 1)
     loss = raw.get("daily_loss_limit") or {}
     loss_mode = str(loss.get("mode", "dollars")).lower()
     if loss_mode not in ("percent", "dollars"):
@@ -149,9 +176,9 @@ def parse(raw: dict) -> Settings:
         markets=markets,
         paper_balance=_dec(raw.get("paper_balance", 20), "paper_balance", 0),
         balance_share_pct=_dec(raw.get("balance_share_pct", 50), "balance_share_pct", 0, 100),
-        size_mode=size_mode,
-        size_value=_dec(size.get("value", 1), "size.value", 0),
-        max_contracts=_dec(size.get("max_contracts", 1), "size.max_contracts", 0),
+        size_mode=size.mode,
+        size_value=size.value,
+        max_contracts=size.max_contracts,
         daily_loss_mode=loss_mode,
         daily_loss_value=_dec(loss.get("value", 5), "daily_loss_limit.value", 0),
         max_trades_per_day=int(raw.get("max_trades_per_day", 0) or 0),

@@ -8,6 +8,7 @@ import unittest
 import urllib.error
 import urllib.parse
 import urllib.request
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal as D
 
 import yaml
@@ -38,7 +39,7 @@ def good_form(**over):
         "loss_mode": "dollars", "loss_value": "4", "max_trades_per_day": "0", "play_count": "1",
         "p0_name": "main", "p0_enabled": "1", "p0_buy": "favorite", "p0_min": "75", "p0_max": "88",
         "p0_slip": "0", "p0_from": "1", "p0_until": "0", "p0_tp": "", "p0_sl": "40",
-        "p0_spread": "3", "p0_depth": "", "p0_rising": "", "p0_dist": "",
+        "p0_spread": "3", "p0_depth": "", "p0_rising": "", "p0_dist": "", "p0_size_mode": "default",
     }
     form.update(over)
     return form
@@ -137,26 +138,46 @@ class TestStatus(WebCase):
         self.call("/resume", data={"key": KEY})
         self.assertFalse(os.path.exists(os.path.join(folder, "STOP")))
 
-    def test_shows_trades_positions_and_activity(self):
+    def setup_bets(self):
         folder = mode_folder(load(self.path))
         ledger = Ledger(folder)
         state = ledger.load_state(D(11))
         state.paper_cash = "10.18"
+        close = (datetime.now(timezone.utc) + timedelta(minutes=6)).isoformat()
         state.set_positions([Position("main", "KXBTC15M-X", "KXBTC15M", "no", "1", "0.80", "0.02",
-                                      "2026-11-22T03:00:00+00:00", "2026-11-22T03:15:00+00:00")])
+                                      "2026-11-22T03:00:00+00:00", close)])
         ledger.save_state(state)
-        ledger.record_trade({"opened_at": "2026-11-22T02:52:00+00:00", "closed_at": "2026-11-22T03:00:20+00:00",
-                             "mode": "paper", "play": "main", "market": "KXBTC15M-Y", "side": "DOWN",
-                             "contracts": "1", "entry_price": "0.80", "entry_fee": "0.02", "exit_type": "settled",
-                             "exit_price": "1", "exit_fee": "0", "result": "DOWN", "payout": "1", "profit": "0.18"})
+        ledger.save_market(datetime.now(timezone.utc), [
+            {"ticker": "KXBTC15M-X", "series": "KXBTC15M", "close_time": close,
+             "yes_bid": "0.12", "yes_ask": "0.14", "target": "59229.55"}])
+        add_trade(ledger, "main", "0.18", side="DOWN", result="DOWN")
         with open(os.path.join(folder, "bot.log"), "w") as fh:
-            fh.write("2026-11-21 17:07:30 INFO main: BOUGHT KXBTC15M-X DOWN x1 at 0.80\n")
+            fh.write("2026-11-21 17:07:30 INFO main: BOUGHT KXBTC15M-X DOWN x1 at 0.80\n"
+                     "2026-11-21 17:08:00 INFO cheap: skip KXBTC15M-X: UP costs 0.14\n")
+        return folder
+
+    def test_overview_shows_money_market_and_plays(self):
+        self.setup_bets()
         _, body, _ = self.call(f"/?key={KEY}")
         self.assertIn("Running", body)
         self.assertIn("$10.18", body)
-        self.assertIn("DOWN won", body)
         self.assertIn("5:07 pm", body)
-        self.assertIn("Open trades", body)
+        self.assertIn("1 open", body)
+        self.assertIn("target $59,229.55", body)          # live market card
+        self.assertIn("88¢", body)                         # buying Down costs 1 - Up's bid (0.12)
+        self.assertIn('href="/play?name=main"', body)
+
+    def test_play_page_shows_its_own_bets(self):
+        self.setup_bets()
+        _, body, _ = self.call(f"/play?name=main&key={KEY}")
+        self.assertIn("Open bets · 1", body)
+        self.assertIn("now 86¢", body)                     # selling Down gets 1 - Up's ask (0.14)
+        self.assertIn("Closed bets · 1", body)
+        self.assertIn("DOWN won", body)
+        self.assertIn("main: BOUGHT", body)
+        self.assertNotIn("cheap: skip", body)              # only this play's activity
+        _, body, _ = self.call(f"/play?name=nothing&key={KEY}")
+        self.assertIn("No play called", body)
         status, csv_text, headers = self.call("/trades.csv", cookie=f"btcbot_key={KEY}")
         self.assertIn("text/csv", headers["Content-Type"])
         self.assertIn("KXBTC15M-Y", csv_text)
@@ -168,23 +189,30 @@ class TestStatus(WebCase):
         self.assertIn("Settings problem", body)
 
 
-class TestPlaysAndUpdates(WebCase):
-    def add_trade(self, ledger, play, profit):
-        ledger.record_trade({"opened_at": "2026-11-22T02:52:00+00:00", "closed_at": "2026-11-22T03:00:20+00:00",
-                             "mode": "paper", "play": play, "market": "KXBTC15M-Y", "side": "UP",
-                             "contracts": "1", "entry_price": "0.10", "entry_fee": "0.01", "exit_type": "settled",
-                             "exit_price": "0", "exit_fee": "0", "result": "DOWN", "payout": "0", "profit": profit})
+def add_trade(ledger, play, profit, side="UP", result="DOWN", exit_type="settled", exit_price="0", price="0.10"):
+    ledger.record_trade({"opened_at": "2026-11-22T02:52:00+00:00", "closed_at": "2026-11-22T03:00:20+00:00",
+                         "mode": "paper", "play": play, "market": "KXBTC15M-Y", "side": side,
+                         "contracts": "1", "entry_price": price, "entry_fee": "0.01", "exit_type": exit_type,
+                         "exit_price": exit_price, "exit_fee": "0", "result": result, "payout": "0",
+                         "profit": profit})
 
-    def test_each_play_gets_its_own_score(self):
+
+class TestPlaysAndUpdates(WebCase):
+    def test_each_play_gets_its_own_page_and_score(self):
         ledger = Ledger(mode_folder(load(self.path)))
-        self.add_trade(ledger, "main", "0.18")
-        self.add_trade(ledger, "cheap", "-0.11")
-        self.add_trade(ledger, "cheap", "-0.11")
+        add_trade(ledger, "main", "0.18")
+        add_trade(ledger, "cheap", "-0.11")
+        add_trade(ledger, "cheap", "0.13", exit_type="take_profit", exit_price="0.25", result="")
         _, body, _ = self.call(f"/?key={KEY}")
-        self.assertIn("Score for each play", body)
-        section = body.split("Score for each play")[1].split("</table>")[0]
-        self.assertIn("<td>main</td><td>1</td>", section)
-        self.assertIn("<td>cheap</td><td>2</td>", section)
+        self.assertIn('href="/play?name=cheap"', body)
+        self.assertIn("REMOVED", body)                    # cheap is not in the settings any more
+        _, body, _ = self.call(f"/play?name=cheap&key={KEY}")
+        self.assertIn("1 won · 1 lost", body)
+        self.assertIn("sold at 25¢ (take profit)", body)
+        self.assertNotIn("Edit this play", body)
+        _, body, _ = self.call(f"/play?name=main&key={KEY}")
+        self.assertIn("1 won · 0 lost", body)
+        self.assertIn("Edit this play", body)
 
     def test_update_button(self):
         app = self.server.RequestHandlerClass.app
@@ -209,6 +237,82 @@ class TestPlaysAndUpdates(WebCase):
     def test_status_page_shows_version(self):
         _, body, _ = self.call(f"/?key={KEY}")
         self.assertIn("Get the newest version", body)
+
+
+class TestPlayButtons(WebCase):
+    def form_from_page(self):
+        """Every field as the settings page shows it now, like a browser would send."""
+        _, body, _ = self.call("/settings", cookie=f"btcbot_key={KEY}")
+        import re
+        form = {"key": KEY}
+        for name, value in re.findall(r'<input name="([^"]+)" value="([^"]*)"', body):
+            form[name] = value.replace("&amp;", "&")
+        for name in re.findall(r'<input type="checkbox" name="([^"]+)" value="1" checked>', body):
+            form[name] = "1"
+        for name, opts in re.findall(r'<select name="([^"]+)">(.*?)</select>', body):
+            chosen = re.search(r'<option value="([^"]+)" selected>', opts)
+            form[name] = chosen.group(1) if chosen else re.search(r'<option value="([^"]+)"', opts).group(1)
+        form["play_count"] = re.search(r'name="play_count" value="(\d+)"', body).group(1)
+        return form
+
+    def test_add_copy_rename_and_delete(self):
+        form = self.form_from_page()
+        status, _, headers = self.call("/settings", data=dict(form, action="add"))
+        self.assertEqual(status, 303)
+        self.assertIn("done=added#play-2", headers["Location"])
+        s = load(self.path)
+        self.assertEqual([p.name for p in s.plays], ["main", "second", "new play"])
+        self.assertFalse(s.plays[2].enabled)
+
+        form = self.form_from_page()
+        self.call("/settings", data=dict(form, action="copy:0"))
+        s = load(self.path)
+        self.assertEqual([p.name for p in s.plays], ["main", "main copy", "second", "new play"])
+        self.assertFalse(s.plays[1].enabled)
+        self.assertEqual(s.plays[1].min_price, s.plays[0].min_price)
+
+        form = self.form_from_page()
+        form["p1_name"] = "cheap 25"
+        form["p1_enabled"] = "1"
+        form["p1_buy"] = "underdog"
+        form["p1_min"], form["p1_max"], form["p1_from"], form["p1_until"] = "5", "15", "15", "11"
+        form["p1_tp"] = "25"
+        form["p1_size_mode"], form["p1_size_value"] = "dollars", "3"
+        self.call("/settings", data=dict(form, action="save"))
+        s = load(self.path)
+        cheap = s.plays[1]
+        self.assertEqual((cheap.name, cheap.enabled, cheap.buy), ("cheap 25", True, "underdog"))
+        self.assertEqual((cheap.min_price, cheap.max_price, cheap.take_profit), (D("0.05"), D("0.15"), D("0.25")))
+        self.assertEqual((cheap.size.mode, cheap.size.value, cheap.size.max_contracts), ("dollars", D(3), D(0)))
+        self.assertIsNone(s.plays[0].size)                 # main keeps the default size
+        _, body, _ = self.call("/settings", cookie=f"btcbot_key={KEY}")
+        self.assertIn('name="p1_size_value" value="3"', body)
+
+        form = self.form_from_page()
+        self.call("/settings", data=dict(form, action="delete:3"))
+        self.assertEqual([p.name for p in load(self.path).plays], ["main", "cheap 25", "second"])
+
+    def test_buttons_with_bad_input_save_nothing(self):
+        before = read(self.path)
+        form = self.form_from_page()
+        form["p0_name"] = "a|b"
+        _, body, _ = self.call("/settings", data=dict(form, action="add"))
+        self.assertIn("Not saved", body)
+        form = self.form_from_page()
+        form["p1_name"] = "main"
+        _, body, _ = self.call("/settings", data=dict(form, action="save"))
+        self.assertIn("its own name", body)
+        form = self.form_from_page()
+        _, body, _ = self.call("/settings", data=dict(form, action="delete:9"))
+        self.assertIn("please reload the page", body)
+        self.assertEqual(read(self.path), before)
+
+    def test_cannot_delete_the_only_play(self):
+        form = self.form_from_page()
+        self.call("/settings", data=dict(form, action="delete:1"))
+        form = self.form_from_page()
+        _, body, _ = self.call("/settings", data=dict(form, action="delete:0"))
+        self.assertIn("at least one play", body)
 
 
 class TestRestartOnChange(unittest.TestCase):

@@ -88,9 +88,11 @@ def cmd_check(settings) -> None:
             exits.append(f"take profit at {p.take_profit}")
         if p.stop_loss is not None:
             exits.append(f"stop loss at {p.stop_loss}")
+        size = settings.size_for(p)
         print(f"- play '{p.name}' ({'ON' if p.enabled else 'off'}): buy {p.buy} at {p.min_price}-{p.max_price}, "
               f"from {p.act_from_minutes_left} to {p.act_until_minutes_left} min left, "
-              f"{', '.join(exits) or 'hold to the end'}")
+              f"{', '.join(exits) or 'hold to the end'}; size {size.value} {size.mode}"
+              f"{'' if p.size else ' (default)'}")
     client = make_client(settings, need_key=settings.live)
     now = RealClock().now()
     for series in settings.markets:

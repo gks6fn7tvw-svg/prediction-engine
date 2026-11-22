@@ -97,11 +97,23 @@ to keep the server. It stays free as long as you use only this one small server.
 
 ## The bot's website (phone friendly)
 
-The bot comes with a small private website. It shows whether the bot is
-running, the balance, today's result, the score and verdict, open and recent
-trades, and recent activity. The Settings page changes every setting, and there
-is a Pause button. Saved settings are checked first; the bot then restarts with
-them in about 15 seconds and keeps its open trades.
+The bot comes with a small private website.
+
+- **Overview:** running or not, balance, today and all-time profit, the live
+  market (price to buy Up and Down, minutes left), a card for each play, recent
+  activity, Pause, and "Get the newest version".
+- **Each play's page:** its score (bets, win rate, the win rate it needs,
+  profit, verdict), its open bets with what they could sell for right now, its
+  closed bets, and its own activity.
+- **Settings:** every setting. Plays can be added, copied, renamed and deleted,
+  and each play can have its own bet size (or use the default). Saved settings
+  are checked first; the bot then restarts with them in about 15 seconds and
+  keeps its open bets.
+- **Get the newest version** downloads new code and restarts the bot and the
+  site, so updates don't need Google Cloud.
+
+For plays that sell early (take profit or stop loss), the win rate they need is
+worked out from their average win and average loss, not from the price paid.
 
 On the Google Cloud server (startup-script setup):
 

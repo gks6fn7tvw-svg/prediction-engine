@@ -266,6 +266,68 @@ class TestLimits(BotCase):
         self.assertEqual(rules.size_contracts(s2, D("11"), D("0.80"), D("4")), D(4))
 
 
+class TestPlaySizes(BotCase):
+    def test_play_can_have_its_own_size(self):
+        cheap = {"name": "cheap", "buy": "underdog", "min_price": 0.05, "max_price": 0.15,
+                 "act_from_minutes_left": 15, "act_until_minutes_left": 11, "take_profit": 0.25,
+                 "size": {"mode": "dollars", "value": 3}}
+        s = parse(base_settings(plays=[base_settings()["plays"][0], cheap]))
+        main, cheap_play = s.plays
+        self.assertIsNone(main.size)
+        self.assertEqual(rules.size_contracts(s, D("11"), D("0.10"), D("0"), main), D(1))       # default: 1
+        self.assertEqual(rules.size_contracts(s, D("11"), D("0.10"), D("0"), cheap_play), D(30))  # $3 / 10c (fee on top)
+        self.assertEqual(rules.size_contracts(s, D("11"), D("0.10"), D("0")), D(1))
+
+    def test_play_size_cap_and_bad_size(self):
+        s = parse(base_settings(plays=[dict(base_settings()["plays"][0],
+                                            size={"mode": "dollars", "value": 3, "max_contracts": 10})]))
+        self.assertEqual(rules.size_contracts(s, D("11"), D("0.10"), D("0"), s.plays[0]), D(10))
+        with self.assertRaises(SettingsError):
+            parse(base_settings(plays=[dict(base_settings()["plays"][0], size={"mode": "lots", "value": 3})]))
+        with self.assertRaises(SettingsError):
+            parse(base_settings(plays=[dict(base_settings()["plays"][0], name="a|b")]))
+
+    def test_two_plays_trade_the_same_market_with_their_own_sizes(self):
+        cheap = {"name": "cheap", "buy": "underdog", "min_price": 0.05, "max_price": 0.15,
+                 "act_from_minutes_left": 15, "act_until_minutes_left": 11, "take_profit": 0.25,
+                 "size": {"mode": "dollars", "value": 3}}
+        self.make(plays=[base_settings()["plays"][0], cheap], balance_share_pct=100)
+        self.at(13, 0.10, 0.12)             # Up is the underdog at 12c: cheap buys $3 worth
+        self.at(7.5, 0.18, 0.20)            # Down is the favorite at 82c: main buys 1
+        pos = {p.play: p for p in self.bot.state.open_positions()}
+        self.assertEqual((pos["cheap"].side, D(pos["cheap"].contracts)), ("yes", D(25)))  # $3 / 12c
+        self.assertEqual((pos["main"].side, D(pos["main"].contracts)), ("no", D(1)))
+        self.at(5, 0.26, 0.28)              # Up bid 26c >= 25c: cheap takes profit, main holds
+        rows = self.trades()
+        self.assertEqual([(r["play"], r["exit_type"]) for r in rows], [("cheap", "take_profit")])
+        self.assertEqual([p.play for p in self.bot.state.open_positions()], ["main"])
+
+    def test_bot_saves_prices_for_the_website(self):
+        self.make()
+        self.at(7.5, 0.20, 0.22)
+        with open(os.path.join(self.dir, "market.json")) as fh:
+            m = json.load(fh)
+        self.assertEqual(m["markets"][0]["ticker"], TICKER)
+        self.assertEqual((m["markets"][0]["yes_bid"], m["markets"][0]["yes_ask"]), ("0.2000", "0.2200"))
+
+
+class TestBreakEven(unittest.TestCase):
+    def row(self, profit, exit_type="settled", price="0.10"):
+        return {"profit": profit, "entry_fee": "0.01", "exit_fee": "0", "contracts": "1",
+                "entry_price": price, "exit_type": exit_type}
+
+    def test_held_to_the_end_uses_price_plus_fees(self):
+        from btcbot.ledger import stats
+        st = stats([self.row("0.18", price="0.80"), self.row("-0.82", price="0.80")])
+        self.assertAlmostEqual(st["need"], 0.81)
+
+    def test_selling_early_uses_average_win_and_loss(self):
+        from btcbot.ledger import stats
+        # buy at 10c, win 12c when it sells at 25c, lose 11c otherwise: needs 11 / 23 = 48%, not 11%
+        rows = [self.row("0.12", "take_profit"), self.row("-0.11"), self.row("-0.11")]
+        self.assertAlmostEqual(stats(rows)["need"], 11 / 23, places=3)
+
+
 class TestConditions(unittest.TestCase):
     def play(self, **c):
         s = parse(base_settings(plays=[{"name": "p", "buy": "favorite", "min_price": 0.5, "max_price": 0.95,

@@ -72,6 +72,14 @@ class Ledger:
             json.dump(asdict(state), fh, indent=2)
         os.replace(tmp, self.state_path)  # never leaves a half-written file
 
+    def save_market(self, now, rows: list) -> None:
+        """Latest prices, for the website."""
+        path = os.path.join(self.folder, "market.json")
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump({"updated": now.isoformat(), "markets": rows}, fh)
+        os.replace(tmp, path)
+
     def record_trade(self, row: dict) -> None:
         new = not os.path.exists(self.trades_path)
         with open(self.trades_path, "a", newline="", encoding="utf-8") as fh:
@@ -97,7 +105,15 @@ def stats(rows: list[dict]) -> dict:
     contracts = sum((Decimal(r["contracts"]) for r in rows), Decimal("0"))
     cost = sum((Decimal(r["contracts"]) * Decimal(r["entry_price"]) for r in rows), Decimal("0"))
     rate = wins / n if n else 0.0
+    # Win rate needed to break even. Held to the end, a contract pays $1 or 0,
+    # so it is the price paid plus fees. Plays that sell early win and lose
+    # other amounts, so there it comes from the average win and average loss.
     need = float((cost + fees) / contracts) if contracts else 0.0
+    won = [Decimal(r["profit"]) for r in rows if Decimal(r["profit"]) > 0]
+    lost = [-Decimal(r["profit"]) for r in rows if Decimal(r["profit"]) <= 0]
+    if won and lost and any(r["exit_type"] != "settled" for r in rows):
+        avg_win, avg_loss = sum(won) / len(won), sum(lost) / len(lost)
+        need = float(avg_loss / (avg_win + avg_loss)) if avg_win + avg_loss > 0 else need
     luck = luck_margin(rate, n) if n else 0.0
     return {
         "trades": n, "wins": wins, "losses": n - wins, "win_rate": rate, "profit": profit,
@@ -122,7 +138,7 @@ def score(trades_path: str, mode: str | None = None) -> str:
             f"== {name} ==",
             f"Trades: {n}   Wins: {st['wins']}   Losses: {st['losses']}   Win rate: {100 * st['win_rate']:.1f}%",
             f"Average price paid: {st['avg_price'] * 100:.1f}c   Fees paid: ${st['fees']:.2f}",
-            f"To break even you need to win about {st['need'] * 100:.1f}% of contracts (price + fees).",
+            f"To break even it needs to win about {st['need'] * 100:.1f}% of trades.",
             f"Total profit after fees: ${st['profit']:+.2f}",
             f"Luck can move a win rate this much with {n} trades: about +/-{100 * st['luck']:.1f} points.",
             st["verdict"],

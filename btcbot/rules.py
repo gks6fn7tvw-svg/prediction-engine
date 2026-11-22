@@ -193,19 +193,24 @@ def _price_seconds_ago(history, now: datetime, seconds: Decimal) -> Decimal | No
     return best
 
 
-def size_contracts(s: Settings, balance: Decimal, price: Decimal, open_cost: Decimal) -> Decimal:
-    """How many whole contracts to buy, after every money limit."""
+def size_contracts(s: Settings, balance: Decimal, price: Decimal, open_cost: Decimal,
+                   play: Play | None = None) -> Decimal:
+    """How many whole contracts to buy, after every money limit.
+
+    Uses the play's own size when it has one, otherwise the default size.
+    """
     if price <= 0:
         return Decimal("0")
-    if s.size_mode == "contracts":
-        n = s.size_value
-    elif s.size_mode == "dollars":
-        n = s.size_value / price
+    size = s.size_for(play)
+    if size.mode == "contracts":
+        n = size.value
+    elif size.mode == "dollars":
+        n = size.value / price
     else:  # percent of balance
-        n = balance * s.size_value / 100 / price
+        n = balance * size.value / 100 / price
     n = n.to_integral_value(rounding=ROUND_FLOOR)
-    if s.max_contracts > 0:
-        n = min(n, s.max_contracts)
+    if size.max_contracts > 0:
+        n = min(n, size.max_contracts)
     # "How much of your Kalshi it can use": money in open trades stays under this share.
     room = (balance + open_cost) * s.balance_share_pct / 100 - open_cost
     while n > 0 and n * price + taker_fee(n, price) > room:

@@ -463,7 +463,12 @@ class Bot:
         if self.state.alert:
             return "paused by the records check; see the website"
         if os.path.exists(self.stop_file):
-            return f"STOP file found, so no new trades (delete {self.stop_file} to resume)"
+            try:
+                with open(self.stop_file, encoding="utf-8") as fh:
+                    why = fh.read().strip().splitlines()[0][:200]
+            except (OSError, IndexError):
+                why = ""
+            return "paused, so no new bets (tap Resume on the website)" + (f": {why}" if why else "")
         limit = rules.daily_loss_limit(self.s, Decimal(self.state.day_start_balance))
         if limit > 0 and Decimal(self.state.day_profit) <= -limit:
             return f"daily loss limit hit (${-Decimal(self.state.day_profit):.2f} lost today); done until tomorrow"

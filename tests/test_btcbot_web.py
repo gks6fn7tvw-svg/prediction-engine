@@ -142,6 +142,7 @@ class TestStatus(WebCase):
         self.assertTrue(os.path.exists(os.path.join(folder, "STOP")))
         _, body, _ = self.call(f"/?key={KEY}")
         self.assertIn("Paused", body)
+        self.assertIn("Why: Pause button tapped on the website", body)
         self.call("/resume", data={"key": KEY})
         self.assertFalse(os.path.exists(os.path.join(folder, "STOP")))
 

@@ -427,7 +427,9 @@ class App:
         os.makedirs(folder, exist_ok=True)
         stop = os.path.join(folder, "STOP")
         if paused:
-            open(stop, "w").close()
+            with open(stop, "w", encoding="utf-8") as fh:
+                when = datetime.now(ZoneInfo(s.day_timezone)).strftime("%b %d %I:%M %p")
+                fh.write(f"Pause button tapped on the website ({when})\n")
         elif os.path.exists(stop):
             os.remove(stop)
 
@@ -754,7 +756,9 @@ def overview_page(app: App, secure: bool = False) -> str:
         parts.append(f'<div class="box bad"><b>⚠️ {esc(st.alert)}</b> Open bets still finish.'
                      '<form method="post" action="/resume"><button>Resume betting</button></form></div>')
     elif d["paused"]:
+        why = pause_reason(d["folder"])
         parts.append('<div class="box warn"><b>Paused:</b> no new bets. Open bets still finish.'
+                     + (f'<p class="hint">Why: {esc(why)}</p>' if why else "") +
                      '<form method="post" action="/resume"><button>Resume betting</button></form></div>')
     if app.moved:
         parts.append(f'<div class="box ok">{esc(app.moved)}</div>')
@@ -820,13 +824,22 @@ def overview_page(app: App, secure: bool = False) -> str:
     if log:
         parts.append('<h2>Recent activity</h2><div class="box log">' + esc("\n".join(log)) + "</div>")
     if not d["paused"]:
-        parts.append('<form method="post" action="/pause"><button class="btn2">Pause new bets</button></form>')
+        parts.append('<form method="post" action="/pause"><button class="btn2" onclick="return confirm('
+                     '\'Pause new bets? Open bets still finish.\')">Pause new bets</button></form>')
     parts.append(f'<h2>Bot version</h2><div class="box">Version {esc(code_version())}'
                  '<form method="post" action="/update"><button class="btn2">Get the newest version</button></form>'
                  '<p class="hint">Only needed when Claude tells you there\'s an update. Takes about a minute. '
                  'Open bets are kept.</p></div>'
                  '<p class="hint">Numbers update live while this page is open.</p>')
     return page("Kalshi bot", "".join(parts), "status", live="/api/live", sig=d["sig"])
+
+
+def pause_reason(folder: str) -> str:
+    try:
+        with open(os.path.join(folder, "STOP"), encoding="utf-8") as fh:
+            return fh.read().strip().splitlines()[0][:300]
+    except (OSError, IndexError):
+        return ""
 
 
 def money_section(d: dict) -> str:
@@ -849,6 +862,10 @@ def money_section(d: dict) -> str:
     to_choices = "".join(f'<option value="{n}"{" selected" if n == first_sub else ""}>{esc(account_name(n))}</option>'
                          for n in numbers)
     notice = f'<p class="hint">Last money move: {esc(st.notice)}</p>' if st and st.notice else ""
+    if numbers == [0]:   # nothing to move between yet
+        return ('<h2 id="money">Kalshi money</h2><div class="box">' + rows + notice +
+                '<p class="hint">Every play that\'s on uses your main account, so there\'s nothing to move. '
+                'This matters later, when plays get their own subaccounts.</p></div>')
     return ('<h2 id="money">Kalshi money</h2><div class="box">' + rows + notice +
             '<form method="post" action="/transfer">'
             f'<div class="row2"><div><label>Move from</label><select name="from">{choices}</select></div>'

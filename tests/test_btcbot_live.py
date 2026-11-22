@@ -274,3 +274,57 @@ class TestMoneyMoves(LiveCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class SequenceSession:
+    """Replies in order: e.g. a 429 first, then a normal answer."""
+
+    def __init__(self, replies):
+        from test_btcbot import FakeResponse
+        self.replies = [FakeResponse(code, body) for code, body in replies]
+        self.calls = []
+
+    def request(self, method, url, params=None, json=None, headers=None, timeout=None):
+        self.calls.append((method, url))
+        return self.replies.pop(0)
+
+
+class TestTooManyRequests(unittest.TestCase):
+    def client(self, replies):
+        from cryptography.hazmat.primitives.asymmetric import rsa
+        session = SequenceSession(replies)
+        c = KalshiClient(key_id="kid", private_key=rsa.generate_private_key(public_exponent=65537, key_size=2048),
+                         session=session)
+        self.slept = []
+        c.sleep = self.slept.append
+        return c, session
+
+    def test_reads_wait_and_ask_once_more(self):
+        c, session = self.client([(429, {"error": {"code": "too_many_requests"}}),
+                                  (200, {"balance": 1167, "balance_dollars": "11.6700"})])
+        self.assertEqual(c.balance_dollars(), D("11.67"))
+        self.assertEqual(len(session.calls), 2)
+        self.assertIn(1.2, self.slept)
+
+    def test_orders_are_never_resent(self):
+        c, session = self.client([(429, {"error": {"code": "too_many_requests"}})])
+        with self.assertRaises(KalshiError):
+            c.place_ioc(TICKER, "bid", D(1), D("0.80"))
+        self.assertEqual(len(session.calls), 1)
+
+    def test_balance_checks_are_spaced_out(self):
+        c, _ = self.client([(200, {"balance_dollars": "1.00"}), (200, {"balance_dollars": "1.00"})])
+        c.balance_dollars()
+        c.balance_dollars()
+        self.assertTrue(self.slept and self.slept[-1] > 0.9)     # waited about a second before the 2nd
+
+    def test_broker_remembers_the_balance_briefly(self):
+        ex = FakeExchange()
+        calls = []
+        real = ex.balance_dollars
+        ex.balance_dollars = lambda subaccount=0: calls.append(subaccount) or real(subaccount)
+        broker = LiveBroker(ex)
+        broker.balance(0)
+        broker.balance()
+        broker.balances()
+        self.assertEqual(len(calls), 1)

@@ -81,14 +81,18 @@ class LiveBroker:
         self._cache: tuple[float, dict] = (0.0, {})
 
     def balances(self) -> dict[int, Decimal]:
-        """Cash per subaccount. One call covers all of them (Kalshi limits balance calls to 1 a second)."""
-        if self.accounts == [0]:
-            return {0: self.client.balance_dollars()}
+        """Cash per subaccount, remembered for a moment (Kalshi limits balance checks to about 1 a second).
+
+        With only the main account in use it's one balance check; otherwise one call covers all.
+        """
         now = time.monotonic()
         if self._cache[1] and now - self._cache[0] < self.BALANCE_CACHE_SECONDS:
             return self._cache[1]
-        b = self.client.subaccount_balances()
-        self._cache = (now, b)
+        if self.accounts == [0]:
+            b = {0: self.client.balance_dollars()}
+        else:
+            b = self.client.subaccount_balances()
+        self._cache = (time.monotonic(), b)
         return b
 
     def balance(self, account: int | None = None) -> Decimal:

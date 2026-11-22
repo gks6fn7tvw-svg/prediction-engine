@@ -84,6 +84,8 @@ class KalshiClient:
         self.private_key = private_key
         self.timeout = timeout
         self.session = session or requests.Session()  # keeps the connection open
+        self.sleep = time.sleep
+        self._last_balance = 0.0
 
     # ---- plumbing -------------------------------------------------------
     def _headers(self, method: str, path: str) -> dict:
@@ -105,6 +107,13 @@ class KalshiClient:
             headers["Content-Type"] = "application/json"
         resp = self.session.request(method, self.base_url + path, params=params, json=body,
                                     headers=headers, timeout=self.timeout)
+        if resp.status_code == 429 and method == "GET":
+            # Kalshi's "too many requests": wait a moment and ask once more. Orders are never
+            # resent this way (a refused order just didn't happen, and the bot decides what's next).
+            self.sleep(1.2)
+            headers = self._headers(method, path) if signed else headers
+            resp = self.session.request(method, self.base_url + path, params=params, json=body,
+                                        headers=headers, timeout=self.timeout)
         if resp.status_code >= 400:
             raise KalshiError(resp.status_code, resp.text)
         return resp.json() if resp.content else {}
@@ -125,8 +134,15 @@ class KalshiClient:
     # `subaccount` 0 is the main account; 1-63 are numbered subaccounts, which
     # keep their own money and positions (so two plays can hold opposite sides).
     def balance_dollars(self, subaccount: int = 0) -> Decimal:
+        # Kalshi allows about one balance check a second (Basic and Advanced levels).
+        wait = 1.1 - (time.monotonic() - self._last_balance)
+        if wait > 0:
+            self.sleep(wait)
         params = {"subaccount": subaccount} if subaccount else None
-        data = self._request("GET", "/portfolio/balance", params=params, signed=True)
+        try:
+            data = self._request("GET", "/portfolio/balance", params=params, signed=True)
+        finally:
+            self._last_balance = time.monotonic()
         if data.get("balance_dollars") not in (None, ""):
             return Decimal(str(data["balance_dollars"]))
         return Decimal(int(data.get("balance", 0))) / 100

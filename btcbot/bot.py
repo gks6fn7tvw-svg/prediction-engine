@@ -416,12 +416,15 @@ class Bot:
             return
         self.last_accounts = now
         try:
-            if getattr(self.broker, "accounts", [0]) == [0]:
+            if hasattr(self.broker, "balances"):
+                cash = self.broker.balances()          # shares the bot's remembered balance
+            elif getattr(self.broker, "accounts", [0]) == [0]:
                 cash = {0: self.client.balance_dollars()}
             else:
                 cash = self.client.subaccount_balances()
         except Exception as e:
             log.warning("could not read Kalshi balances (%s)", e)
+            self.last_accounts = now - timedelta(seconds=ACCOUNTS_SECONDS - 5)   # try again in 5 seconds
             return
         self.state.accounts = {str(k): str(v) for k, v in sorted(cash.items())}
 

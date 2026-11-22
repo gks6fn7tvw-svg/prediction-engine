@@ -76,8 +76,11 @@ def cmd_run(settings, path: str = DEFAULT_PATH) -> None:
     state = ledger.load_state(settings.paper_balance)
     if settings.live:
         broker = LiveBroker(client)
-        logging.getLogger("btcbot").warning("LIVE MODE: real money. Main account balance $%.2f",
-                                            broker.balance(0))
+        try:
+            logging.getLogger("btcbot").warning("LIVE MODE: real money. Main account balance $%.2f",
+                                                broker.balance(0))
+        except Exception as e:  # the bot keeps going; it reads the balance again when it needs it
+            logging.getLogger("btcbot").warning("LIVE MODE: real money (balance not read yet: %s)", e)
     else:
         broker = PaperBroker(Decimal(state.paper_cash))
     bot = Bot(settings, client, broker, ledger, state, RealClock())

@@ -168,6 +168,49 @@ class TestStatus(WebCase):
         self.assertIn("Settings problem", body)
 
 
+class TestPlaysAndUpdates(WebCase):
+    def add_trade(self, ledger, play, profit):
+        ledger.record_trade({"opened_at": "2026-11-22T02:52:00+00:00", "closed_at": "2026-11-22T03:00:20+00:00",
+                             "mode": "paper", "play": play, "market": "KXBTC15M-Y", "side": "UP",
+                             "contracts": "1", "entry_price": "0.10", "entry_fee": "0.01", "exit_type": "settled",
+                             "exit_price": "0", "exit_fee": "0", "result": "DOWN", "payout": "0", "profit": profit})
+
+    def test_each_play_gets_its_own_score(self):
+        ledger = Ledger(mode_folder(load(self.path)))
+        self.add_trade(ledger, "main", "0.18")
+        self.add_trade(ledger, "cheap", "-0.11")
+        self.add_trade(ledger, "cheap", "-0.11")
+        _, body, _ = self.call(f"/?key={KEY}")
+        self.assertIn("Score for each play", body)
+        section = body.split("Score for each play")[1].split("</table>")[0]
+        self.assertIn("<td>main</td><td>1</td>", section)
+        self.assertIn("<td>cheap</td><td>2</td>", section)
+
+    def test_update_button(self):
+        app = self.server.RequestHandlerClass.app
+        calls = []
+        app.updater = lambda: True
+        app.restarter = lambda path: calls.append(path) or True
+        _, body, _ = self.call("/update", data={"key": KEY})
+        self.assertIn("Updated", body)
+        self.assertEqual(calls, [self.path])
+        app.updater = lambda: False
+        _, body, _ = self.call("/update", data={"key": KEY})
+        self.assertIn("Already the newest", body)
+        self.assertEqual(len(calls), 1)
+
+        def broken():
+            raise RuntimeError("couldn't reach GitHub")
+        app.updater = broken
+        _, body, _ = self.call("/update", data={"key": KEY})
+        self.assertIn("Not updated", body)
+        self.assertEqual(self.call("/update", data={"key": "wrong"})[0], 403)
+
+    def test_status_page_shows_version(self):
+        _, body, _ = self.call(f"/?key={KEY}")
+        self.assertIn("Get the newest version", body)
+
+
 class TestRestartOnChange(unittest.TestCase):
     def test_watcher_notices_a_saved_file(self):
         d = tempfile.mkdtemp()

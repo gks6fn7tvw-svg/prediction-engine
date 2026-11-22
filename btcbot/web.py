@@ -11,6 +11,9 @@ import hmac
 import html
 import os
 import secrets
+import subprocess
+import sys
+import threading
 import time
 from decimal import Decimal
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -25,6 +28,7 @@ from .settings import (PACKAGE_DIR, Settings, SettingsError, load, load_raw, mod
 KEY_FILE_ENV = "BTCBOT_WEB_KEY_FILE"
 MARKETS = [("KXBTC15M", "Bitcoin"), ("KXETH15M", "Ethereum"), ("KXSOL15M", "Solana"), ("KXXRP15M", "XRP")]
 BUY_CHOICES = [("favorite", "The favorite"), ("underdog", "The underdog"), ("up", "Always Up"), ("down", "Always Down")]
+REPO_DIR = os.path.dirname(PACKAGE_DIR)
 COOKIE = "btcbot_key"
 MAX_BODY = 64_000
 
@@ -45,6 +49,59 @@ def load_key(path: str | None = None) -> str:
     with os.fdopen(fd, "w") as fh:
         fh.write(key + "\n")
     return key
+
+
+# ---------------------------------------------------------------- updates
+def _git(*args, timeout=90):
+    return subprocess.run(["git", "-C", REPO_DIR, *args], capture_output=True, text=True, timeout=timeout)
+
+
+def code_version() -> str:
+    try:
+        r = _git("log", "-1", "--format=%h (%cs)", timeout=10)
+        return r.stdout.strip() or "unknown"
+    except (OSError, subprocess.SubprocessError):
+        return "unknown"
+
+
+def update_code() -> bool:
+    """Download the newest bot code the same way the server does at boot.
+
+    Returns True if the code changed. Raises RuntimeError with a plain reason.
+    """
+    try:
+        branch = _git("rev-parse", "--abbrev-ref", "HEAD").stdout.strip() or "btcbot"
+        before = _git("rev-parse", "HEAD").stdout.strip()
+        for b in dict.fromkeys([branch, "main"]):
+            if _git("fetch", "--depth", "1", "origin", b).returncode == 0:
+                break
+        else:
+            raise RuntimeError("couldn't reach GitHub. Try again in a few minutes.")
+        r = _git("checkout", "-q", "-f", "-B", b, "FETCH_HEAD")
+        if r.returncode:
+            raise RuntimeError("couldn't switch to the new code: " + r.stderr.strip()[-300:])
+        after = _git("rev-parse", "HEAD").stdout.strip()
+        pip = subprocess.run([sys.executable, "-m", "pip", "install", "-q", "-r",
+                              os.path.join(PACKAGE_DIR, "requirements.txt")],
+                             capture_output=True, text=True, timeout=600)
+        if pip.returncode:
+            raise RuntimeError("couldn't install python packages: " + pip.stderr.strip()[-300:])
+        return before != after
+    except (OSError, subprocess.SubprocessError) as e:
+        raise RuntimeError(f"update failed: {e}")
+
+
+def restart_soon(settings_path: str) -> bool:
+    """Restart the bot (it restarts when its settings file changes) and this website.
+
+    Returns False when not running under systemd, where nothing would bring
+    the website back.
+    """
+    os.utime(settings_path, None)
+    if not os.environ.get("INVOCATION_ID"):
+        return False
+    threading.Timer(1.5, os._exit, (0,)).start()
+    return True
 
 
 # ---------------------------------------------------------------- helpers
@@ -88,6 +145,8 @@ class App:
     def __init__(self, settings_path: str, key: str):
         self.settings_path = settings_path
         self.key = key
+        self.updater = update_code
+        self.restarter = restart_soon
 
     # -- reading
     def settings(self) -> tuple[Settings | None, str | None]:
@@ -185,7 +244,7 @@ nav a.on{background:#2b5cff}.badge{display:inline-block;padding:2px 10px;border-
 .box{background:#1c1f26;border-radius:14px;padding:14px;margin:10px 0}.ok{border-left:4px solid #34c37a}.bad{border-left:4px solid #ff5c5c}.warn{border-left:4px solid #f4b740}
 .cards{display:grid;grid-template-columns:repeat(3,1fr);gap:8px}.card{background:#1c1f26;border-radius:14px;padding:12px}.card b{display:block;font-size:20px}.card span{color:#9aa0a6;font-size:13px}
 .pos{color:#5ee08f}.neg{color:#ff7b7b}table{width:100%;border-collapse:collapse;font-size:14px}td,th{padding:7px 4px;border-bottom:1px solid #2a2e37;text-align:left}th{color:#9aa0a6;font-weight:500}
-.log{font:13px/1.5 ui-monospace,Menlo,monospace;white-space:pre-wrap;color:#c4c7cc}button,.btn{background:#2b5cff;color:#fff;border:0;border-radius:10px;padding:12px 16px;font-size:16px;width:100%;margin-top:8px}
+.log{font:13px/1.5 ui-monospace,Menlo,monospace;white-space:pre-wrap;color:#c4c7cc}button,.btn{display:block;text-align:center;text-decoration:none;background:#2b5cff;color:#fff;border:0;border-radius:10px;padding:12px 16px;font-size:16px;width:100%;margin-top:8px}
 .btn2{background:#30343d}label{display:block;margin:10px 0 4px;color:#c4c7cc;font-size:14px}input,select{width:100%;padding:10px;border-radius:10px;border:1px solid #3a3f4a;background:#0f1115;color:#e8eaed;font-size:16px}
 .row{display:grid;grid-template-columns:1fr 1fr;gap:10px}.check{display:flex;gap:10px;align-items:center;margin:8px 0}.check input{width:22px;height:22px}
 .hint{color:#9aa0a6;font-size:13px;margin:2px 0}details{margin-top:10px}summary{cursor:pointer;color:#8ab4ff}
@@ -292,6 +351,16 @@ def status_page(app: App) -> str:
             f'<div class="box"><b>Win rate {100 * total["win_rate"]:.0f}%</b> · needs about '
             f'{100 * total["need"]:.0f}% to break even · luck range ±{100 * total["luck"]:.0f} points'
             f'<p class="hint">{esc(total["verdict"])}</p></div>')
+    plays_seen = list(dict.fromkeys(r["play"] for r in rows))
+    if plays_seen:
+        items = ""
+        for name in plays_seen:
+            ps = L.stats([r for r in rows if r["play"] == name])
+            items += (f"<tr><td>{esc(name)}</td><td>{ps['trades']}</td><td>{100 * ps['win_rate']:.0f}%</td>"
+                      f"<td>{100 * ps['need']:.0f}%</td><td>{money(ps['profit'])}</td></tr>")
+        parts.append("<h2>Score for each play</h2><div class=\"box\"><table><tr><th>Play</th><th>Trades</th>"
+                     f"<th>Wins</th><th>Needs</th><th>Profit</th></tr>{items}</table>"
+                     '<p class="hint">"Needs" is the win rate that play must beat to make money at the prices it paid.</p></div>')
     parts.append("<h2>What it's doing</h2><div class=\"box\">" +
                  "<br>".join(describe_play(p) for p in s.plays if p.enabled) +
                  f'<p class="hint">Watching: {esc(", ".join(s.markets))}. Closes are at :00, :15, :30 and :45.</p></div>')
@@ -318,6 +387,10 @@ def status_page(app: App) -> str:
         parts.append('<h2>Recent activity</h2><div class="box log">' + esc("\n".join(log)) + "</div>")
     if not paused:
         parts.append('<form method="post" action="/pause"><button class="btn btn2">Pause new trades</button></form>')
+    parts.append(f'<h2>Bot version</h2><div class="box">Version {esc(code_version())}'
+                 '<form method="post" action="/update"><button class="btn btn2">Get the newest version</button></form>'
+                 '<p class="hint">Only needed when Claude tells you there\'s an update. Takes about a minute. '
+                 'Open trades are kept.</p></div>')
     parts.append('<p class="hint">This page refreshes by itself every 30 seconds.</p>')
     return page("Kalshi bot", "".join(parts), "status", refresh=30)
 
@@ -497,6 +570,20 @@ class Handler(BaseHTTPRequestHandler):
         if url.path in ("/pause", "/resume"):
             self.app.set_paused(url.path == "/pause")
             return self._redirect("/")
+        if url.path == "/update":
+            try:
+                changed = self.app.updater()
+            except RuntimeError as e:
+                return self._send(200, page("Update", f'<div class="box bad"><b>Not updated:</b> {esc(e)}</div>'
+                                            '<a class="btn" href="/">Back</a>', "status"))
+            if not changed:
+                return self._send(200, page("Update", '<div class="box ok">Already the newest version.</div>'
+                                            '<a class="btn" href="/">Back</a>', "status"))
+            restarting = self.app.restarter(self.app.settings_path)
+            note = ("Updated. The bot and this page are restarting. This page comes back by itself in about "
+                    "20 seconds." if restarting else
+                    "Updated. The bot is restarting. Restart this website yourself to use its new version.")
+            return self._send(200, page("Update", f'<div class="box ok">{note}</div>', "status", refresh="20;url=/"))
         return self._send(404, page("Not found", '<div class="box">Not found.</div>', ""))
 
 

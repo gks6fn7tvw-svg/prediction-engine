@@ -358,3 +358,30 @@ class TestSetupAfterFirstBet(LiveCase):
         self.client.open = [market(0.50, 0.52, close=CLOSE + timedelta(minutes=15))]
         self.bot.step()
         self.assertEqual(calls, [1])
+
+
+class TestNotFilledReplies(LiveCase):
+    def test_contracts_that_arrive_anyway_are_recorded_once(self):
+        ex = FakeExchange()
+        real = ex.place_ioc
+
+        def says_not_filled(*a, **kw):
+            reply = real(*a, **kw)
+            return dict(reply, fill_count="0.00", average_fill_price=None)
+        ex.place_ioc = says_not_filled
+        self.make([MAIN], ex)
+        self.at(7.5, 0.80, 0.82)
+        self.at(7.4, 0.80, 0.82)
+        self.assertEqual(len(ex.orders), 1)                  # no second order
+        pos = self.bot.state.open_positions()
+        self.assertEqual((len(pos), D(pos[0].contracts)), (1, D(1)))
+
+    def test_real_misses_are_retried(self):
+        ex = FakeExchange()
+        ex.place_ioc = lambda *a, **kw: (ex.orders.append(1) or
+                                         {"order_id": "x", "fill_count": "0.00", "remaining_count": "0.00"})
+        self.make([MAIN], ex)
+        self.at(7.5, 0.80, 0.82)
+        self.at(7.4, 0.80, 0.82)
+        self.assertEqual(len(ex.orders), 2)
+        self.assertEqual(self.bot.state.open_positions(), [])

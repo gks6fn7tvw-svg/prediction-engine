@@ -542,6 +542,12 @@ class Bot:
                 self.state.entered.append(key)
                 self.ledger.save_state(self.state)
                 return
+        if fill is None and self.broker.live:
+            # Double-check with Kalshi: if contracts showed up anyway, record them (never buy twice).
+            fill = self._recover_buy(q, chk.side, chk.limit, mult, acct)
+            if fill is not None:
+                log.warning("%s: Kalshi's reply said 'not filled' but the contracts are there; recorded them",
+                            play.name)
         if fill is None:
             self._say(key, f"{play.name}: {q.ticker}: price moved before the order filled; will retry")
             return

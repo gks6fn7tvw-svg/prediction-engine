@@ -101,6 +101,7 @@ class TestTradeBox(WebCase):
         _, body, _ = self.call(f"/?key={KEY}")
         self.assertIn("Make a trade", body)
         self.assertIn("▲ Buy Up", body)
+        self.assertLess(body.index("▼ Buy Down"), body.index("▲ Buy Up"))     # Down left, Up right, like the prices
         self.call("/trade", data={"key": KEY, "action": "buy", "side": "no", "contracts": "3", "max": "40",
                                   "series": "KXBTC15M"})
         with open(self.trade_file()) as fh:

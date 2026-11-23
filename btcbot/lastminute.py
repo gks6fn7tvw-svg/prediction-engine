@@ -262,17 +262,26 @@ SCORE_COLUMNS = ["time", "market", "seconds_left", "chance_up", "up_cost", "down
                  "down_score", "best", "best_score", "level", "result", "best_won"]
 
 
-def confidence(chance: float, steady_seconds: float, pulling_away: bool) -> int:
-    """How much to trust the pick: 1 shaky (still flipping or under 65%), 2 steady, 3 strong.
+def confidence(chance: float) -> int:
+    """How sure the pick is to win: 1, 2 or 3 (price doesn't matter here).
 
-    Example: Down picked for 3+ minutes, our chance 88%, and Bitcoin moving further below the
-    target -> 3. Same pick but it switched sides 40 seconds ago -> 1.
+    From the backtest (1,328 Bitcoin markets, Nov 9-23 2026), picks in each band won:
+    1 = our chance under 70%   -> about 6 in 10
+    2 = 70% up to 90%          -> about 8 in 10
+    3 = 90% or more            -> about 19 in 20
+    Being steady for minutes or "pulling away" didn't change how often a pick won once
+    the chance was known, so they're left out. Example: Down at 93% -> 3, at 72% -> 2.
     """
-    if steady_seconds >= 180 and chance >= 0.85 and pulling_away:
+    if chance >= 0.90:
         return 3
-    if steady_seconds >= 120 and chance >= 0.65:
+    if chance >= 0.70:
         return 2
     return 1
+
+
+LEVEL_WORDS = {1: "about 6 in 10", 2: "about 8 in 10", 3: "about 19 in 20"}
+
+
 CHECKPOINTS = (600, 300, 240, 180, 120, 60, 30)   # seconds left when a score is written down
 
 

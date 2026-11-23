@@ -265,6 +265,23 @@ class TestPlayButtons(WebCase):
         form["play_count"] = re.search(r'name="play_count" value="(\d+)"', body).group(1)
         return form
 
+    def test_add_the_deal_play(self):
+        form = self.form_from_page()
+        _, body, _ = self.call("/settings", cookie=f"btcbot_key={KEY}")
+        self.assertIn('value="add_deal"', body)
+        self.call("/settings", data=dict(form, action="add_deal"))
+        s = load(self.path)
+        deal = s.plays[-1]
+        self.assertEqual((deal.name, deal.enabled, deal.pretend, deal.buy), ("deal", True, True, "pick"))
+        self.assertEqual((deal.act_from_minutes_left, deal.act_until_minutes_left), (D(5), D(1)))
+        self.assertEqual((deal.conditions.min_score, deal.size.value, deal.size.max_contracts), (D(7), D(1), D(1)))
+        _, body, _ = self.call("/settings", cookie=f"btcbot_key={KEY}")
+        self.assertNotIn('value="add_deal"', body)          # only offered while there's no "our pick" play
+        form = self.form_from_page()                       # saving again keeps everything
+        self.call("/settings", data=dict(form, action="save"))
+        deal = load(self.path).plays[-1]
+        self.assertEqual((deal.buy, deal.conditions.min_score, deal.pretend), ("pick", D(7), True))
+
     def test_add_copy_rename_and_delete(self):
         form = self.form_from_page()
         status, _, headers = self.call("/settings", data=dict(form, action="add"))

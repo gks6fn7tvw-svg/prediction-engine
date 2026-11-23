@@ -40,7 +40,7 @@ plays:
   - name: main
     enabled: true
 
-    # What it buys: favorite | underdog | up | down
+    # What it buys: favorite | underdog | up | down | pick (the side our chance says wins)
     buy: favorite
     min_price: 0.70        # only buy if it costs at least 70c
     max_price: 0.85        # and at most 85c
@@ -62,6 +62,7 @@ plays:
       min_contracts_at_price: null    # skip if fewer contracts are offered at that price
       favorite_rising_seconds: null   # the side must be higher than it was this many seconds ago
       btc_distance_min_dollars: null  # price must be this many $ past the target (uses Coinbase)
+      min_score: null                 # 1-10: only buy if the live score for that side is at least this
 
   # Second play (optional). Off until you set enabled: true.
   - name: second

@@ -164,8 +164,6 @@ class Bot:
         self.sigma_fn = sigma_fn or (lambda coin: lastminute.candles_sigma(client.session, coin))
         self.sigmas: dict = {}
         self.scores: dict = {}
-        self.picks: dict = {}                       # ticker -> (picked side, since when)
-        self.gaps = defaultdict(lambda: deque(maxlen=400))   # ticker -> (time, $ from target)
         self.estimates: dict[str, lastminute.Estimate] = {}
         self.plays = {p.name: p for p in settings.plays}
         self.history = defaultdict(lambda: deque(maxlen=2000))
@@ -541,6 +539,7 @@ class Bot:
             q = quotes.get(pos.ticker)
             if q is not None:
                 self._maybe_exit(pos, q)
+        self._score(quotes, now)     # before entries: "our pick" plays and the score check use it
         reason = self._entry_block_reason()
         if reason is None:
             spots = self._spots(quotes, now)
@@ -551,7 +550,6 @@ class Bot:
         else:
             self._say("block", reason)
         self._watch(quotes, now)
-        self._score(quotes, now)
         self._share_prices(quotes, now)
         self._settle(now)
         self.check_records(quotes, now)
@@ -567,10 +565,10 @@ class Bot:
         rows = []
         for q in quotes.values():
             row = q.as_row()
-            sc = self.scores.get(q.ticker)
+            sc = self.scores.get(q.ticker) if self.s.watch.score else None
             if sc is not None:
                 row.update(chance_up=f"{sc['chance_up']:.3f}", score_up=sc["up"], score_down=sc["down"],
-                           score_best=sc["best"], score_level=sc["level"], score_steady=sc["steady"])
+                           score_best=sc["best"], score_level=sc["level"])
             est = self.estimates.get(q.ticker)
             if est is not None:
                 row.update(est_projected=str(est.projected.quantize(Decimal("0.01"))),
@@ -1043,7 +1041,7 @@ class Bot:
         key = f"{play.name}|{q.ticker}"
         if key in self.state.entered or self.state.attempts.get(key, 0) >= MAX_ORDER_TRIES:
             return
-        chk = rules.check_entry(play, q, now, self.history.get(q.ticker), spot)
+        chk = rules.check_entry(play, q, now, self.history.get(q.ticker), spot, self.scores.get(q.ticker))
         if not chk.ok:
             if chk.reason != "outside time window":
                 self._say(key, f"{play.name}: skip {q.ticker}: {chk.reason}")
@@ -1484,9 +1482,14 @@ class Bot:
             self.sigmas[coin] = hit = (now, value)
         return hit[1]
 
+    @property
+    def needs_score(self) -> bool:
+        """A play that buys "our pick" or checks the score needs our chance even if the card is off."""
+        return any(p.enabled and (p.buy == "pick" or p.conditions.min_score is not None) for p in self.s.plays)
+
     def _score(self, quotes: dict, now: datetime) -> None:
         """Our chance for each side vs Kalshi's price, as 1-10 (5 = fair), plus snapshots to check later."""
-        if not self.s.watch.score:
+        if not (self.s.watch.score or self.needs_score):
             return
         spot_cache: dict = {}
         for q in quotes.values():
@@ -1517,28 +1520,16 @@ class Bot:
             su = lastminute.score(p, float(up_ask) if up_ask is not None else None)
             sd = lastminute.score(1 - p, float(down_ask) if down_ask is not None else None)
             best = "yes" if p >= 0.5 else "no"      # the side we think will win (its score says if it's a deal)
-            # How steady is the pick? Same side for how long, and is Bitcoin pulling away from the target?
-            side_since = self.picks.get(q.ticker)
-            if side_since is None or side_since[0] != best:
-                side_since = self.picks[q.ticker] = (best, now)
-            gap = mean - float(q.target)
-            hist = self.gaps[q.ticker]
-            hist.append((now, gap))
-            ago = next((g for t, g in hist if (now - t).total_seconds() <= 75), gap)
-            toward = 1 if best == "yes" else -1
-            pulling = gap * toward > 0 and gap * toward > ago * toward + 1
             chance_best = p if best == "yes" else 1 - p
-            level = lastminute.confidence(chance_best, (now - side_since[1]).total_seconds(), pulling)
-            steady = int((now - side_since[1]).total_seconds())
-            self.scores[q.ticker] = {"chance_up": p, "up": su, "down": sd, "best": best, "level": level,
-                                     "steady": steady}
-            self._score_snapshot(q, now, left, p, up_ask, down_ask, su, sd, best, level)
+            level = lastminute.confidence(chance_best)
+            self.scores[q.ticker] = {"chance_up": p, "up": su, "down": sd, "best": best, "level": level}
+            if self.s.watch.score:
+                self._score_snapshot(q, now, left, p, up_ask, down_ask, su, sd, best, level)
         for ticker in list(self.scores):
             if ticker not in quotes:
                 del self.scores[ticker]
-                self.picks.pop(ticker, None)
-                self.gaps.pop(ticker, None)
-        self._score_resolve(now)
+        if self.s.watch.score:
+            self._score_resolve(now)
 
     def _score_snapshot(self, q, now, left, p, up_ask, down_ask, su, sd, best, level=1) -> None:
         pending = self.state.score_pending.setdefault(q.ticker, {"close": q.close_time.isoformat(), "snaps": []})

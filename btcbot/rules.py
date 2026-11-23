@@ -120,11 +120,15 @@ def favorite(q: Quote) -> str | None:
     return "yes" if mid > Decimal("0.5") else "no"
 
 
-def pick_side(play: Play, q: Quote) -> str | None:
+def pick_side(play: Play, q: Quote, score: dict | None = None) -> str | None:
     if play.buy == "up":
         return "yes"
     if play.buy == "down":
         return "no"
+    if play.buy == "pick":      # the side our chance says will win (from the live score)
+        if not score or score.get("chance_up") is None:
+            return None
+        return "yes" if score["chance_up"] >= 0.5 else "no"
     fav = favorite(q)
     if fav is None:
         return None
@@ -156,13 +160,19 @@ class EntryCheck:
     limit: Decimal | None = None
 
 
-def check_entry(play: Play, q: Quote, now: datetime, history=None, spot: Decimal | None = None) -> EntryCheck:
-    """Decide whether `play` wants to buy in this market right now (ignores money)."""
+def check_entry(play: Play, q: Quote, now: datetime, history=None, spot: Decimal | None = None,
+                score: dict | None = None) -> EntryCheck:
+    """Decide whether `play` wants to buy in this market right now (ignores money).
+
+    `score` is the bot's live score for this market: {"chance_up", "up", "down"} (1-10 each).
+    """
     mins = q.minutes_left(now)
     if not in_window(play, mins):
         return EntryCheck(False, "outside time window")
-    side = pick_side(play, q)
+    side = pick_side(play, q, score)
     if side is None:
+        if play.buy == "pick":
+            return EntryCheck(False, "our chance isn't ready yet (needs Bitcoin's price and how jumpy it's been)")
         return EntryCheck(False, "no clear favorite (prices missing or exactly 50/50)")
     ask = q.ask(side)
     if ask is None:
@@ -197,6 +207,12 @@ def check_entry(play: Play, q: Quote, now: datetime, history=None, spot: Decimal
             where = f"only ${gap:,.0f} past" if gap >= 0 else f"${-gap:,.0f} on the wrong side of"
             return EntryCheck(False, f"Bitcoin is {where} the target (wanted ${c.btc_distance_min_dollars} past)",
                               side, ask)
+    if c.min_score is not None:
+        got = (score or {}).get("up" if side == "yes" else "down")
+        if not isinstance(got, int):
+            return EntryCheck(False, f"no live score for {side_name(side)} yet", side, ask)
+        if got < c.min_score:
+            return EntryCheck(False, f"{side_name(side)} scores {got} (wanted {c.min_score} or more)", side, ask)
     limit = min(play.max_price, ask + play.slippage_cents * CENT)
     return EntryCheck(True, "ok", side, ask, limit)
 

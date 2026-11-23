@@ -38,6 +38,7 @@ class Conditions:
     min_contracts_at_price: Decimal | None = None
     favorite_rising_seconds: Decimal | None = None
     btc_distance_min_dollars: Decimal | None = None
+    min_score: Decimal | None = None          # only buy if the live score for that side is at least this (1-10)
 
 
 @dataclass
@@ -62,7 +63,7 @@ def _size(raw: dict, name: str, default_max) -> Size:
 class Play:
     name: str
     enabled: bool
-    buy: str                      # favorite | underdog | up | down
+    buy: str                      # favorite | underdog | up | down | pick (the side our chance says wins)
     min_price: Decimal
     max_price: Decimal
     act_from_minutes_left: Decimal
@@ -137,9 +138,9 @@ def _play(raw: dict, i: int) -> Play:
     if "|" in name or len(name) > 40:
         raise SettingsError(f"play name {name!r}: use up to 40 characters and no | sign")
     buy = str(raw.get("buy", "favorite")).lower()
-    if buy not in ("favorite", "underdog", "up", "down", "yes", "no"):
-        raise SettingsError(f"{p}.buy must be favorite, underdog, up or down, got {buy!r}")
-    buy = {"yes": "up", "no": "down"}.get(buy, buy)
+    if buy not in ("favorite", "underdog", "up", "down", "yes", "no", "pick", "our pick", "our_pick"):
+        raise SettingsError(f"{p}.buy must be favorite, underdog, up, down or pick, got {buy!r}")
+    buy = {"yes": "up", "no": "down", "our pick": "pick", "our_pick": "pick"}.get(buy, buy)
     lo = _dec(raw.get("min_price", 0.01), f"{p}.min_price", 0.01, 0.99)
     hi = _dec(raw.get("max_price", 0.99), f"{p}.max_price", 0.01, 0.99)
     if lo > hi:
@@ -159,6 +160,7 @@ def _play(raw: dict, i: int) -> Play:
         min_contracts_at_price=_dec(c.get("min_contracts_at_price"), f"{p}.min_contracts_at_price", 0, None, True),
         favorite_rising_seconds=_dec(c.get("favorite_rising_seconds"), f"{p}.favorite_rising_seconds", 1, 900, True),
         btc_distance_min_dollars=_dec(c.get("btc_distance_min_dollars"), f"{p}.btc_distance_min_dollars", 0, None, True),
+        min_score=_dec(c.get("min_score"), f"{p}.min_score", 1, 10, True),
     )
     size = raw.get("size")
     sub = _dec(raw.get("subaccount", 0) or 0, f"{p}.subaccount", 0, 63)

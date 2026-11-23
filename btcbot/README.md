@@ -243,11 +243,13 @@ second in the last minutes). It compares **our chance** with **Kalshi's price**:
 Our chance (`lastminute.chance_up`): how far Bitcoin is from the target, how jumpy it has
 been (Coinbase 1-minute candles, last 30 minutes, refreshed each minute), how much time is
 left, and in the final minute how much of the settlement average is already counted (the
-running estimate above). The badge sits on the side we think will win, as score plus a small confidence number:
-¹ shaky (the pick switched in the last 2 minutes, or our chance is under 65%), ² steady
-(same side 2+ minutes, 65%+), ³ strong (same side 3+ minutes, 85%+, and Bitcoin moving
-further from the target over the last minute). Example: 8² = a good price on a steady
-call; 5³ = almost sure but no bargain; 9¹ = a bargain that is still flipping.
+running estimate above). The badge sits on the side we think will win, as score plus a
+small number for **how sure that side is to win** (price doesn't change it). From the
+backtest of 1,328 Bitcoin markets (Nov 9-23 2026), picks in each band won:
+¹ under 70% → about 6 in 10 · ² 70-90% → about 8 in 10 · ³ 90%+ → about 19 in 20.
+Being steady for minutes or "pulling away" didn't change how often a pick won once the
+chance was known, so they aren't part of it. Example: 8² = likely winner at a good price;
+5³ = almost sure but no bargain (the price already says so).
 It assumes moves are random, so news or one huge order can still
 beat it. Snapshots at 10, 5, 4, 3, 2, 1 minutes and 30 seconds left are checked after each
 close (`scores.csv`, "Score track record" on the Overview). On the first night of data the
@@ -260,6 +262,19 @@ history showed more moves). For the market that's running, the bot now reads the
 order book every step (`KalshiClient.best_prices`), so the website, the score and the
 plays all use the current price. If Kalshi refuses the order book (401/403), it falls
 back to the list's prices and says so in the log.
+
+## The deal play (our pick + score)
+
+Two settings make it: **What it buys → Our pick** (the side our chance says will win) and
+**Only buy if its live score is at least 7** (under Extra conditions). The button
+"+ Add the deal play (pretend money)" sets it up: 5 to 1 minutes left, 1 contract, any price.
+
+Why: in the backtest, buying the likely winner at Kalshi's price lost a little at every
+level (Kalshi's price already knows who's likely to win, and the fee takes the rest).
+Main (favorite 70-85¢ at 8-7 minutes) lost $16.53 over 642 bets. The one rule that made
+money was our pick with a score of 7+ in the last 5 minutes: 73 bets, won about 3 in 4 at
+about 62¢, +$7.49, up in both weeks. Only 2 weeks of minute snapshots, so it starts with
+pretend money.
 
 ## Backtest data (Settings → Collect history)
 

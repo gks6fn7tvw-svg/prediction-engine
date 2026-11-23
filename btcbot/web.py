@@ -42,7 +42,8 @@ from .settings import (LIVE_CONFIRM_TEXT, PACKAGE_DIR, SIZE_MODES, Settings, Set
 
 KEY_FILE_ENV = "BTCBOT_WEB_KEY_FILE"
 MARKETS = [("KXBTC15M", "Bitcoin"), ("KXETH15M", "Ethereum"), ("KXSOL15M", "Solana"), ("KXXRP15M", "XRP")]
-BUY_CHOICES = [("favorite", "The favorite"), ("underdog", "The underdog"), ("up", "Always Up"), ("down", "Always Down")]
+BUY_CHOICES = [("favorite", "The favorite"), ("underdog", "The underdog"), ("up", "Always Up"), ("down", "Always Down"),
+               ("pick", "Our pick (the side our chance says wins)")]
 SIZE_CHOICES = [("contracts", "Contracts"), ("dollars", "Dollars"), ("percent", "% of balance")]
 LOSS_CHOICES = [("dollars", "Dollars"), ("percent", "% of the day's balance")]
 EXIT_WORDS = {"take_profit": "take profit", "stop_loss": "stop loss"}
@@ -58,6 +59,8 @@ DONE_MESSAGES = {
     "saved": "Saved. The bot restarts with the new settings in about 15 seconds.",
     "added": "Added a new play. It starts switched off: set it up, tick \"This play is on\", then Save.",
     "copied": "Copied. The copy starts switched off: change it, tick \"This play is on\", then Save.",
+    "deal": "Added the deal play with pretend money: it buys our pick when its score is 7 or more, 5 to 1 minutes "
+            "before the close, 1 contract. It's already on.",
     "deleted": "Deleted. Its past bets stay in the trade list.",
     "reset": "Pretend money reset. The bot picks it up within a few seconds; past bets are kept.",
 }
@@ -213,8 +216,19 @@ def new_play(names: list) -> dict:
         "min_price": 0.7, "max_price": 0.85, "act_from_minutes_left": 8, "act_until_minutes_left": 7,
         "slippage_cents": 0, "take_profit": None, "stop_loss": None,
         "conditions": {"max_spread_cents": None, "min_contracts_at_price": None,
-                       "favorite_rising_seconds": None, "btc_distance_min_dollars": None},
+                       "favorite_rising_seconds": None, "btc_distance_min_dollars": None, "min_score": None},
     }
+
+
+def deal_play(names: list) -> dict:
+    """The backtest's best rule (Nov 9-23 2026): our pick with a score of 7+ in the last 5 minutes
+    won about 3 in 4 at about 62c and made money both weeks. Starts on, with pretend money."""
+    p = new_play(names)
+    p.update(name=unique_name("deal", names) if "deal" in names else "deal", enabled=True, pretend=True,
+             buy="pick", min_price=0.01, max_price=0.99, act_from_minutes_left=5, act_until_minutes_left=1,
+             size={"mode": "contracts", "value": 1, "max_contracts": 1})
+    p["conditions"]["min_score"] = 7
+    return p
 
 
 def size_words(size) -> str:
@@ -232,6 +246,8 @@ def size_words(size) -> str:
 
 def describe_play(p, s: Settings) -> str:
     buy = dict(BUY_CHOICES).get(p.buy, p.buy).lower()
+    if p.conditions.min_score is not None:
+        buy += f" when its score is {float(p.conditions.min_score):g} or more"
     exits = []
     if p.take_profit is not None:
         exits.append(f"sells at {cents_text(p.take_profit)} or more")
@@ -416,6 +432,9 @@ class App:
             if action == "add":
                 plays.append(new_play(names))
                 focus, done = len(plays) - 1, "added"
+            elif action == "add_deal":
+                plays.append(deal_play(names))
+                focus, done = len(plays) - 1, "deal"
             elif action.startswith("copy:"):
                 i = int(action[5:])
                 c = copy.deepcopy(plays[i])
@@ -528,6 +547,7 @@ def form_to_raw(form: dict, current: dict) -> dict:
                 "min_contracts_at_price": number(form, p + "depth", f"{label} contracts offered", blank_ok=True),
                 "favorite_rising_seconds": number(form, p + "rising", f"{label} rising seconds", blank_ok=True),
                 "btc_distance_min_dollars": number(form, p + "dist", f"{label} distance", blank_ok=True),
+                "min_score": number(form, p + "minscore", f"{label} lowest score", blank_ok=True),
             },
         }
         size_mode = field(form, p + "size_mode", "default")
@@ -828,17 +848,11 @@ def market_cards(d: dict) -> str:
                 price = up if pick_up else down
                 side = "Up" if pick_up else "Down"
                 kalshi = f"Kalshi says {float(price) * 100:.0f}%" if price is not None else ""
-                if top >= 6:
-                    what = f"{side} likely wins and looks cheap: we think {mine * 100:.0f}%, {kalshi}."
-                elif top == 5:
-                    what = f"{side} likely wins, fair price: we think {mine * 100:.0f}%, {kalshi}."
-                else:
-                    what = f"{side} likely wins but costs more than it's worth: we think {mine * 100:.0f}%, {kalshi}."
-                held = int(m.get("score_steady") or 0)
-                steady = ("Still flipping." if level == 1 else
-                          f"Steady for {max(1, held // 60)} min." if level == 2 else
-                          f"Strong: same side {max(1, held // 60)} min and pulling away.")
-                line = f'<p class="hint" style="margin-top:8px">{esc(what)} {steady}</p>'
+                sure = lastminute.LEVEL_WORDS.get(level, "")
+                price_words = ("looks cheap" if top >= 6 else "fair" if top == 5 else "costs more than it's worth")
+                what = (f"{side} likely wins ({sure}). Price {price_words}: "
+                        f"we think {mine * 100:.0f}%, {kalshi}.")
+                line = f'<p class="hint" style="margin-top:8px">{esc(what)}</p>'
         est = ""
         if m.get("est_gap") not in (None, "") and mins * 60 <= 600:
             gap = float(m["est_gap"])
@@ -1253,9 +1267,11 @@ def play_form(i: int, p: dict, opt, inp) -> str:
         f'<label>Skip if fewer contracts are offered than</label>{inp(pre + "depth", plain(c.get("min_contracts_at_price")))}'
         f'<label>Only buy if its side rose over the last N seconds</label>{inp(pre + "rising", plain(c.get("favorite_rising_seconds")))}'
         f'<label>Only buy if the price is this many $ past the target</label>{inp(pre + "dist", plain(c.get("btc_distance_min_dollars")))}'
+        f'<label>Only buy if its live score is at least (1-10)</label>{inp(pre + "minscore", plain(c.get("min_score")), "numeric")}'
         '<p class="hint">Blank = off. In the last few minutes the "$ past the target" check uses the bot\'s '
         'running average (what Kalshi settles on) instead of Bitcoin\'s live price. Example: 25 for a last-minute '
-        'play skips close calls, where the average is within $25 of the target.</p></details>'
+        'play skips close calls, where the average is within $25 of the target. Live score 7 = only buy when '
+        'that side looks cheap for its chance (the big number on the price card).</p></details>'
         f'<div class="row2"><button class="btn2" name="action" value="copy:{i}">Copy this play</button>'
         f'<button class="danger" name="action" value="delete:{i}" onclick="return confirm(this.dataset.q)" '
         f'data-q="{confirm}">Delete</button></div>'
@@ -1297,6 +1313,10 @@ def settings_page(app: App, raw: dict | None = None, message: str | None = None,
     out.append(f'<input type="hidden" name="play_count" value="{len(plays)}">')
     out.extend(play_form(i, p, opt, inp) for i, p in enumerate(plays))
     out.append('<div id="add"></div><button class="btn2" name="action" value="add">+ Add a play</button>')
+    if not any(p.get("buy") == "pick" for p in plays):
+        out.append('<button class="btn2" name="action" value="add_deal" style="margin-top:8px">'
+                   '+ Add the deal play (pretend money)</button><p class="hint">Buys our pick when its score is '
+                   '7 or more, 5 to 1 minutes before the close, 1 contract. The best rule in the backtest.</p>')
     out.append(
         "<h2>Markets</h2><div class=\"box\">" + "".join(
             f'<div class="check"><input type="checkbox" name="market_{m}" value="1"'

@@ -249,6 +249,16 @@ close (`scores.csv`, "Score track record" on the Overview). On the first night o
 same math was about as accurate as Kalshi's own price in the last 5 minutes, and better
 near the end, on only 35 markets.
 
+## Backtest data (Settings → Collect history)
+
+Downloads the last N days of settled markets (`btcbot/history.py`): Kalshi's 1-minute Up
+bid/ask candles per market (batch endpoint, split to stay under 10,000 periods per
+request; falls back to the per-market and historical endpoints), each result and official
+settlement value (`expiration_value`), and Coinbase 1-minute candles for the same minutes.
+One row per market-minute in `history.csv` (download link on Settings). Runs in the
+background in the website process; public data only. With a saved key it also checks
+whether the account may read the official BRTI through Kalshi's CF Benchmarks passthrough.
+
 ## Make a trade (from the website)
 
 The Overview has a **Make a trade** box under the prices (tap a price to jump there):

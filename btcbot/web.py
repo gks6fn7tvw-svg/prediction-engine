@@ -31,6 +31,7 @@ from . import goal as G
 from . import keystore
 from . import ledger as L
 from .kalshi import KalshiClient, KalshiError
+from . import history as H
 from . import lastminute
 from .bot import (ALLOCATION_FILE, MAKE_SUB_FILE, MANUAL, PAPER_RESET_FILE, POT_MOVE_FILE, SETUP_FILE,
                   TRADE_FILE, TRANSFER_FILE, account_name, pot_name)
@@ -285,6 +286,8 @@ class App:
         self.flash = ""               # one-time message for the Settings page
         self.secure_link: SecureLink | None = None
         self.key_tester = test_key
+        self.history_job: dict = {}           # backtest data download (one at a time)
+        self.history_collect = H.collect      # replaced in tests
         self.fetcher = self._fetch_from_kalshi
         self._client = None
         self._lock = threading.Lock()
@@ -1266,6 +1269,7 @@ def settings_page(app: App, raw: dict | None = None, message: str | None = None,
                    f'{esc(app.flash)}</div>')
         app.flash = ""
     out.append(real_money_section(app, raw, secure))
+    out.append(history_section(app))
     # The hidden first button makes Enter in a box save, instead of pressing the first Copy button.
     out.append('<form method="post" action="/settings">'
                '<button name="action" value="save" tabindex="-1" aria-hidden="true" '
@@ -1445,6 +1449,56 @@ def watch_section(d: dict) -> str:
                '<a href="/lastminute.csv?days=3" style="color:#8fb0ff">last 3 days</a> · '
                '<a href="/scores.csv" style="color:#8fb0ff">scores</a></p></div>')
     return "".join(out)
+
+
+def start_history(app: App, days: int) -> str:
+    """Download past markets for backtests in the background (website stays usable)."""
+    job = app.history_job
+    if job.get("state") == "running":
+        return "Already collecting; wait for it to finish."
+    s, _ = app.settings()
+    if s is None:
+        return "Fix the settings first."
+    folder = mode_folder(s)
+    os.makedirs(folder, exist_ok=True)
+    path = os.path.join(folder, "history.csv")
+    app.history_job = job = {"state": "running", "msg": "Starting...", "days": days,
+                             "started": datetime.now(timezone.utc).isoformat()}
+
+    def run():
+        try:
+            key_id, key_path = keystore.load_key()
+            private_key = None
+            if key_id and key_path:
+                from .kalshi import load_private_key
+                private_key = load_private_key(key_path)
+            client = KalshiClient(s.api_base, key_id=key_id, private_key=private_key, timeout=15)
+            summary = app.history_collect(client, client.session, s.markets[0], days, path,
+                                          progress=lambda m: job.update(msg=m))
+            job.update(state="done", msg=summary)
+        except Exception as e:     # shown on the page; never crashes the website
+            job.update(state="error", msg=f"stopped: {e}")
+    threading.Thread(target=run, daemon=True).start()
+    return f"Collecting the last {days} days. Refresh this page to see how far it got."
+
+
+def history_section(app: App) -> str:
+    job = app.history_job
+    status = ""
+    if job:
+        word = {"running": "Working", "done": "Done", "error": "Problem"}.get(job.get("state"), "")
+        status = f'<p class="{"bad" if job.get("state") == "error" else "hint"}"><b>{word}:</b> {esc(job.get("msg", ""))}</p>'
+    link = ('<p><a class="btn btn2" href="/history.csv">Download the history (history.csv)</a></p>'
+            if job.get("state") == "done" else "")
+    return ('<h2 id="history">Backtest data</h2><div class="box">'
+            '<p class="hint">Downloads past markets so ideas can be tested on hundreds of them instead of '
+            'waiting days: Kalshi\'s minute-by-minute prices, each result and its official settlement number, '
+            'and Bitcoin\'s minute-by-minute price. It takes a few minutes and uses only free public data. '
+            'It also checks whether your Kalshi account can read the official index the markets settle on.</p>'
+            f'{status}<form method="post" action="/history" style="display:flex;gap:8px;align-items:end">'
+            '<div style="flex:1"><label>Days back</label><input name="days" value="14" inputmode="numeric"></div>'
+            '<button class="btn2" style="flex:1">Collect history</button></form>'
+            f'{link}</div>')
 
 
 def real_money_section(app: App, raw: dict, secure: bool) -> str:
@@ -1648,6 +1702,14 @@ class Handler(BaseHTTPRequestHandler):
             done = (query.get("done") or [""])[0]
             return self._send(200, settings_page(self.app, message=DONE_MESSAGES.get(done), secure=self.secure),
                               set_cookie=from_link)
+        if url.path == "/history.csv":
+            s, _ = self.app.settings()
+            try:
+                with open(os.path.join(mode_folder(s), "history.csv"), encoding="utf-8") as fh:
+                    text = fh.read()
+            except (OSError, TypeError):
+                text = ",".join(H.COLUMNS) + "\n"
+            return self._send(200, text, ctype="text/csv; charset=utf-8", compress=True)
         if url.path in ("/watch.csv", "/lastminute.csv", "/scores.csv"):
             s, _ = self.app.settings()
             folder = mode_folder(s) if s else ""
@@ -1728,6 +1790,13 @@ class Handler(BaseHTTPRequestHandler):
                     self.app.moved = ("Asked Kalshi to keep your money in the crypto pot. Check back in a minute."
                                       if choice == "2" else "Asked Kalshi to stop moving money between pots.")
             return self._redirect("/#money")
+        if url.path == "/history":
+            try:
+                days = max(1, min(60, int(float(field(form, "days", "14") or 14))))
+            except ValueError:
+                days = 14
+            start_history(self.app, days)
+            return self._redirect("/settings#history")
         if url.path == "/trade":
             s, _ = self.app.settings()
             if s is None:

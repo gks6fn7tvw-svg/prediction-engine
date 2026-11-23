@@ -269,11 +269,14 @@ class Watch:
     follow_seconds: Decimal = Decimal("60")    # follow looks this many seconds before the close
     follow_margin: Decimal = Decimal("30")     # ...when the estimate is this many $ past the target
     follow_max_price: Decimal = Decimal("0.85")  # ...and that side costs at most this
+    crowd_seconds: Decimal = Decimal("90")     # crowd: in the final stretch...
+    crowd_price: Decimal = Decimal("0.50")     # ...if your bet's price falls to this, the crowd has switched
 
     @property
     def seconds(self) -> Decimal:
         """How long before each close the bot watches (and checks every second)."""
-        return max(self.guard_seconds, self.follow_seconds, Decimal("60")) if self.enabled else Decimal("0")
+        return (max(self.guard_seconds, self.follow_seconds, self.crowd_seconds, Decimal("60"))
+                if self.enabled else Decimal("0"))
 
 
 def _watch(raw: dict) -> Watch:
@@ -285,7 +288,9 @@ def _watch(raw: dict) -> Watch:
               guard_margin=_dec(raw.get("guard_margin_dollars", 20), "last_minute.guard_margin_dollars", 0),
               follow_seconds=_dec(raw.get("follow_seconds", 60), "last_minute.follow_seconds", 5, 600),
               follow_margin=_dec(raw.get("follow_margin_dollars", 30), "last_minute.follow_margin_dollars", 0),
-              follow_max_price=cents(raw.get("follow_max_cents", 85), "last_minute.follow_max_cents"))
+              follow_max_price=cents(raw.get("follow_max_cents", 85), "last_minute.follow_max_cents"),
+              crowd_seconds=_dec(raw.get("crowd_seconds", 90), "last_minute.crowd_seconds", 5, 600),
+              crowd_price=cents(raw.get("crowd_cents", 50), "last_minute.crowd_cents"))
     return w
 
 

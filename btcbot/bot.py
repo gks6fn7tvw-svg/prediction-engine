@@ -1091,6 +1091,7 @@ class Bot:
             left = (q.close_time - now).total_seconds()
             if not 0 <= left <= float(w.seconds) + 1:
                 continue
+            self._watch_crowd(q, now, left)
             coin = lastminute.coin_for(q.series)
             if coin is None:
                 continue
@@ -1159,6 +1160,29 @@ class Bot:
                      pos.play, self.market_words(q), rules.side_name(pos.side), cents_words(bid),
                      lastminute.gap_words(est), lastminute.seconds_words(est.seconds_left))
 
+    def _watch_crowd(self, q: rules.Quote, now: datetime, left: float) -> None:
+        """Copy the crowd: when the price of a bet we hold falls to the set level late, note 'would sell'."""
+        w = self.s.watch
+        if left > float(w.crowd_seconds):
+            return
+        for pos in self.state.open_positions():
+            key = f"crowd|{pos.play}|{pos.ticker}"
+            if pos.ticker != q.ticker or key in self.state.watch:
+                continue
+            bid = q.bid(pos.side)
+            if bid is None or bid > w.crowd_price:
+                continue
+            n = pos.d("contracts")
+            fee = rules.taker_fee(n, bid, self.multipliers.get(q.series, ONE))
+            self.state.watch[key] = {
+                "kind": "crowd", "play": pos.play, "market": pos.ticker, "side": pos.side, "contracts": str(n),
+                "price": str(bid), "fee": str(fee), "entry_price": pos.entry_price, "entry_fee": pos.entry_fee,
+                "seconds_left": int(left), "gap": str(self.estimates[q.ticker].gap.quantize(Decimal("1")))
+                if q.ticker in self.estimates else "", "close": q.close_time.isoformat()}
+            log.info("watch (no order sent): %s's %s %s fell to %s with %s left; copying the crowd would sell now",
+                     pos.play, self.market_words(q), rules.side_name(pos.side), cents_words(bid),
+                     lastminute.seconds_words(left))
+
     def _watch_follow(self, q: rules.Quote, now: datetime, est) -> None:
         w = self.s.watch
         key = f"follow|{q.ticker}"
@@ -1201,14 +1225,15 @@ class Bot:
             won = result == e["side"]
             q = rules.Quote(e["market"], e["market"].split("-")[0], close, "", None, None, None, None, None)
             where = f"{self.market_words(q)} {rules.side_name(e['side'])}"
-            if e["kind"] == "guard":
+            if e["kind"] in ("guard", "crowd"):
                 entry, entry_fee = Decimal(e["entry_price"]), Decimal(e["entry_fee"])
                 held = (n if won else Decimal("0")) - n * entry - entry_fee
                 would = n * price - fee - n * entry - entry_fee
                 diff = would - held
-                verdict = (f"the guard would have saved ${diff:.2f}" if diff > 0
-                           else f"the guard would have cost ${-diff:.2f}")
-                log.info("watch result: %s's %s %s. Holding to the end: %s. Guard selling at %s: %s. So %s.",
+                who = "the guard" if e["kind"] == "guard" else "copying the crowd"
+                verdict = (f"{who} would have saved ${diff:.2f}" if diff > 0
+                           else f"{who} would have cost ${-diff:.2f}")
+                log.info("watch result: %s's %s %s. Holding to the end: %s. Selling at %s: %s. So %s.",
                          e["play"], where, "won" if won else "lost", signed(held), cents_words(price), signed(would),
                          verdict)
             else:

@@ -249,6 +249,9 @@ It only watches. Two ideas are written down and checked after each close:
   N seconds: "would sell now at the bid". Compared with holding to the end.
 - **Follow:** when the estimate is at least $X past the target in the last N seconds and
   that side costs at most Y cents: "would buy 1". Win or loss after fees.
+- **Copy the crowd:** a bet you hold whose Kalshi price falls to Y cents or less in the
+  last N seconds (others are selling it): "would sell now at the bid". Uses Kalshi's own
+  price, where the fast traders' moves show up, instead of our estimate.
 
 Results: `watch.csv` (Overview: "Last-minute watch"); every second of the final stretch:
 `lastminute/<day>.csv` (two weeks kept). Settings: `last_minute:` or the website.

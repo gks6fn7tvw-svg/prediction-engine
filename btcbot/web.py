@@ -477,6 +477,8 @@ def form_to_raw(form: dict, current: dict) -> dict:
             "follow_seconds": number(form, "lm_follow_s", "Follow: seconds before the close"),
             "follow_margin_dollars": number(form, "lm_follow_m", "Follow: dollars past the target"),
             "follow_max_cents": number(form, "lm_follow_max", "Follow: highest price"),
+            "crowd_seconds": number(form, "lm_crowd_s", "Copy the crowd: seconds before the close"),
+            "crowd_cents": number(form, "lm_crowd_p", "Copy the crowd: price"),
         }
     plays = []
     for i in range(int(field(form, "play_count", "0") or 0)):
@@ -1283,9 +1285,15 @@ def watch_form(w: dict, inp) -> str:
         f'<div class="row2"><div><label>Seconds before the close</label>{inp("lm_follow_s", plain(w.get("follow_seconds", 60)))}</div>'
         f'<div><label>When it\'s this many $ past the target</label>{inp("lm_follow_m", plain(w.get("follow_margin_dollars", 30)))}</div></div>'
         f'<label>Follow only if that side costs at most (¢)</label>{inp("lm_follow_max", plain(w.get("follow_max_cents", 85)))}'
+        '<label><b>Copy the crowd</b>: sell when everyone else is selling your side</label>'
+        f'<div class="row2"><div><label>Seconds before the close</label>{inp("lm_crowd_s", plain(w.get("crowd_seconds", 90)))}</div>'
+        f'<div><label>When your bet\'s price falls to (¢)</label>{inp("lm_crowd_p", plain(w.get("crowd_cents", 50)))}</div></div>'
         '<p class="hint">Example: Guard 90 and 20 = with 1:30 or less left, if the average is heading $20 or more to '
         'the wrong side of your bet, note "would sell now". Follow 60, 30 and 85 = with a minute or less left, if '
-        'the average is $30 or more past the target and that side still costs 85¢ or less, note "would buy".</p>'
+        'the average is $30 or more past the target and that side still costs 85¢ or less, note "would buy". '
+        'Copy the crowd 90 and 50 = with 1:30 or less left, if your Up bet (bought at 80¢) falls to 50¢ because '
+        'others are selling, note "would sell now". Guard uses our own average; Copy the crowd uses Kalshi\'s '
+        'price, which is where the fast bots leave their footprints.</p>'
         '</div>')
 
 
@@ -1296,7 +1304,7 @@ def watch_section(d: dict) -> str:
         return ""
     rows = lastminute.read_watch(os.path.join(d["folder"], "watch.csv"))
     sm = lastminute.summary(rows)
-    g, f = sm["guard"], sm["follow"]
+    g, c, f = sm["guard"], sm["crowd"], sm["follow"]
 
     def money(x):
         return f"${abs(x):.2f}"
@@ -1308,6 +1316,11 @@ def watch_section(d: dict) -> str:
         out.append(f'<div class="bet"><div><b>Guard</b><div class="sub">{g["count"]} times it would have sold early; '
                    f'it would have helped {g["helped"]} of them</div></div>'
                    f'<div class="amt {"pos" if g["difference"] >= 0 else "neg"}">{word} {money(g["difference"])}</div></div>')
+    if c["count"]:
+        word = "saved" if c["difference"] >= 0 else "cost"
+        out.append(f'<div class="bet"><div><b>Copy the crowd</b><div class="sub">{c["count"]} times it would have '
+                   f'sold early; it would have helped {c["helped"]} of them</div></div>'
+                   f'<div class="amt {"pos" if c["difference"] >= 0 else "neg"}">{word} {money(c["difference"])}</div></div>')
     if f["count"]:
         out.append(f'<div class="bet"><div><b>Follow</b><div class="sub">{f["count"]} buys it would have made '
                    f'(1 contract each); {f["wins"]} won</div></div>'

@@ -177,7 +177,7 @@ def read_watch(path: str) -> list[dict]:
 def summary(rows: list[dict]) -> dict:
     """Totals for the website: per kind, how often, and money compared with what really happened."""
     out = {}
-    for kind in ("guard", "follow"):
+    for kind in ("guard", "crowd", "follow"):
         rs = [r for r in rows if r.get("kind") == kind]
         diff = sum((Decimal(r.get("difference") or "0") for r in rs), Decimal("0"))
         would = sum((Decimal(r.get("would_profit") or "0") for r in rs), Decimal("0"))

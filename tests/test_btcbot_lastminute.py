@@ -89,6 +89,20 @@ class TestWatch(LiveCase):
         self.run_bot(-0.2, 0.98, 0.99)
         self.assertLess(D(self.watch_rows()[0]["difference"]), 0)
 
+    def test_copy_the_crowd_notes_a_sell_when_our_side_falls(self):
+        self.make([MAIN])
+        self.run_bot(7.5, 0.80, 0.82)                       # bought Up at 82c
+        self.price = D("60005")                              # our average still says Up, barely
+        self.run_bot(1, 0.62, 0.64)                          # Up at 62c: nothing yet
+        self.assertNotIn(f"crowd|main|{TICKER}", self.bot.state.watch)
+        with self.assertLogs("btcbot", level="INFO") as logs:
+            self.run_bot(0, 0.48, 0.50, seconds=50)          # crowd sold Up down to 48c
+        self.assertIn("fell to 48", "\n".join(logs.output))
+        self.client.results[TICKER] = "no"
+        self.run_bot(-0.2, 0.01, 0.02)
+        rows = {r["kind"]: r for r in self.watch_rows()}
+        self.assertGreater(D(rows["crowd"]["difference"]), 0)
+
     def test_follow_logs_a_pretend_buy_and_its_result(self):
         self.make([MAIN])
         self.price = D("60060")                              # $60 above the target
@@ -154,7 +168,7 @@ from test_btcbot_web import KEY, WebCase, good_form  # noqa: E402
 class TestWatchPages(WebCase):
     def test_settings_save_and_show(self):
         form = dict(good_form(), lm_on="1", lm_guard_s="120", lm_guard_m="15", lm_follow_s="45",
-                    lm_follow_m="40", lm_follow_max="80", action="save")
+                    lm_follow_m="40", lm_follow_max="80", lm_crowd_s="60", lm_crowd_p="55", action="save")
         status, _, _ = self.call("/settings", data=form)
         self.assertEqual(status, 303)
         from btcbot.settings import load
@@ -163,6 +177,7 @@ class TestWatchPages(WebCase):
                          (D("120"), D("15"), D("45"), D("40"), D("0.8")))
         _, body, _ = self.call("/settings", cookie=f"btcbot_key={KEY}")
         self.assertIn('name="lm_guard_s" value="120"', body)
+        self.assertEqual((w.crowd_seconds, w.crowd_price), (D("60"), D("0.55")))
 
     def test_overview_summary_and_downloads(self):
         from btcbot.settings import load, mode_folder

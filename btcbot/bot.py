@@ -66,6 +66,7 @@ POT_MOVE_FILE = "POT_MOVE_REQUEST"      # the website asks to move the main acco
 MAKE_SUB_FILE = "MAKE_SUBACCOUNT_REQUEST"  # the website asks for a new subaccount inside the crypto pot
 POTS = {0: "general", 1: "combos", 2: "crypto", 3: "sports"}
 CRYPTO_POT = 2                      # the money pot Kalshi uses for crypto markets
+DEFEND_FROM = Decimal("0.5")        # guard/crowd watch only bets bought as the favorite (cheap bets start "losing")
 
 
 def pot_name(shard) -> str:
@@ -1157,7 +1158,7 @@ class Bot:
             return
         for pos in self.state.open_positions():
             key = f"guard|{pos.play}|{pos.ticker}"
-            if pos.ticker != q.ticker or key in self.state.watch:
+            if pos.ticker != q.ticker or key in self.state.watch or pos.d("entry_price") < DEFEND_FROM:
                 continue
             against = -est.gap if pos.side == "yes" else est.gap
             bid = q.bid(pos.side)
@@ -1181,7 +1182,7 @@ class Bot:
             return
         for pos in self.state.open_positions():
             key = f"crowd|{pos.play}|{pos.ticker}"
-            if pos.ticker != q.ticker or key in self.state.watch:
+            if pos.ticker != q.ticker or key in self.state.watch or pos.d("entry_price") < DEFEND_FROM:
                 continue
             bid = q.bid(pos.side)
             if bid is None or bid > w.crowd_price:

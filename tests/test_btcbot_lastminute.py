@@ -9,7 +9,7 @@ from btcbot import lastminute
 from btcbot.lastminute import Tracker
 
 from test_btcbot import CLOSE, TICKER, market
-from test_btcbot_live import MAIN, LiveCase
+from test_btcbot_live import CHEAP, MAIN, LiveCase
 
 
 class TestEstimate(unittest.TestCase):
@@ -258,3 +258,14 @@ class TestDownloadDays(WebCase):
         self.assertEqual([line.split(",")[7] for line in text.strip().split("\n")[1:]], ["-1", "-2", "-3"])
         _, text, _ = self.call("/lastminute.csv", cookie=f"btcbot_key={KEY}")
         self.assertNotIn(",-1,", text)
+
+
+class TestCheapBetsAreNotDefended(LiveCase):
+    def test_underdog_bets_are_left_alone(self):
+        self.make([CHEAP])
+        self.bot.index_fn = lambda coin: (D("60000"), 3)
+        self.at(12, 0.80, 0.82)                              # buys Down at about 20c
+        self.assertEqual(len(self.client.orders), 1)
+        self.bot.index_fn = lambda coin: (D("60200"), 3)     # far against it
+        self.at(1, 0.95, 0.96)
+        self.assertEqual(self.bot.state.watch, {})

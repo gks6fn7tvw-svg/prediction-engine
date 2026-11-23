@@ -1129,7 +1129,6 @@ def trade_box(app: "App", d: dict, secure: bool) -> str:
     market = (f'<label>Market</label><select name="series">{pick}</select>' if len(s.markets) > 1
               else f'<input type="hidden" name="series" value="{esc(s.markets[0])}">')
     money = "real money from your main account\'s crypto pot" if real else "pretend money"
-    ask = (f' onclick="return confirm(\'Buy with REAL money now?\')"' if real else "")
     out.append(
         '<form method="post" action="/trade"><input type="hidden" name="action" value="buy">'
         f'<input type="hidden" name="side" id="trade-side" value="yes">{market}'
@@ -1137,8 +1136,8 @@ def trade_box(app: "App", d: dict, secure: bool) -> str:
         '<input name="contracts" value="1" inputmode="numeric"></div>'
         '<div><label>Most I\'ll pay (¢)</label><input name="max" inputmode="decimal" placeholder="price + 2"></div></div>'
         '<div class="row2">'
-        f'<button name="side" value="no"{ask} style="background:#7a2a33">▼ Buy Down</button>'
-        f'<button name="side" value="yes"{ask}>▲ Buy Up</button></div>'
+        '<button name="side" value="no" style="background:#7a2a33">▼ Buy Down</button>'
+        '<button name="side" value="yes">▲ Buy Up</button></div>'
         f'<p class="hint">Buys right away in the market closing next, at the price on screen (up to 2¢ more, or '
         f'your limit), with {money}. Your trades show up as the play "{MANUAL}"; each open one has a Sell now '
         'button.</p></form></div>'

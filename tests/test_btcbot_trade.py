@@ -118,7 +118,8 @@ class TestTradeBox(WebCase):
         self.assertFalse(os.path.exists(self.trade_file()))
         self.server.secure = True                            # as if on the locked link
         _, body, _ = self.call(f"/?key={KEY}")
-        self.assertIn("Buy with REAL money now?", body)
+        self.assertNotIn("Buy with REAL money now?", body)     # no pop-up: one tap buys
+        self.assertIn("with real money", body)
         self.call("/trade", data={"key": KEY, "action": "buy", "side": "yes", "contracts": "1"})
         self.assertTrue(os.path.exists(self.trade_file()))
 

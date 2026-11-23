@@ -161,6 +161,18 @@ DATA_COLUMNS = ["time", "market", "seconds_left", "target", "price", "sources", 
 def append_csv(path: str, columns: list, row: dict) -> None:
     new = not os.path.exists(path)
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    if not new:
+        with open(path, newline="", encoding="utf-8") as fh:
+            header = next(csv.reader(fh), [])
+        if header != columns:              # columns changed since the file was started: rewrite it once
+            with open(path, newline="", encoding="utf-8") as fh:
+                old = list(csv.DictReader(fh))
+            with open(path + ".tmp", "w", newline="", encoding="utf-8") as fh:
+                w = csv.DictWriter(fh, fieldnames=columns)
+                w.writeheader()
+                for r in old:
+                    w.writerow({k: r.get(k, "") for k in columns})
+            os.replace(path + ".tmp", path)
     with open(path, "a", newline="", encoding="utf-8") as fh:
         w = csv.DictWriter(fh, fieldnames=columns)
         if new:
@@ -247,7 +259,20 @@ def score(chance: float, ask: float | None) -> int | None:
 
 
 SCORE_COLUMNS = ["time", "market", "seconds_left", "chance_up", "up_cost", "down_cost", "up_score",
-                 "down_score", "best", "best_score", "result", "best_won"]
+                 "down_score", "best", "best_score", "level", "result", "best_won"]
+
+
+def confidence(chance: float, steady_seconds: float, pulling_away: bool) -> int:
+    """How much to trust the pick: 1 shaky (still flipping or under 65%), 2 steady, 3 strong.
+
+    Example: Down picked for 3+ minutes, our chance 88%, and Bitcoin moving further below the
+    target -> 3. Same pick but it switched sides 40 seconds ago -> 1.
+    """
+    if steady_seconds >= 180 and chance >= 0.85 and pulling_away:
+        return 3
+    if steady_seconds >= 120 and chance >= 0.65:
+        return 2
+    return 1
 CHECKPOINTS = (600, 300, 240, 180, 120, 60, 30)   # seconds left when a score is written down
 
 

@@ -164,6 +164,8 @@ class Bot:
         self.sigma_fn = sigma_fn or (lambda coin: lastminute.candles_sigma(client.session, coin))
         self.sigmas: dict = {}
         self.scores: dict = {}
+        self.picks: dict = {}                       # ticker -> (picked side, since when)
+        self.gaps = defaultdict(lambda: deque(maxlen=400))   # ticker -> (time, $ from target)
         self.estimates: dict[str, lastminute.Estimate] = {}
         self.plays = {p.name: p for p in settings.plays}
         self.history = defaultdict(lambda: deque(maxlen=2000))
@@ -566,7 +568,7 @@ class Bot:
             sc = self.scores.get(q.ticker)
             if sc is not None:
                 row.update(chance_up=f"{sc['chance_up']:.3f}", score_up=sc["up"], score_down=sc["down"],
-                           score_best=sc["best"])
+                           score_best=sc["best"], score_level=sc["level"], score_steady=sc["steady"])
             est = self.estimates.get(q.ticker)
             if est is not None:
                 row.update(est_projected=str(est.projected.quantize(Decimal("0.01"))),
@@ -685,7 +687,7 @@ class Bot:
         self.state.day_trades += 1
         if not self.broker.live:
             self.state.paper_cash = str(self.broker.cash)
-        return (f"BOUGHT {fill.contracts:g} {word} in {self.market_words(q)} at "
+        return (f"BOUGHT {plain(fill.contracts)} {word} in {self.market_words(q)} at "
                 f"{cents_words(fill.price)} (fee {cents_words(fill.fee)}).")
 
     def _manual_sell(self, req: dict, side: str, quotes: dict) -> str:
@@ -713,7 +715,7 @@ class Bot:
         if fill is None:
             return f"didn't sell: tried at {cents_words(floor)} or more; the price moved."
         self._close(pos, fill.contracts, "sold_by_you", fill, None)
-        return f"SOLD {fill.contracts:g} {word} at {cents_words(fill.price)} (fee {cents_words(fill.fee)})."
+        return f"SOLD {plain(fill.contracts)} {word} at {cents_words(fill.price)} (fee {cents_words(fill.fee)})."
 
     # ---- pieces --------------------------------------------------------------
     def _fetch_quotes(self, now: datetime) -> dict:
@@ -1483,15 +1485,31 @@ class Bot:
             up_ask, down_ask = q.ask("yes"), q.ask("no")
             su = lastminute.score(p, float(up_ask) if up_ask is not None else None)
             sd = lastminute.score(1 - p, float(down_ask) if down_ask is not None else None)
-            best = "yes" if (su or 0) >= (sd or 0) else "no"
-            self.scores[q.ticker] = {"chance_up": p, "up": su, "down": sd, "best": best}
-            self._score_snapshot(q, now, left, p, up_ask, down_ask, su, sd, best)
+            best = "yes" if p >= 0.5 else "no"      # the side we think will win (its score says if it's a deal)
+            # How steady is the pick? Same side for how long, and is Bitcoin pulling away from the target?
+            side_since = self.picks.get(q.ticker)
+            if side_since is None or side_since[0] != best:
+                side_since = self.picks[q.ticker] = (best, now)
+            gap = mean - float(q.target)
+            hist = self.gaps[q.ticker]
+            hist.append((now, gap))
+            ago = next((g for t, g in hist if (now - t).total_seconds() <= 75), gap)
+            toward = 1 if best == "yes" else -1
+            pulling = gap * toward > 0 and gap * toward > ago * toward + 1
+            chance_best = p if best == "yes" else 1 - p
+            level = lastminute.confidence(chance_best, (now - side_since[1]).total_seconds(), pulling)
+            steady = int((now - side_since[1]).total_seconds())
+            self.scores[q.ticker] = {"chance_up": p, "up": su, "down": sd, "best": best, "level": level,
+                                     "steady": steady}
+            self._score_snapshot(q, now, left, p, up_ask, down_ask, su, sd, best, level)
         for ticker in list(self.scores):
             if ticker not in quotes:
                 del self.scores[ticker]
+                self.picks.pop(ticker, None)
+                self.gaps.pop(ticker, None)
         self._score_resolve(now)
 
-    def _score_snapshot(self, q, now, left, p, up_ask, down_ask, su, sd, best) -> None:
+    def _score_snapshot(self, q, now, left, p, up_ask, down_ask, su, sd, best, level=1) -> None:
         pending = self.state.score_pending.setdefault(q.ticker, {"close": q.close_time.isoformat(), "snaps": []})
         taken = {s["checkpoint"] for s in pending["snaps"]}
         for cp in lastminute.CHECKPOINTS:
@@ -1500,7 +1518,7 @@ class Bot:
                     "checkpoint": cp, "time": now.isoformat(timespec="seconds"), "seconds_left": int(left),
                     "chance_up": f"{p:.3f}", "up_cost": str(up_ask or ""), "down_cost": str(down_ask or ""),
                     "up_score": su or "", "down_score": sd or "", "best": rules.side_name(best),
-                    "best_score": (su if best == "yes" else sd) or ""})
+                    "best_score": (su if best == "yes" else sd) or "", "level": level})
 
     def _score_resolve(self, now: datetime) -> None:
         for ticker, pending in list(self.state.score_pending.items()):

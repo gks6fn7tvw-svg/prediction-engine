@@ -72,6 +72,20 @@ class TestBotScore(LiveCase):
         self.assertTrue(all(r["best"] == "UP" and r["best_won"] == "yes" for r in rows))
         self.assertEqual(self.bot.state.score_pending, {})
 
+    def test_confidence_grows_when_the_pick_holds(self):
+        self.make([MAIN])
+        self.price = D("60020")
+        self.run_bot(5, 0.69, 0.70)
+        self.assertEqual(self.market_row()["score_level"], 1)           # just picked
+        for sec, price in ((240, "60030"), (180, "60045"), (150, "60050"), (120, "60060"), (90, "60080")):
+            self.price = D(price)
+            self.run_bot(0, 0.80, 0.81, sec)
+        self.assertEqual(self.market_row()["score_best"], "yes")
+        self.assertEqual(self.market_row()["score_level"], 3)           # 3+ minutes, sure, pulling away
+        self.price = D("59900")                                          # big drop: the pick flips
+        self.run_bot(0, 0.30, 0.31, 80)
+        self.assertEqual(self.market_row()["score_level"], 1)
+
     def test_checks_at_least_every_5_seconds(self):
         self.make([MAIN])
         self.assertLessEqual(self.run_bot(12, 0.50, 0.52), 5)
@@ -97,7 +111,9 @@ class TestScorePage(WebCase):
             lastminute.append_csv(os.path.join(folder, "scores.csv"), lastminute.SCORE_COLUMNS,
                                   {"best_score": 9, "best_won": won})
         _, body, _ = self.call(f"/?key={KEY}")
-        self.assertIn("Score now: Up 9/10</b> (our chance 86%)", body)
+        self.assertIn('<span class="score good">9<sup>1</sup></span>▲ Up', body)     # badge on the picked side
+        self.assertIn("Up likely wins and looks cheap: we think 86%, Kalshi says 70%. Still flipping.", body)
+        self.assertLess(body.index("▼ Down"), body.index("▲ Up"))                    # Down left, Up right
         self.assertIn("8-10: won 2 of 3", body)
         _, text, _ = self.call("/scores.csv", cookie=f"btcbot_key={KEY}")
         self.assertIn("best_won", text)

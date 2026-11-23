@@ -568,6 +568,11 @@ h2{font-size:13px;letter-spacing:.08em;text-transform:uppercase;margin:22px 0 8p
 .market .top{display:flex;justify-content:space-between;color:var(--dim);font-size:14px}
 .prices{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:10px}
 .price{background:var(--card2);border-radius:12px;padding:10px;text-align:center;border:2px solid transparent}
+.price.pick{border-color:#2fa86a}.score{position:absolute;top:-12px;left:50%;transform:translateX(-50%);
+font-size:15px;font-weight:700;padding:1px 12px;border-radius:999px;white-space:nowrap}
+.score sup{font-size:10px;margin-left:1px}.score.good{background:#163a2a;color:#7ee2a8}
+.score.ok{background:#3a3216;color:#ffd27a}.score.bad{background:#3d1d22;color:#ff9da4}
+.market .prices{margin-top:14px}
 .price b{display:block;font-size:24px}.price.fav{border-color:var(--blue)}
 .play{display:block;text-decoration:none;background:var(--card);border-radius:16px;padding:14px;margin:10px 0}
 .play .head{display:flex;justify-content:space-between;align-items:center;gap:8px}
@@ -793,10 +798,11 @@ def market_cards(d: dict) -> str:
             soonest[m["series"]] = m
     names = dict(MARKETS)
 
-    def box(series, word, arrow, p, fav):
+    def box(series, word, arrow, p, fav, badge=""):
         value = f' data-k="{esc(series)}-{word}" data-v="{p}"' if p is not None else ""
         return (f'<a href="#trade" onclick="pickSide(\'{"yes" if word == "Up" else "no"}\')" '
-                f'class="price{" fav" if fav else ""}" style="text-decoration:none;color:inherit">{arrow} {word}'
+                f'class="price{" pick" if badge else " fav" if fav else ""}" '
+                f'style="text-decoration:none;color:inherit;position:relative">{badge}{arrow} {word}'
                 f'<b{value}>{cents_text(p) if p is not None else "—"}</b></a>')
 
     out = []
@@ -808,29 +814,42 @@ def market_cards(d: dict) -> str:
         fav_up = up is not None and down is not None and up >= down
         target = f' · target ${float(m["target"]):,.2f}' if m.get("target") else ""
         stale = f' · prices {int(age)}s old' if age > 10 else ""
-        sc = ""
-        if m.get("score_up") not in (None, "") or m.get("score_down") not in (None, ""):
-            up_s, down_s = m.get("score_up") or "–", m.get("score_down") or "–"
-            best = "Up" if m.get("score_best") == "yes" else "Down"
-            top = up_s if best == "Up" else down_s
-            chance = float(m.get("chance_up") or 0.5)
-            mine = chance if best == "Up" else 1 - chance
-            tone = "#7ee2a8" if isinstance(top, int) and top >= 7 else "#ffd27a" if isinstance(top, int) and top >= 5 else "#ff9da4"
-            sc = (f'<p class="hint" style="margin-top:6px"><b style="color:{tone}">Score now: {best} {top}/10</b> '
-                  f'(our chance {mine * 100:.0f}%) · ▲ Up {up_s} · ▼ Down {down_s}. '
-                  '5 = Kalshi\'s price is fair; higher = cheap for its chance.</p>')
+        badge_up = badge_down = line = ""
+        if m.get("score_best") in ("yes", "no"):
+            pick_up = m["score_best"] == "yes"
+            top = m.get("score_up") if pick_up else m.get("score_down")
+            level = int(m.get("score_level") or 1)
+            if isinstance(top, int):
+                tone = "good" if top >= 7 else "ok" if top >= 5 else "bad"
+                badge = f'<span class="score {tone}">{top}<sup>{level}</sup></span>'
+                badge_up, badge_down = (badge, "") if pick_up else ("", badge)
+                chance = float(m.get("chance_up") or 0.5)
+                mine = chance if pick_up else 1 - chance
+                price = up if pick_up else down
+                side = "Up" if pick_up else "Down"
+                kalshi = f"Kalshi says {float(price) * 100:.0f}%" if price is not None else ""
+                if top >= 6:
+                    what = f"{side} likely wins and looks cheap: we think {mine * 100:.0f}%, {kalshi}."
+                elif top == 5:
+                    what = f"{side} likely wins, fair price: we think {mine * 100:.0f}%, {kalshi}."
+                else:
+                    what = f"{side} likely wins but costs more than it's worth: we think {mine * 100:.0f}%, {kalshi}."
+                held = int(m.get("score_steady") or 0)
+                steady = ("Still flipping." if level == 1 else
+                          f"Steady for {max(1, held // 60)} min." if level == 2 else
+                          f"Strong: same side {max(1, held // 60)} min and pulling away.")
+                line = f'<p class="hint" style="margin-top:8px">{esc(what)} {steady}</p>'
         est = ""
         if m.get("est_gap") not in (None, "") and mins * 60 <= 600:
             gap = float(m["est_gap"])
-            est = (f'<p class="hint">Last minute: the average is heading <b>${abs(gap):,.0f} '
-                   f'{"above" if gap >= 0 else "below"}</b> the target ({"Up" if gap >= 0 else "Down"} ahead) · '
-                   f'{int(m.get("est_locked") or 0)} of 60 seconds counted · our estimate, not Kalshi\'s</p>')
+            est = (f'<p class="hint">Last minute: average heading ${abs(gap):,.0f} '
+                   f'{"above" if gap >= 0 else "below"} the target · {int(m.get("est_locked") or 0)} of 60 s counted</p>')
         out.append(f'<div class="box market"><div class="top"><span><b style="color:var(--text)">'
                    f'{esc(names.get(series, series))}</b> · closes {clock(t, zone)}</span>'
                    f'<span>{countdown(mins * 60)} left</span></div>'
-                   f'<div class="prices">{box(series, "Up", "▲", up, fav_up)}'
-                   f'{box(series, "Down", "▼", down, not fav_up)}</div>'
-                   f'<p class="hint">Price to buy right now{target}{stale}</p>{sc}{est}</div>')
+                   f'<div class="prices">{box(series, "Down", "▼", down, not fav_up, badge_down)}'
+                   f'{box(series, "Up", "▲", up, fav_up, badge_up)}</div>'
+                   f'{line}<p class="hint" style="margin-top:4px">Price to buy right now{target}{stale}</p>{est}</div>')
     return "".join(out)
 
 

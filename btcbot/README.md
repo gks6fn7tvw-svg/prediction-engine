@@ -243,7 +243,12 @@ second in the last minutes). It compares **our chance** with **Kalshi's price**:
 Our chance (`lastminute.chance_up`): how far Bitcoin is from the target, how jumpy it has
 been (Coinbase 1-minute candles, last 30 minutes, refreshed each minute), how much time is
 left, and in the final minute how much of the settlement average is already counted (the
-running estimate above). It assumes moves are random, so news or one huge order can still
+running estimate above). The badge sits on the side we think will win, as score plus a small confidence number:
+¹ shaky (the pick switched in the last 2 minutes, or our chance is under 65%), ² steady
+(same side 2+ minutes, 65%+), ³ strong (same side 3+ minutes, 85%+, and Bitcoin moving
+further from the target over the last minute). Example: 8² = a good price on a steady
+call; 5³ = almost sure but no bargain; 9¹ = a bargain that is still flipping.
+It assumes moves are random, so news or one huge order can still
 beat it. Snapshots at 10, 5, 4, 3, 2, 1 minutes and 30 seconds left are checked after each
 close (`scores.csv`, "Score track record" on the Overview). On the first night of data the
 same math was about as accurate as Kalshi's own price in the last 5 minutes, and better

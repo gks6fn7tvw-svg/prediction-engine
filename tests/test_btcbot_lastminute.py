@@ -211,8 +211,7 @@ class TestWatchPages(WebCase):
         with open(os.path.join(folder, "market.json"), "w") as fh:
             json.dump({"updated": datetime.now(timezone.utc).isoformat(), "markets": [row]}, fh)
         _, body, _ = self.call(f"/?key={KEY}")
-        self.assertIn("the average is heading <b>$35 below</b> the target (Down ahead)", body)
-        self.assertIn("20 of 60 seconds counted", body)
+        self.assertIn("average heading $35 below the target · 20 of 60 s counted", body)
 
 
 class TestCloseCallFilter(LiveCase):

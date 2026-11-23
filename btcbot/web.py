@@ -1304,6 +1304,13 @@ def request_transfer(app: App, form: dict) -> str:
         if existing and n not in existing:
             return (f"Not moved: {account_name(n)} isn't set up on Kalshi yet. Kalshi makes subaccounts only "
                     "after the bot's first real bet; the bot then sets them up by itself.")
+    try:
+        pot = (L.Ledger(folder).load_state(Decimal(0)).shards.get(str(frm)) or {}).get("2")
+    except (OSError, ValueError, AttributeError):
+        pot = None
+    if pot is not None and Decimal(pot) < Decimal(str(amount)):
+        return (f"Not moved: only ${Decimal(pot):.2f} of {account_name(frm)} is in the crypto pot, and moves "
+                "happen inside the crypto pot. Get the money into the crypto pot first.")
     os.makedirs(folder, exist_ok=True)
     tmp = os.path.join(folder, TRANSFER_FILE + ".tmp")
     with open(tmp, "w", encoding="utf-8") as fh:

@@ -597,7 +597,21 @@ class Bot:
             return
         try:
             # The bot only bets on crypto, so money moves happen inside the crypto pot.
-            self.client.transfer(frm, to, cents, req.get("id"), exchange_index=CRYPTO_POT)
+            try:
+                self.client.transfer(frm, to, cents, req.get("id"), exchange_index=CRYPTO_POT)
+            except KalshiError as e:
+                if e.status != 404 or to == 0:
+                    raise
+                # Kalshi keeps each subaccount per pot. One made before the bot knew about pots
+                # lives in the general pot only, so make it in the crypto pot (once) and try again.
+                n = self.client.create_subaccount(CRYPTO_POT)
+                log.info("made Kalshi subaccount %s in the crypto pot", n)
+                self.state.subaccounts = sorted(set(self.state.subaccounts) | {n})
+                if n != to:
+                    raise KalshiError(0, f"{account_name(to)} isn't in the crypto pot (it was made before the bot "
+                                         f"knew about pots), so Kalshi made subaccount {n} there instead. On "
+                                         f"Settings, set the play to subaccount {n}, then move the money again.")
+                self.client.transfer(frm, to, cents, None, exchange_index=CRYPTO_POT)
             self.state.notice = (f"Moved ${cents / 100:.2f} from {account_name(frm)} to {account_name(to)} "
                                  "(crypto pot).")
             log.info(self.state.notice)
@@ -605,7 +619,8 @@ class Bot:
             if hasattr(self.broker, "_cache"):
                 self.broker._cache = (0.0, {})
         except Exception as e:
-            self.state.notice = f"Money move failed: {kalshi_words(e)}"
+            words = e.text if isinstance(e, KalshiError) and e.status == 0 else kalshi_words(e)
+            self.state.notice = f"Money not moved: {words}"
             log.error(self.state.notice)
         self.ledger.save_state(self.state)
 

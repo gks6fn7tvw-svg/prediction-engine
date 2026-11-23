@@ -274,7 +274,7 @@ class TestMoneyMoves(LiveCase):
         with open(os.path.join(self.dir, TRANSFER_FILE), "w") as fh:
             json.dump({"id": "x", "from": 0, "to": 1, "amount_cents": 99999}, fh)
         self.at(9, 0.80, 0.82)
-        self.assertIn("Money move failed", self.bot.state.notice)
+        self.assertIn("Money not moved", self.bot.state.notice)
 
 
 if __name__ == "__main__":

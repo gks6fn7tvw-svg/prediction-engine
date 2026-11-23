@@ -262,3 +262,57 @@ class TestMoveMessageShowsByTheButtons(WebCase):
         _, body, _ = self.call(f"/?key={KEY}")
         money = body[body.index('id="money"'):]
         self.assertIn("Not moved: subaccount 1 isn", money)
+
+
+class TestSubaccountInTheWrongPot(LiveCase):
+    def setup_move(self, made_number):
+        from btcbot.bot import TRANSFER_FILE
+        ex = FakeExchange(subaccounts=(0, 1))
+        calls = []
+        real = ex.transfer
+
+        def transfer(frm, to, cents, transfer_id=None, exchange_index=None):
+            calls.append(exchange_index)
+            if len(calls) == 1:
+                raise KalshiError(404, '{"error":{"code":"not_found","message":"not found"}}')
+            return real(frm, to, cents, transfer_id, exchange_index)
+        ex.transfer = transfer
+        ex.create_subaccount = lambda exchange_index=None: made_number
+        self.make([dict(MAIN, subaccount=1)], ex)
+        with open(os.path.join(self.ledger.folder, TRANSFER_FILE), "w") as fh:
+            json.dump({"id": "x", "from": 0, "to": 1, "amount_cents": 500}, fh)
+        self.at(12, 0.50, 0.52)
+        return calls
+
+    def test_made_in_the_crypto_pot_then_moved(self):
+        calls = self.setup_move(1)
+        self.assertEqual(calls, [2, 2])
+        self.assertIn("Moved $5.00", self.bot.state.notice)
+
+    def test_kalshi_gives_a_new_number(self):
+        calls = self.setup_move(2)
+        self.assertEqual(calls, [2])
+        self.assertIn("set the play to subaccount 2", self.bot.state.notice)
+
+
+class TestMoveNeedsCryptoPotMoney(WebCase):
+    def test_refuses_more_than_the_crypto_pot(self):
+        import yaml
+        from btcbot.bot import TRANSFER_FILE
+        from btcbot.ledger import Ledger
+        from btcbot.settings import load, mode_folder
+        with open(self.path) as fh:
+            raw = yaml.safe_load(fh)
+        raw.update(mode="live", live_confirm="I accept real-money risk")
+        with open(self.path, "w") as fh:
+            yaml.safe_dump(raw, fh)
+        folder = mode_folder(load(self.path))
+        ledger = Ledger(folder)
+        state = ledger.load_state(D(0))
+        state.accounts = {"0": "8.42", "1": "0"}
+        state.shards = {"0": {"0": "7.54", "2": "0.88"}}
+        ledger.save_state(state)
+        self.call("/transfer", data={"key": KEY, "from": "0", "to": "1", "amount": "5"})
+        self.assertFalse(os.path.exists(os.path.join(folder, TRANSFER_FILE)))
+        _, body, _ = self.call(f"/?key={KEY}")
+        self.assertIn("only $0.88 of your main account is in the crypto pot", body)

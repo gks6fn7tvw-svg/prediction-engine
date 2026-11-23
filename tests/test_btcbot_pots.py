@@ -178,3 +178,65 @@ class TestWebsitePots(WebCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestEmptySubaccounts(LiveCase):
+    """Kalshi leaves empty subaccounts out of its list. The bot must not keep making new ones."""
+
+    def test_empty_subaccount_counts_as_set_up(self):
+        ex = FakeExchange(subaccounts=(0, 1))          # subaccount 1 exists but holds $0
+        self.make([dict(MAIN, subaccount=1)], ex)
+        self.assertEqual(getattr(ex, "created", 0), 0)
+        self.assertIn(1, self.bot.ready_accounts)
+        self.assertEqual(self.bot.state.setup_note, "")
+        self.at(12, 0.50, 0.52)
+        self.assertEqual(self.bot.state.accounts.get("1"), "0")   # shown as $0, so money can be moved in
+
+    def test_restarts_do_not_make_more(self):
+        ex = FakeExchange()
+        self.make([dict(MAIN, subaccount=1)], ex)
+        self.assertEqual(ex.created, 1)
+        for _ in range(3):                              # restarts (each save or update restarts the bot)
+            self.make([dict(MAIN, subaccount=1)], ex)
+        self.assertEqual(ex.created, 1)
+        self.assertEqual(sorted(ex.cash), [0, 1])
+
+    def test_at_most_one_extra_if_kalshi_hides_one(self):
+        ex = FakeExchange(subaccounts=(0, 1))
+        ex.balance_dollars = lambda subaccount=0: (_ for _ in ()).throw(KalshiError(500, "busy"))
+        self.make([dict(MAIN, subaccount=1)], ex)
+        self.assertEqual(ex.created, 1)                 # made #2, noticed, stopped
+        self.assertIn("subaccount 2", self.bot.state.setup_note)
+
+    def test_money_moves_happen_in_the_crypto_pot(self):
+        from btcbot.bot import TRANSFER_FILE
+        ex = FakeExchange(subaccounts=(0, 1))
+        self.make([dict(MAIN, subaccount=1)], ex)
+        with open(os.path.join(self.ledger.folder, TRANSFER_FILE), "w") as fh:
+            json.dump({"id": "x", "from": 0, "to": 1, "amount_cents": 500}, fh)
+        self.at(12, 0.50, 0.52)
+        self.assertEqual(ex.transfer_pot, 2)
+        self.assertIn("Moved $5.00", self.bot.state.notice)
+
+
+class TestMoveMessageShowsByTheButtons(WebCase):
+    def test_refusal_is_inside_the_money_box(self):
+        import yaml
+        from btcbot.ledger import Ledger
+        from btcbot.settings import load, mode_folder
+        with open(self.path) as fh:
+            raw = yaml.safe_load(fh)
+        raw.update(mode="live", live_confirm="I accept real-money risk")
+        raw["plays"][0]["subaccount"] = 1
+        raw["plays"] = raw["plays"][:1]
+        with open(self.path, "w") as fh:
+            yaml.safe_dump(raw, fh)
+        folder = mode_folder(load(self.path))
+        ledger = Ledger(folder)
+        state = ledger.load_state(D(0))
+        state.accounts = {"0": "8.42"}
+        ledger.save_state(state)
+        self.call("/transfer", data={"key": KEY, "from": "0", "to": "1", "amount": "5"})
+        _, body, _ = self.call(f"/?key={KEY}")
+        money = body[body.index('id="money"'):]
+        self.assertIn("Not moved: subaccount 1 isn", money)

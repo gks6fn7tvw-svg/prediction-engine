@@ -43,7 +43,8 @@ class FakeExchange(FakeClient):
             raise KalshiError(403, "no API-created order in the last 100 orders")
         self.level = "advanced"
 
-    def create_subaccount(self):
+    def create_subaccount(self, exchange_index=None):
+        self.created = getattr(self, "created", 0) + 1
         if self.level == "basic":
             raise KalshiError(403, "subaccount_creation_requires_advanced_api_usage_level")
         n = max(self.cash) + 1
@@ -51,13 +52,17 @@ class FakeExchange(FakeClient):
         return n
 
     def subaccount_balances(self):
-        return dict(self.cash)
+        # Like Kalshi: subaccounts with no money in them are left out of this list.
+        return {n: v for n, v in self.cash.items() if n == 0 or v != 0}
 
     def balance_dollars(self, subaccount=0):
-        return self.cash.get(subaccount, D(0))
+        if subaccount not in self.cash:
+            raise KalshiError(404, '{"error":{"code":"not_found","message":"subaccount not found"}}')
+        return self.cash[subaccount]
 
-    def transfer(self, frm, to, cents, transfer_id=None):
+    def transfer(self, frm, to, cents, transfer_id=None, exchange_index=None):
         self.transfers.append((frm, to, cents, transfer_id))
+        self.transfer_pot = exchange_index
         self.cash[frm] -= D(cents) / 100
         self.cash[to] += D(cents) / 100
         return {}

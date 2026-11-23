@@ -54,6 +54,7 @@ TRANSFER_FILE = "TRANSFER_REQUEST"  # the website asks to move money between sub
 SETUP_FILE = "SETUP_REQUEST"        # the website asks to set up subaccounts again now
 ALLOCATION_FILE = "ALLOCATION_REQUEST"  # the website asks Kalshi to keep money in the crypto pot
 POTS = {0: "general", 1: "combos", 2: "crypto", 3: "sports"}
+CRYPTO_POT = 2                      # the money pot Kalshi uses for crypto markets
 
 
 def pot_name(shard) -> str:
@@ -139,6 +140,15 @@ class Bot:
         except Exception as e:
             log.error("could not list your Kalshi subaccounts (%s)", e)
             have = {0}
+        # Kalshi's list leaves out subaccounts with no money in them, so also count the ones
+        # the bot already knows about, and ask Kalshi about each missing one directly.
+        have |= {int(n) for n in self.state.subaccounts}
+        for n in [n for n in needed if n not in have]:
+            try:
+                self.client.balance_dollars(n)
+                have.add(n)
+            except Exception:
+                pass
         missing = [n for n in needed if n not in have]
         if missing:
             try:
@@ -155,18 +165,28 @@ class Bot:
                     problem = f"Kalshi said: {kalshi_words(e)}"
                     log.error("Kalshi would not upgrade the API level (%s). It needs one bet placed by the "
                               "bot first: run a single play on subaccount 0 for one bet, then try again.", e)
-            tries = 0
-            while missing and max(missing) not in have and tries < 63:
-                tries += 1
+            # Kalshi numbers them 1, 2, 3, ... in order, so making #3 means making #2 first. Never make
+            # more than that (a restart must not keep making new ones).
+            for _ in range(max(0, max(missing) - max(have))):
                 try:
-                    n = self.client.create_subaccount()
+                    n = self.client.create_subaccount(CRYPTO_POT)
                 except Exception as e:
                     log.error("could not make a Kalshi subaccount (%s)", e)
                     problem = problem or f"Making it failed. Kalshi said: {kalshi_words(e)}"
                     break
+                fresh = n not in have
                 have.add(n)
                 log.info("made Kalshi subaccount %s", n)
+                if not fresh or n > max(missing):
+                    problem = (f"Kalshi made subaccount {n} instead. Set the play to use subaccount {n} "
+                               "on Settings.")
+                    log.warning(problem)
+                    break
+                if all(m in have for m in missing):
+                    break
         self.ready_accounts = {n for n in needed if n in have} | {0}
+        self.state.subaccounts = sorted(n for n in have if n != 0)
+        self.ledger.save_state(self.state)
         not_ready = [n for n in needed if n not in have]
         if not_ready:
             log.error("Kalshi subaccount(s) %s are not set up, so plays using them won't bet",
@@ -534,14 +554,16 @@ class Bot:
                 pass
             return
         try:
-            self.client.transfer(frm, to, cents, req.get("id"))
-            self.state.notice = f"Moved ${cents / 100:.2f} from {account_name(frm)} to {account_name(to)}."
+            # The bot only bets on crypto, so money moves happen inside the crypto pot.
+            self.client.transfer(frm, to, cents, req.get("id"), exchange_index=CRYPTO_POT)
+            self.state.notice = (f"Moved ${cents / 100:.2f} from {account_name(frm)} to {account_name(to)} "
+                                 "(crypto pot).")
             log.info(self.state.notice)
             self.last_accounts = None   # show the new amounts soon
             if hasattr(self.broker, "_cache"):
                 self.broker._cache = (0.0, {})
         except Exception as e:
-            self.state.notice = f"Money move failed: {e}"
+            self.state.notice = f"Money move failed: {kalshi_words(e)}"
             log.error(self.state.notice)
         self.ledger.save_state(self.state)
 
@@ -569,6 +591,8 @@ class Bot:
             log.warning("could not read Kalshi balances (%s)", e)
             self.last_accounts = now - timedelta(seconds=ACCOUNTS_SECONDS - 5)   # try again in 5 seconds
             return
+        for n in getattr(self, "ready_accounts", {0}):
+            cash.setdefault(n, Decimal("0"))            # a new, empty subaccount still exists
         self.state.accounts = {str(k): str(v) for k, v in sorted(cash.items())}
 
     def _apply_paper_reset(self) -> None:

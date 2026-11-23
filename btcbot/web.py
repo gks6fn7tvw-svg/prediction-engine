@@ -806,7 +806,10 @@ def overview_page(app: App, secure: bool = False) -> str:
         parts.append('<div class="box warn"><b>Paused:</b> no new bets. Open bets still finish.'
                      + (f'<p class="hint">Why: {esc(why)}</p>' if why else "") +
                      '<form method="post" action="/resume"><button>Resume betting</button></form></div>')
-    if app.moved:
+    if app.moved and s is not None and s.mode == "live":
+        d["moved"] = app.moved          # shown inside the Kalshi money box, where the buttons are
+        app.moved = ""
+    elif app.moved:
         parts.append(f'<div class="box ok">{esc(app.moved)}</div>')
         app.moved = ""
     if not secure and app.secure_link is not None and app.secure_link.ready:
@@ -921,6 +924,9 @@ def money_section(d: dict) -> str:
     to_choices = "".join(f'<option value="{n}"{" selected" if n == first_sub else ""}>{esc(account_name(n))}</option>'
                          for n in numbers)
     notice = f'<p class="hint">Last change: {esc(st.notice)}</p>' if st and st.notice else ""
+    if d.get("moved"):
+        bad = d["moved"].startswith("Not ")
+        notice = f'<div class="box {"bad" if bad else "ok"}" style="margin:8px 0">{esc(d["moved"])}</div>' + notice
     if st and st.setup_note:
         notice = (f'<div class="box warn" style="margin:8px 0">{esc(st.setup_note)}'
                   '<form method="post" action="/setup"><button class="btn2">Try setting up again now</button>'

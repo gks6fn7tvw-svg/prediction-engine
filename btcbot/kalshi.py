@@ -224,18 +224,21 @@ class KalshiClient:
             out[n] = out.get(n, Decimal("0")) + (dollars(b.get("balance")) or Decimal("0"))
         return out
 
-    def create_subaccount(self) -> int:
+    def create_subaccount(self, exchange_index: int | None = None) -> int:
         """Make the next numbered subaccount (needs the Advanced API level). Returns its number."""
-        data = self._request("POST", "/portfolio/subaccounts", body={}, signed=True)
+        body = {"exchange_index": exchange_index} if exchange_index is not None else {}
+        data = self._request("POST", "/portfolio/subaccounts", body=body, signed=True)
         for key in ("subaccount_number", "subaccount"):
             if data.get(key) is not None:
                 return int(data[key])
         raise KalshiError(0, f"Kalshi did not say which subaccount it made: {data}")
 
     def transfer(self, from_subaccount: int, to_subaccount: int, amount_cents: int,
-                 transfer_id: str | None = None) -> dict:
-        """Move cash between your own subaccounts. Nothing leaves your Kalshi account."""
+                 transfer_id: str | None = None, exchange_index: int | None = None) -> dict:
+        """Move cash between your own subaccounts, inside one money pot. Nothing leaves your Kalshi account."""
+        extra = {"exchange_index": exchange_index} if exchange_index is not None else {}
         return self._request("POST", "/portfolio/subaccounts/transfer", signed=True, body={
+            **extra,
             "client_transfer_id": transfer_id or str(uuid.uuid4()),
             "from_subaccount": int(from_subaccount), "to_subaccount": int(to_subaccount),
             "amount_cents": int(amount_cents)})

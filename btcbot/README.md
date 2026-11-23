@@ -291,7 +291,10 @@ pretend money.
 Downloads the last N days of settled markets (`btcbot/history.py`): Kalshi's 1-minute Up
 bid/ask candles per market (batch endpoint, split to stay under 10,000 periods per
 request; falls back to the per-market and historical endpoints), each result and official
-settlement value (`expiration_value`), and Coinbase 1-minute candles for the same minutes.
+settlement value (`expiration_value`), Coinbase 1-minute candles for the same minutes, and
+Binance's per-minute buying power (`buy_volume` = coins bought by takers, `all_volume` =
+everything traded; daily files from data.binance.vision, the newest day from Binance.US;
+`flow_from` says which).
 One row per market-minute in `history.csv` (download link on Settings). Runs in the
 background in the website process; public data only. With a saved key it also checks
 whether the account may read the official BRTI through Kalshi's CF Benchmarks passthrough.

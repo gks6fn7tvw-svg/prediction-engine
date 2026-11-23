@@ -62,6 +62,63 @@ class FakeCoinbase:
         return R()
 
 
+class FakeBinance(FakeCoinbase):
+    """Coinbase candles, Binance daily files (microsecond times) and Binance.US for the newest day."""
+    def __init__(self, files_work=True):
+        self.files_work = files_work
+        self.urls = []
+
+    def get(self, url, params=None, timeout=None):
+        import io
+        import zipfile
+        self.urls.append(url)
+        if "data.binance.vision" in url:
+            day = datetime.strptime(url.rsplit("-1m-", 1)[1][:10], "%Y-%m-%d").replace(tzinfo=timezone.utc)
+            if not self.files_work or day.date() >= END.date():
+                return type("R", (), {"status_code": 404, "content": b"<Error/>"})()
+            start = int(day.timestamp())
+            lines = [f"{(start + 60 * k) * 1_000_000},60000,60010,59990,60005,10.0,0,0,0,7.0,0,0"
+                     for k in range(1440)]
+            buf = io.BytesIO()
+            with zipfile.ZipFile(buf, "w") as z:
+                z.writestr("x.csv", "\n".join(lines))
+            return type("R", (), {"status_code": 200, "content": buf.getvalue()})()
+        if "binance.us" in url:
+            t0 = params["startTime"] // 1000
+            stop = params["endTime"] // 1000
+            rows = [[(t0 + 60 * k) * 1000, "1", "1", "1", "1", "2.0", 0, 0, 0, "0.5", 0, 0]
+                    for k in range(1000) if t0 + 60 * k < stop]
+            return type("R", (), {"status_code": 200, "json": lambda self: rows})()
+        return super().get(url, params, timeout)
+
+
+class TestBuyingPower(unittest.TestCase):
+    def test_daily_files_then_binance_us_for_today(self):
+        start, end = int((END - timedelta(days=1)).timestamp()), int(END.timestamp())
+        flow = H.buying_power(FakeBinance(), "BTCUSDT", start, end, sleep=lambda s: None)
+        old, new = flow[start], flow[end - 60]
+        self.assertEqual(old, (7.0, 10.0, "binance"))           # 70% bought by eager buyers
+        self.assertEqual(new, (0.5, 2.0, "binance.us"))         # today's file isn't out yet
+        self.assertTrue(all(m in flow for m in range(start, end, 60)))   # no gaps
+
+    def test_rows_get_the_buying_power(self):
+        d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d)
+        path = os.path.join(d, "history.csv")
+        summary = H.collect(FakeKalshi(4), FakeBinance(), "KXBTC15M", 1, path, sleep=lambda s: None,
+                            now=END.timestamp() + 1)
+        self.assertIn("buying power for", summary)
+        with open(path) as fh:
+            rows = list(csv.DictReader(fh))
+        self.assertTrue(all(r["buy_volume"] and r["all_volume"] and r["flow_from"] for r in rows))
+
+    def test_binance_us_alone_when_files_fail(self):
+        start, end = int((END - timedelta(hours=20)).timestamp()), int(END.timestamp())
+        flow = H.buying_power(FakeBinance(files_work=False), "BTCUSDT", start, end, sleep=lambda s: None)
+        self.assertEqual({v[2] for v in flow.values()}, {"binance.us"})
+        self.assertEqual(len(flow), (end - start) // 60)
+
+
 class TestCollect(unittest.TestCase):
     def setUp(self):
         self.dir = tempfile.mkdtemp()

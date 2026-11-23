@@ -411,3 +411,55 @@ class TestMoveButton(WebCase):
         self.assertIn("Move $7.55 into the crypto pot", body)
         self.call("/pots", data={"key": KEY, "pot": "move"})
         self.assertTrue(os.path.exists(os.path.join(folder, POT_MOVE_FILE)))
+
+
+class TestMakeCryptoSubaccount(LiveCase):
+    def ask(self):
+        from btcbot.bot import MAKE_SUB_FILE
+        open(os.path.join(self.ledger.folder, MAKE_SUB_FILE), "w").close()
+
+    def test_makes_one_in_the_crypto_pot(self):
+        ex = FakeExchange(subaccounts=(0, 1))
+        pots = []
+        real = ex.create_subaccount
+        ex.create_subaccount = lambda exchange_index=None: pots.append(exchange_index) or real(exchange_index)
+        self.make([MAIN], ex)
+        self.ask()
+        self.at(12, 0.50, 0.52)
+        self.assertEqual(pots, [2])
+        self.assertEqual(self.bot.state.crypto_subaccounts, [2])
+        self.assertIn("made subaccount 2 in the crypto pot", self.bot.state.notice)
+
+    def test_does_not_pile_up_unused_ones(self):
+        ex = FakeExchange(subaccounts=(0,))
+        self.make([MAIN], ex)
+        for minutes in (12, 11.9, 11.8):
+            self.ask()
+            self.at(minutes, 0.50, 0.52)
+        self.assertEqual(self.bot.state.crypto_subaccounts, [1, 2])
+        self.assertIn("no play uses them yet", self.bot.state.notice)
+
+
+class TestMakeSubaccountButton(WebCase):
+    def test_button_asks_the_bot(self):
+        import yaml
+        from btcbot.bot import MAKE_SUB_FILE
+        from btcbot.ledger import Ledger
+        from btcbot.settings import load, mode_folder
+        with open(self.path) as fh:
+            raw = yaml.safe_load(fh)
+        raw.update(mode="live", live_confirm="I accept real-money risk")
+        with open(self.path, "w") as fh:
+            yaml.safe_dump(raw, fh)
+        folder = mode_folder(load(self.path))
+        ledger = Ledger(folder)
+        state = ledger.load_state(D(0))
+        state.accounts = {"0": "8.42"}
+        state.shards = {"0": {"2": "8.42"}}
+        state.crypto_subaccounts = [2]
+        ledger.save_state(state)
+        _, body, _ = self.call(f"/?key={KEY}")
+        self.assertIn("Make a subaccount in the crypto pot", body)
+        self.assertIn("Made so far: 2.", body)
+        self.call("/subaccount", data={"key": KEY})
+        self.assertTrue(os.path.exists(os.path.join(folder, MAKE_SUB_FILE)))

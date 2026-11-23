@@ -55,6 +55,7 @@ TRANSFER_FILE = "TRANSFER_REQUEST"  # the website asks to move money between sub
 SETUP_FILE = "SETUP_REQUEST"        # the website asks to set up subaccounts again now
 ALLOCATION_FILE = "ALLOCATION_REQUEST"  # the website asks Kalshi to keep money in the crypto pot
 POT_MOVE_FILE = "POT_MOVE_REQUEST"      # the website asks to move the main account's cash into the crypto pot
+MAKE_SUB_FILE = "MAKE_SUBACCOUNT_REQUEST"  # the website asks for a new subaccount inside the crypto pot
 POTS = {0: "general", 1: "combos", 2: "crypto", 3: "sports"}
 CRYPTO_POT = 2                      # the money pot Kalshi uses for crypto markets
 
@@ -256,6 +257,38 @@ class Bot:
             log.warning(self.state.notice)
         self.ledger.save_state(self.state)
 
+    def _apply_make_sub_request(self) -> None:
+        """Website button: make one new Kalshi subaccount inside the crypto pot."""
+        path = os.path.join(self.ledger.folder, MAKE_SUB_FILE)
+        if not os.path.exists(path):
+            return
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+        now = self.clock.now()
+        used = {p.subaccount for p in self.s.plays}
+        spare = [n for n in self.state.crypto_subaccounts if n not in used]
+        if len(spare) >= 2:
+            self.state.notice = (f"{self.clock_words(now)}: not made: subaccounts {', '.join(map(str, spare))} are "
+                                 "already in the crypto pot and no play uses them yet. Set a play to one of them on "
+                                 "Settings.")
+            log.info(self.state.notice)
+            self.ledger.save_state(self.state)
+            return
+        try:
+            n = self.client.create_subaccount(CRYPTO_POT)
+        except Exception as e:
+            self.state.notice = f"{self.clock_words(now)}: Kalshi didn't make the subaccount: {kalshi_words(e)}"
+            log.error(self.state.notice)
+        else:
+            self.state.crypto_subaccounts = sorted(set(self.state.crypto_subaccounts) | {n})
+            self.state.subaccounts = sorted(set(self.state.subaccounts) | {n})
+            self.state.notice = (f"{self.clock_words(now)}: made subaccount {n} in the crypto pot. Next: on Settings, "
+                                 f"set a play to subaccount {n} and save; then move money into it here.")
+            log.info(self.state.notice)
+        self.ledger.save_state(self.state)
+
     def _apply_pot_move_request(self) -> None:
         """Website button: move the main account's cash from the other pots into the crypto pot."""
         path = os.path.join(self.ledger.folder, POT_MOVE_FILE)
@@ -426,6 +459,7 @@ class Bot:
             self._retry_setup(now)
             self._apply_allocation_request()
             self._apply_pot_move_request()
+            self._apply_make_sub_request()
             self._apply_transfer_request()
             self._refresh_accounts(now)
         self._goal_check()   # before any new bet, so the goal pauses betting in time

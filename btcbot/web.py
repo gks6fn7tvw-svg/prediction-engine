@@ -30,8 +30,8 @@ from . import goal as G
 from . import keystore
 from . import ledger as L
 from .kalshi import KalshiClient, KalshiError
-from .bot import (ALLOCATION_FILE, PAPER_RESET_FILE, POT_MOVE_FILE, SETUP_FILE, TRANSFER_FILE, account_name,
-                  pot_name)
+from .bot import (ALLOCATION_FILE, MAKE_SUB_FILE, PAPER_RESET_FILE, POT_MOVE_FILE, SETUP_FILE, TRANSFER_FILE,
+                  account_name, pot_name)
 from .rules import Quote, parse_time
 from .secure import SecureLink
 from .settings import (LIVE_CONFIRM_TEXT, PACKAGE_DIR, SIZE_MODES, Settings, SettingsError, load, load_raw,
@@ -942,6 +942,12 @@ def money_section(d: dict) -> str:
         notice = (f'<div class="box warn" style="margin:8px 0">{esc(st.setup_note)}'
                   '<form method="post" action="/setup"><button class="btn2">Try setting up again now</button>'
                   '</form></div>' + notice)
+    made = sorted(int(n) for n in (st.crypto_subaccounts if st else []))
+    make_box = ('<form method="post" action="/subaccount"><button class="btn2">Make a subaccount in the crypto pot'
+                '</button></form><p class="hint">Each play that\'s on needs its own subaccount, made inside the '
+                'crypto pot. Then set the play to that number on Settings, save, and move money into it here.'
+                + (f' Made so far: {", ".join(map(str, made))}.' if made else "") + '</p>')
+    pots_box += make_box
     if numbers == [0]:   # nothing to move between yet
         return ('<h2 id="money">Kalshi money</h2><div class="box">' + rows + notice + pots_box +
                 '<p class="hint">Every play that\'s on uses your main account, so there\'s nothing to move '
@@ -1481,6 +1487,14 @@ class Handler(BaseHTTPRequestHandler):
                         json.dump({"shard": 2 if choice == "2" else None}, fh)
                     self.app.moved = ("Asked Kalshi to keep your money in the crypto pot. Check back in a minute."
                                       if choice == "2" else "Asked Kalshi to stop moving money between pots.")
+            return self._redirect("/#money")
+        if url.path == "/subaccount":
+            s, _ = self.app.settings()
+            if s is not None and s.mode == "live":
+                folder = mode_folder(s)
+                os.makedirs(folder, exist_ok=True)
+                open(os.path.join(folder, MAKE_SUB_FILE), "w").close()
+                self.app.moved = "Asked the bot to make a subaccount in the crypto pot. The number shows here soon."
             return self._redirect("/#money")
         if url.path == "/setup":
             s, _ = self.app.settings()

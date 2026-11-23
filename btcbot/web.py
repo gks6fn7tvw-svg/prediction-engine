@@ -1131,7 +1131,7 @@ def trade_box(app: "App", d: dict, secure: bool) -> str:
     money = "real money from your main account\'s crypto pot" if real else "pretend money"
     out.append(
         '<form method="post" action="/trade"><input type="hidden" name="action" value="buy">'
-        f'<input type="hidden" name="side" id="trade-side" value="yes">{market}'
+        f'{market}'
         '<div class="row2"><div><label>Contracts</label>'
         '<input name="contracts" value="1" inputmode="numeric"></div>'
         '<div><label>Most I\'ll pay (¢)</label><input name="max" inputmode="decimal" placeholder="price + 2"></div></div>'
@@ -1141,7 +1141,7 @@ def trade_box(app: "App", d: dict, secure: bool) -> str:
         f'<p class="hint">Buys right away in the market closing next, at the price on screen (up to 2¢ more, or '
         f'your limit), with {money}. Your trades show up as the play "{MANUAL}"; each open one has a Sell now '
         'button.</p></form></div>'
-        '<script>function pickSide(v){var e=document.getElementById("trade-side");if(e)e.value=v;}</script>')
+        '<script>function pickSide(v){}</script>')
     return "".join(out)
 
 
@@ -1865,7 +1865,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self._redirect("/#trade")
             action = field(form, "action", "buy")
             req = {"id": str(uuid.uuid4()), "action": "sell" if action == "sell" else "buy",
-                   "side": field(form, "side"), "at": datetime.now(timezone.utc).isoformat()}
+                   "side": (form.get("side") or [""])[-1].strip(),   # the button tapped (sent last)
+                   "at": datetime.now(timezone.utc).isoformat()}
             try:
                 if req["action"] == "buy":
                     req["series"] = field(form, "series") or s.markets[0]

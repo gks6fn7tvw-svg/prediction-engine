@@ -97,6 +97,24 @@ class TestTradeBox(WebCase):
         from btcbot.settings import load, mode_folder
         return os.path.join(mode_folder(load(self.path)), TRADE_FILE)
 
+    def test_the_tapped_button_decides_the_side(self):
+        # A browser sends the form's hidden fields, then the button that was tapped.
+        import re
+        _, body, _ = self.call(f"/?key={KEY}")
+        form = body[body.index('<form method="post" action="/trade"><input type="hidden" name="action" value="buy">'):]
+        form = form[:form.index("</form>")]
+        fields = re.findall(r'<input type="hidden" name="([^"]+)" value="([^"]*)"', form)
+        self.assertNotIn("side", [n for n, _ in fields])      # only the buttons say Up or Down
+        self.call("/trade", data=[("key", KEY)] + fields + [("contracts", "1"), ("side", "no")])
+        with open(self.trade_file()) as fh:
+            self.assertEqual(json.load(fh)["side"], "no")
+        os.remove(self.trade_file())
+        # A page loaded before this fix still sent side=yes first: the tapped button (last) wins.
+        self.call("/trade", data=[("key", KEY), ("action", "buy"), ("side", "yes"), ("contracts", "1"),
+                                  ("series", "KXBTC15M"), ("side", "no")])
+        with open(self.trade_file()) as fh:
+            self.assertEqual(json.load(fh)["side"], "no")
+
     def test_paper_mode_trade_is_sent_to_the_bot(self):
         _, body, _ = self.call(f"/?key={KEY}")
         self.assertIn("Make a trade", body)

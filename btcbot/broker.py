@@ -127,8 +127,8 @@ class LiveBroker:
     def _fill(self, resp: dict, side: str, limit: Decimal, multiplier: Decimal, buying: bool) -> Fill | None:
         n = dollars(resp.get("fill_count")) or Decimal("0")
         if n <= 0:
-            log.info("order did not fill (order id %s; Kalshi said filled %s, left %s)", resp.get("order_id"),
-                     resp.get("fill_count"), resp.get("remaining_count"))
+            log.debug("order %s did not fill (Kalshi said filled %s, left %s)", resp.get("order_id"),
+                      resp.get("fill_count"), resp.get("remaining_count"))
             return None
         yes_avg = dollars(resp.get("average_fill_price"))
         price = self._our_price(yes_avg, side, limit, buying)

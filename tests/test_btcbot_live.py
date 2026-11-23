@@ -415,3 +415,20 @@ class TestCheckAroundTheClose(LiveCase):
         self.at(0, 0.99, 1.00, seconds=-20)
         self.assertEqual(self.bot.mismatch_streak, 0)
         self.assertEqual(self.bot.state.alert, "")
+
+
+class TestMissReasons(LiveCase):
+    def test_says_why_and_when(self):
+        import logging
+        ex = FakeExchange()
+        ex.place_ioc = lambda *a, **kw: (ex.orders.append(1) or
+                                         {"order_id": "x", "fill_count": "0.00", "remaining_count": "0.00"})
+        ex.market = lambda ticker: market(0.83, 0.85)          # right after: Up costs 85c
+        self.make([MAIN], ex)
+        with self.assertLogs("btcbot", level="INFO") as logs:
+            self.at(7.5, 0.80, 0.82)
+        line = next(m for m in logs.output if "didn't fill" in m)
+        self.assertIn("Bitcoin", line)
+        self.assertIn("UP didn't fill: tried to buy at up to 82¢ with 7:30 left", line)
+        self.assertIn("the price had moved to 85¢ right after", line)
+        self.assertIn("1 of 5 tries used", line)

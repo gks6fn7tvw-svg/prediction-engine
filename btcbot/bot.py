@@ -18,6 +18,21 @@ from .ledger import Ledger, Position, State
 from .settings import Settings
 
 
+COINS = {"KXBTC": "Bitcoin", "KXETH": "Ethereum", "KXSOL": "Solana", "KXXRP": "XRP", "KXDOGE": "Dogecoin",
+         "KXBNB": "BNB", "KXHYPE": "HYPE", "KXZEC": "Zcash"}
+
+
+def cents_words(price) -> str:
+    return f"{Decimal(price) * 100:.1f}".rstrip("0").rstrip(".") + "¢"
+
+
+def time_left_words(q: rules.Quote, now: datetime) -> str:
+    if q.close_time is None:
+        return "unknown time left"
+    secs = max(0, int((q.close_time - now).total_seconds()))
+    return f"{secs // 60}:{secs % 60:02d} left"
+
+
 def kalshi_words(e: Exception) -> str:
     """Kalshi's own error message, short."""
     text = getattr(e, "text", "") or str(e)
@@ -178,6 +193,35 @@ class Bot:
         if missing and self.last_setup and (now - self.last_setup).total_seconds() >= SETUP_RETRY_SECONDS:
             log.info("trying again to set up Kalshi subaccounts")
             self.prepare_live()
+
+    def market_words(self, q: rules.Quote) -> str:
+        """KXBTC15M-26NOV221845-45 -> "Bitcoin 1:45 pm" (the close, in your time zone)."""
+        coin = next((name for prefix, name in COINS.items() if q.series.upper().startswith(prefix)), q.series)
+        if q.close_time is None:
+            return coin
+        t = q.close_time.astimezone(ZoneInfo(self.s.day_timezone))
+        return f"{coin} {t.strftime('%I:%M %p').lstrip('0').lower()}"
+
+    def _miss_reason(self, q: rules.Quote, side: str, limit: Decimal) -> str:
+        """Why an order that fills-now-or-cancels didn't fill, from the prices right after it."""
+        if self.broker.live:
+            try:
+                after = rules.Quote.from_market(self.client.market(q.ticker), q.series)
+            except Exception:
+                return "Kalshi couldn't be asked why"
+            when = "right after"
+        else:
+            after, when = q, "at that moment"
+        ask, size = after.ask(side), after.ask_size(side)
+        if ask is None or size == 0:
+            return f"nobody was selling {rules.side_name(side)} {when}"
+        if ask > limit:
+            return (f"the price had moved to {cents_words(ask)} {when} (it offered up to {cents_words(limit)}; "
+                    f"raise \"Extra cents\" to chase moves)")
+        if not self.broker.live:
+            return "not enough pretend money"
+        return (f"the price looks fine now ({cents_words(ask)}), so the sellers at that price were taken a "
+                f"moment before the order arrived")
 
     def _account(self, play) -> int:
         return play.subaccount if self.broker.live else 0
@@ -580,7 +624,12 @@ class Bot:
                 log.warning("%s: Kalshi's reply said 'not filled' but the contracts are there; recorded them",
                             play.name)
         if fill is None:
-            self._say(key, f"{play.name}: {q.ticker}: price moved before the order filled; will retry")
+            tries = self.state.attempts.get(key, 0)
+            log.info("%s: %s %s didn't fill: tried to buy at up to %s with %s; %s. %s", play.name,
+                     self.market_words(q), rules.side_name(chk.side), cents_words(chk.limit),
+                     time_left_words(q, now), self._miss_reason(q, chk.side, chk.limit),
+                     f"Will try again ({tries} of {MAX_ORDER_TRIES} tries used)." if tries < MAX_ORDER_TRIES
+                     else "That was the last try for this market.")
             return
         pos = Position(play.name, q.ticker, q.series, chk.side, plain(fill.contracts), str(fill.price),
                        str(fill.fee), now.isoformat(), q.close_time.isoformat() if q.close_time else "", acct)

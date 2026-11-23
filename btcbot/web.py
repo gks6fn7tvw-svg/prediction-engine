@@ -601,12 +601,58 @@ def page(title: str, body: str, tab: str, refresh=None, live: str | None = None,
     meta = f'<meta http-equiv="refresh" content="{refresh}">' if refresh and not live else ""
     on = lambda t: ' class="on"' if t == tab else ""
     body_attrs = f' data-live="{esc(live)}" data-sig="{esc(sig)}"' if live else ""
-    script = f"<script>{LIVE_JS}</script>" if live else ""
+    script = f"<script>{COPY_JS}{LIVE_JS if live else ''}</script>"
     return (f'<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" '
             f'content="width=device-width,initial-scale=1"><meta name="theme-color" content="#0d0f14">'
             f'{meta}<title>{esc(title)}</title><style>{CSS}</style></head><body{body_attrs}><main>'
             f'<nav><a href="/"{on("status")}>Overview</a><a href="/settings"{on("settings")}>Settings</a></nav>'
             f'{body}</main>{script}</body></html>')
+
+
+COPY_JS = """
+function copyLog(btn){
+  var text = document.getElementById(btn.dataset.target).value;
+  function done(){ btn.textContent = 'Copied ✓'; setTimeout(function(){ btn.textContent = 'Copy'; }, 2000); }
+  function fail(){
+    var box = document.getElementById(btn.dataset.target);
+    box.hidden = false; box.style.display = 'block'; box.focus(); box.select();
+    btn.textContent = 'Press and hold the text to copy';
+  }
+  function legacy(){
+    var ta = document.createElement('textarea');
+    ta.value = text; ta.style.position = 'fixed'; ta.style.top = '0'; ta.style.left = '0';
+    ta.style.opacity = '0'; ta.style.fontSize = '16px';
+    document.body.appendChild(ta);
+    ta.contentEditable = true; ta.readOnly = false;
+    var range = document.createRange(); range.selectNodeContents(ta);
+    var sel = window.getSelection(); sel.removeAllRanges(); sel.addRange(range);
+    ta.setSelectionRange(0, 9999999);
+    var ok = false;
+    try { ok = document.execCommand('copy'); } catch (e) {}
+    document.body.removeChild(ta);
+    if (ok) { done(); } else { fail(); }
+  }
+  if (navigator.clipboard && window.isSecureContext) {
+    navigator.clipboard.writeText(text).then(done, legacy);
+  } else { legacy(); }
+}
+"""
+
+
+def activity_box(title: str, path: str, box_id: str, play: str | None = None) -> str:
+    """Recent log lines (newest first) with a Copy button that copies the last 300."""
+    shown = tail_log(path, 15, play=play)
+    if not shown:
+        return ""
+    everything = tail_log(path, 300, play=play)
+    return (f'<div style="display:flex;justify-content:space-between;align-items:center;margin:22px 0 8px">'
+            f'<h2 style="margin:0">{esc(title)}</h2>'
+            f'<button type="button" class="btn2" style="width:auto;margin:0;padding:7px 14px;font-size:14px" '
+            f'data-target="{box_id}" onclick="copyLog(this)">Copy</button></div>'
+            f'<div class="box log">{esc(chr(10).join(shown))}</div>'
+            f'<textarea id="{box_id}" hidden readonly rows="12" class="log" style="width:100%;background:var(--bg);'
+            f'color:var(--text);border-radius:10px;padding:10px">{esc(chr(10).join(everything))}</textarea>'
+            f'<p class="hint">Copy takes the last {len(everything)} lines, newest first.</p>')
 
 
 LIVE_BADGE = '<span class="livebadge"><span id="live-dot" class="dot"></span>LIVE</span>'
@@ -820,9 +866,7 @@ def overview_page(app: App, secure: bool = False) -> str:
     parts.append('<a class="btn btn2" href="/settings#add">+ Add or change plays</a>')
     if s.mode == "live":
         parts.append(money_section(d))
-    log = tail_log(os.path.join(d["folder"], "bot.log"), 15)
-    if log:
-        parts.append('<h2>Recent activity</h2><div class="box log">' + esc("\n".join(log)) + "</div>")
+    parts.append(activity_box("Recent activity", os.path.join(d["folder"], "bot.log"), "log-all"))
     if not d["paused"]:
         parts.append('<form method="post" action="/pause"><button class="btn2" onclick="return confirm('
                      '\'Pause new bets? Open bets still finish.\')">Pause new bets</button></form>')
@@ -979,9 +1023,7 @@ def play_page(app: App, name: str) -> str:
     if len(rows) > 60:
         parts.append(f'<p class="hint">Showing the newest 60 of {len(rows)}.</p>')
     parts.append('<p class="hint"><a href="/trades.csv" style="color:#8fb0ff">Download every bet</a></p></div>')
-    log = tail_log(os.path.join(d["folder"], "bot.log"), 15, play=name)
-    if log:
-        parts.append('<h2>What it did lately</h2><div class="box log">' + esc("\n".join(log)) + "</div>")
+    parts.append(activity_box("What it did lately", os.path.join(d["folder"], "bot.log"), "log-play", play=name))
     if play is not None:
         parts.append(f'<a class="btn btn2" href="/settings#play-{s.plays.index(play)}">Edit this play</a>')
     return page(name, "".join(parts), "status", live="/api/live?play=" + quote(name, safe=""), sig=d["sig"])

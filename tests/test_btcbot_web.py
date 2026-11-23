@@ -184,6 +184,8 @@ class TestStatus(WebCase):
         self.assertIn("DOWN won", body)
         self.assertIn("main: BOUGHT", body)
         self.assertNotIn("cheap: skip", body)              # only this play's activity
+        self.assertIn('data-target="log-play" onclick="copyLog(this)"', body)
+        self.assertIn('<textarea id="log-play" hidden', body)
         _, body, _ = self.call(f"/play?name=nothing&key={KEY}")
         self.assertIn("No play called", body)
         status, csv_text, headers = self.call("/trades.csv", cookie=f"btcbot_key={KEY}")

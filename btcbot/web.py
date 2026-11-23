@@ -30,7 +30,8 @@ from . import goal as G
 from . import keystore
 from . import ledger as L
 from .kalshi import KalshiClient, KalshiError
-from .bot import ALLOCATION_FILE, PAPER_RESET_FILE, SETUP_FILE, TRANSFER_FILE, account_name, pot_name
+from .bot import (ALLOCATION_FILE, PAPER_RESET_FILE, POT_MOVE_FILE, SETUP_FILE, TRANSFER_FILE, account_name,
+                  pot_name)
 from .rules import Quote, parse_time
 from .secure import SecureLink
 from .settings import (LIVE_CONFIRM_TEXT, PACKAGE_DIR, SIZE_MODES, Settings, SettingsError, load, load_raw,
@@ -915,12 +916,19 @@ def money_section(d: dict) -> str:
                  f'<div class="amt">{"$%.2f" % float(cash) if cash is not None else "not set up yet"}</div></div>')
     pots_box = ""
     if st is not None and shards:
+        elsewhere = sum((float(v) for k, v in (shards.get("0") or {}).items() if k != "2"), 0.0)
+        move = (f'<button name="pot" value="move">Move ${elsewhere:.2f} into the crypto pot</button>'
+                if elsewhere >= 0.01 else "")
         pots_box = ('<p class="hint">Kalshi splits your cash into pots by kind of market. The bot can only bet '
                     'with what\'s in the <b>crypto</b> pot. Your own bets in the app move money for you; '
                     'bot bets don\'t. Example: $8 total but $0 in crypto = the bot can\'t buy.</p>'
-                    '<form method="post" action="/pots" style="display:flex;gap:8px;flex-wrap:wrap">'
+                    f'<form method="post" action="/pots">{move}'
+                    '<details><summary>Let Kalshi keep it there by itself</summary>'
+                    '<div style="display:flex;gap:8px;flex-wrap:wrap">'
                     '<button class="btn2" name="pot" value="2">Keep my money in the crypto pot</button>'
-                    '<button class="btn2" name="pot" value="off" style="opacity:.7">Stop</button></form>')
+                    '<button class="btn2" name="pot" value="off" style="opacity:.7">Stop</button></div>'
+                    '<p class="hint">Kalshi took this setting before but didn\'t move anything.</p>'
+                    '</details></form>')
     numbers = sorted(accounts)
     first_sub = next((n for n in numbers if n != 0), 0)
     choices = "".join(f'<option value="{n}">{esc(account_name(n))}</option>' for n in numbers)
@@ -1464,10 +1472,15 @@ class Handler(BaseHTTPRequestHandler):
                 folder = mode_folder(s)
                 os.makedirs(folder, exist_ok=True)
                 choice = field(form, "pot")
-                with open(os.path.join(folder, ALLOCATION_FILE), "w", encoding="utf-8") as fh:
-                    json.dump({"shard": 2 if choice == "2" else None}, fh)
-                self.app.moved = ("Asked Kalshi to keep your money in the crypto pot. Check back in a few seconds."
-                                  if choice == "2" else "Asked Kalshi to stop moving money between pots.")
+                if choice == "move":
+                    with open(os.path.join(folder, POT_MOVE_FILE), "w", encoding="utf-8") as fh:
+                        json.dump({"id": str(uuid.uuid4())}, fh)
+                    self.app.moved = "Asked the bot to move your money into the crypto pot. The result shows here soon."
+                else:
+                    with open(os.path.join(folder, ALLOCATION_FILE), "w", encoding="utf-8") as fh:
+                        json.dump({"shard": 2 if choice == "2" else None}, fh)
+                    self.app.moved = ("Asked Kalshi to keep your money in the crypto pot. Check back in a minute."
+                                      if choice == "2" else "Asked Kalshi to stop moving money between pots.")
             return self._redirect("/#money")
         if url.path == "/setup":
             s, _ = self.app.settings()

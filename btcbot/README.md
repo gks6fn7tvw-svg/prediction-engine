@@ -173,12 +173,12 @@ Advanced API level, which Kalshi grants for free once one of your last 100 order
 came from the API; the bot asks for it by itself.
 
 **Money pots:** Kalshi splits each account's cash into pots by kind of market
-("exchange shards"; crypto is pot 2). Orders from the app or website move money
-between pots for you; orders from a bot don't, so the crypto pot must already
-hold the money. The Overview shows how much is in the crypto pot. Tap **Keep my
-money in the crypto pot** once and Kalshi keeps it there (it checks every 10
-seconds); **Stop** turns that off. If the pot is short, the log says so instead
-of trying anyway.
+("exchange shards": crypto is 2, sports 3). Orders from the app or website move
+money between pots for you; orders from a bot don't, so the crypto pot must
+already hold the money. The Overview shows each pot. Tap **Move $X into the
+crypto pot** to move the main account's other pots over (Kalshi's Intra Account
+Transfer; it runs in the background and the bot confirms it arrived). If the
+pot is short, the log says so instead of trying anyway.
 
 **Step 1: one play, main account, tiny bets** (this also qualifies you for subaccounts)
 

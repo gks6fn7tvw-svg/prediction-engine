@@ -43,12 +43,37 @@ class TestRequests(unittest.TestCase):
         self.assertEqual(call["json"], {})
         self.assertEqual(call["headers"]["Content-Type"], "application/json")
 
-    def test_reads_cash_per_pot(self):
-        c, _ = signed_client({"balance": 842, "balance_dollars": "8.4200", "balance_breakdown": [
-            {"exchange_index": 0, "balance": "8.4200"}, {"exchange_index": 2, "balance": "0.0000"}]})
-        total, pots = c.balance_summary()
-        self.assertEqual(total, D("8.42"))
-        self.assertEqual(pots, {0: D("8.42"), 2: D("0")})
+    def test_reads_cash_per_account_and_pot(self):
+        c, _ = signed_client({"subaccount_balances": [
+            {"subaccount_number": 0, "exchange_index": 3, "balance": "7.5500"},
+            {"subaccount_number": 0, "exchange_index": 2, "balance": "0.8800"},
+            {"subaccount_number": 1, "exchange_index": 0, "balance": "0.0000"}]})
+        self.assertEqual(c.subaccount_shards(), {0: {3: D("7.55"), 2: D("0.88")}, 1: {0: D("0")}})
+
+    def test_pot_move_request(self):
+        # Kalshi counts this one in centicents: $7.55 = 75,500.
+        c, session = signed_client({"transfer_id": "t1"})
+        self.assertEqual(c.move_between_pots(3, 2, D("7.55"), transfer_id="abc"), "t1")
+        call = session.calls[0]
+        self.assertTrue(call["url"].endswith("/portfolio/intra_exchange_instance_transfer"))
+        self.assertEqual(call["json"], {"source": "event_contract", "destination": "event_contract",
+                                        "source_exchange_shard": 3, "destination_exchange_shard": 2,
+                                        "amount": 75500, "client_transfer_id": "abc"})
+
+    def test_pot_move_for_a_subaccount_has_no_client_id(self):
+        c, session = signed_client({"transfer_id": "t2"})
+        c.move_between_pots(0, 2, D("1"), transfer_id="abc", subaccount=1)
+        body = session.calls[0]["json"]
+        self.assertNotIn("client_transfer_id", body)
+        self.assertEqual((body["source_subaccount"], body["destination_subaccount"]), (1, 1))
+
+    def test_positions_follow_pages(self):
+        from test_btcbot import FakeResponse
+        c, session = signed_client()
+        replies = [FakeResponse(200, {"market_positions": [{"ticker": "A", "position_fp": "2"}], "cursor": "x"}),
+                   FakeResponse(200, {"market_positions": [{"ticker": "B", "position_fp": "-1"}], "cursor": ""})]
+        session.request = lambda *a, **k: (session.calls.append(k), replies.pop(0))[1]
+        self.assertEqual(c.positions(), {"A": D("2"), "B": D("-1")})
 
     def test_one_pot_balance_asks_for_that_pot(self):
         c, session = signed_client({"balance_dollars": "3.0000"})
@@ -79,8 +104,21 @@ class PotExchange(FakeExchange):
     def balance_dollars(self, subaccount=0, exchange_index=None):
         return self.pots.get(exchange_index, D(0)) if exchange_index is not None else sum(self.pots.values())
 
-    def balance_summary(self):
-        return sum(self.pots.values()), dict(self.pots)
+    def subaccount_shards(self):
+        return {0: dict(self.pots)}
+
+    refuse_moves = False
+
+    def move_between_pots(self, from_shard, to_shard, amount, transfer_id=None, subaccount=0):
+        self.pot_moves = getattr(self, "pot_moves", []) + [(from_shard, to_shard, amount, transfer_id)]
+        if self.refuse_moves:
+            raise KalshiError(403, '{"error":{"code":"forbidden","message":"insufficient permissions"}}')
+        self.pots[from_shard] -= amount
+        self.pots[to_shard] = self.pots.get(to_shard, D(0)) + amount
+        return "t1"
+
+    def pot_move(self, transfer_id):
+        return {"transfer_id": transfer_id, "status": "completed"}
 
     moves_money = True
 
@@ -160,7 +198,7 @@ class TestBotUsesTheCryptoPot(LiveCase):
         with self.assertLogs("btcbot", level="WARNING") as logs:
             self.crypto_at(10.8, 0.50, 0.52)
         self.assertIn("still hasn't moved any money into the crypto pot ($0.88)", self.bot.state.notice)
-        self.assertIn("Move it by hand", "\n".join(logs.output))
+        self.assertIn("into the crypto pot\" button", "\n".join(logs.output))
 
     def test_turning_it_off(self):
         ex = PotExchange()
@@ -284,15 +322,11 @@ class TestSubaccountInTheWrongPot(LiveCase):
         self.at(12, 0.50, 0.52)
         return calls
 
-    def test_made_in_the_crypto_pot_then_moved(self):
-        calls = self.setup_move(1)
-        self.assertEqual(calls, [2, 2])
-        self.assertIn("Moved $5.00", self.bot.state.notice)
-
-    def test_kalshi_gives_a_new_number(self):
+    def test_a_404_makes_no_new_subaccount(self):
         calls = self.setup_move(2)
-        self.assertEqual(calls, [2])
-        self.assertIn("set the play to subaccount 2", self.bot.state.notice)
+        self.assertEqual(calls, [2])                      # asked once, not again
+        self.assertEqual(getattr(self.client, "created", 0), 0)
+        self.assertIn("has no crypto pot", self.bot.state.notice)
 
 
 class TestMoveNeedsCryptoPotMoney(WebCase):
@@ -316,3 +350,64 @@ class TestMoveNeedsCryptoPotMoney(WebCase):
         self.assertFalse(os.path.exists(os.path.join(folder, TRANSFER_FILE)))
         _, body, _ = self.call(f"/?key={KEY}")
         self.assertIn("only $0.88 of your main account is in the crypto pot", body)
+
+
+class TestMoveIntoCryptoPot(LiveCase):
+    def crypto_at(self, minutes_left, yes_bid, yes_ask):
+        from datetime import timedelta
+        from test_btcbot import CLOSE
+        self.clock.t = CLOSE - timedelta(minutes=minutes_left)
+        self.client.open = [dict(market(yes_bid, yes_ask), exchange_index=2)]
+        return self.bot.step()
+
+    def ask(self):
+        from btcbot.bot import POT_MOVE_FILE
+        with open(os.path.join(self.ledger.folder, POT_MOVE_FILE), "w") as fh:
+            json.dump({"id": "6f1c2a52-3b5e-4c55-9a59-0d7a8c1f0a11"}, fh)
+
+    def test_moves_sports_money_to_crypto_and_confirms(self):
+        ex = PotExchange(general=0, crypto=0.88)
+        ex.pots[3] = D("7.55")
+        self.make([MAIN], exchange=ex)
+        self.crypto_at(12, 0.50, 0.52)
+        self.ask()
+        self.crypto_at(11.9, 0.50, 0.52)
+        self.assertEqual(ex.pot_moves, [(3, 2, D("7.55"), "6f1c2a52-3b5e-4c55-9a59-0d7a8c1f0a11")])
+        self.assertIn("asked Kalshi to move $7.55 from sports", self.bot.state.notice)
+        self.crypto_at(11.4, 0.50, 0.52)          # 30 seconds later
+        self.assertIn("Kalshi moved money into the crypto pot ($0.88 → $8.43)", self.bot.state.notice)
+        self.crypto_at(7.5, 0.80, 0.82)           # and now the bot can bet
+        self.assertEqual(len(ex.orders), 1)
+
+    def test_kalshi_saying_no_is_shown(self):
+        ex = PotExchange(general=0, crypto=0.88)
+        ex.pots[3] = D("7.55")
+        ex.refuse_moves = True
+        self.make([MAIN], exchange=ex)
+        self.ask()
+        self.crypto_at(12, 0.50, 0.52)
+        self.assertIn("Kalshi said no to moving $7.55 from sports", self.bot.state.notice)
+        self.assertEqual(self.bot.state.pot_check, {})
+
+
+class TestMoveButton(WebCase):
+    def test_button_shows_amount_and_asks_the_bot(self):
+        import yaml
+        from btcbot.bot import POT_MOVE_FILE
+        from btcbot.ledger import Ledger
+        from btcbot.settings import load, mode_folder
+        with open(self.path) as fh:
+            raw = yaml.safe_load(fh)
+        raw.update(mode="live", live_confirm="I accept real-money risk")
+        with open(self.path, "w") as fh:
+            yaml.safe_dump(raw, fh)
+        folder = mode_folder(load(self.path))
+        ledger = Ledger(folder)
+        state = ledger.load_state(D(0))
+        state.accounts = {"0": "8.43"}
+        state.shards = {"0": {"2": "0.88", "3": "7.55"}}
+        ledger.save_state(state)
+        _, body, _ = self.call(f"/?key={KEY}")
+        self.assertIn("Move $7.55 into the crypto pot", body)
+        self.call("/pots", data={"key": KEY, "pot": "move"})
+        self.assertTrue(os.path.exists(os.path.join(folder, POT_MOVE_FILE)))

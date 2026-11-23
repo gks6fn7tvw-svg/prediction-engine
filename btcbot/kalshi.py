@@ -148,19 +148,34 @@ class KalshiClient:
         finally:
             self._last_balance = time.monotonic()
 
-    def balance_summary(self) -> tuple[Decimal, dict[int, Decimal]]:
-        """Main account: (cash you can use, cash per shard), from one balance check."""
-        data = self._balance_data()
-        total = (Decimal(str(data["balance_dollars"])) if data.get("balance_dollars") not in (None, "")
-                 else Decimal(int(data.get("balance", 0))) / 100)
-        shards: dict[int, Decimal] = {}
-        for b in data.get("balance_breakdown") or []:
-            idx = int(b.get("exchange_index", 0))
-            shards[idx] = shards.get(idx, Decimal("0")) + (dollars(b.get("balance")) or Decimal("0"))
-        return total, shards
+    def move_between_pots(self, from_shard: int, to_shard: int, amount_dollars: Decimal,
+                          transfer_id: str | None = None, subaccount: int = 0) -> str:
+        """Move cash from one money pot (exchange shard) to another inside your own account.
+
+        POST /portfolio/intra_exchange_instance_transfer. Kalshi counts this amount in
+        centicents ($1 = 10,000), unlike subaccount moves (cents). The move runs in the
+        background on Kalshi's side; returns Kalshi's transfer id.
+        """
+        amount = Decimal(str(amount_dollars)) * 10000
+        if not amount.is_finite() or amount <= 0 or amount != amount.to_integral_value():
+            raise ValueError(f"can't move ${amount_dollars}")
+        body = {"source": "event_contract", "destination": "event_contract",
+                "source_exchange_shard": int(from_shard), "destination_exchange_shard": int(to_shard),
+                "amount": int(amount)}
+        if subaccount:
+            body["source_subaccount"] = body["destination_subaccount"] = int(subaccount)
+        elif transfer_id:
+            body["client_transfer_id"] = transfer_id   # Kalshi accepts this for the main account only
+        data = self._request("POST", "/portfolio/intra_exchange_instance_transfer", body=body, signed=True)
+        return str(data.get("transfer_id", ""))
+
+    def pot_move(self, transfer_id: str) -> dict:
+        """One pot-to-pot move, as Kalshi reports it (has a status)."""
+        data = self._request("GET", f"/portfolio/intra_exchange_instance_transfers/{transfer_id}", signed=True)
+        return data.get("transfer") or data.get("intra_exchange_instance_transfer") or data
 
     def shard_balances(self) -> dict[int, Decimal]:
-        """Cash per exchange shard (Kalshi keeps a separate pot per kind of market; crypto is shard 2)."""
+        """Cash per exchange shard, summed over ALL subaccounts (Kalshi's balance_breakdown)."""
         out: dict[int, Decimal] = {}
         for b in self._balance_data().get("balance_breakdown") or []:
             idx = int(b.get("exchange_index", 0))
@@ -200,12 +215,16 @@ class KalshiClient:
         params = {"count_filter": "position", "settlement_status": "unsettled", "limit": 1000}
         if subaccount:
             params["subaccount"] = subaccount
-        data = self._request("GET", "/portfolio/positions", params=params, signed=True)
-        out = {}
-        for p in data.get("market_positions", []):
-            n = Decimal(str(p.get("position_fp", "0")))
-            if p.get("ticker") and n != 0:
-                out[p["ticker"]] = out.get(p["ticker"], Decimal("0")) + n
+        out: dict[str, Decimal] = {}
+        for _ in range(20):                         # follow Kalshi's pages (cursor)
+            data = self._request("GET", "/portfolio/positions", params=params, signed=True)
+            for p in data.get("market_positions", []):
+                n = Decimal(str(p.get("position_fp", "0")))
+                if p.get("ticker") and n != 0:
+                    out[p["ticker"]] = out.get(p["ticker"], Decimal("0")) + n
+            if not data.get("cursor"):
+                break
+            params = dict(params, cursor=data["cursor"])
         return out
 
     def subaccount_shards(self) -> dict[int, dict[int, Decimal]]:

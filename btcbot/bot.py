@@ -5,6 +5,7 @@ import json
 import logging
 import os
 import time
+import uuid
 from collections import defaultdict, deque
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
@@ -53,6 +54,7 @@ PAPER_RESET_FILE = "PAPER_RESET"   # the website writes the new pretend balance 
 TRANSFER_FILE = "TRANSFER_REQUEST"  # the website asks to move money between subaccounts
 SETUP_FILE = "SETUP_REQUEST"        # the website asks to set up subaccounts again now
 ALLOCATION_FILE = "ALLOCATION_REQUEST"  # the website asks Kalshi to keep money in the crypto pot
+POT_MOVE_FILE = "POT_MOVE_REQUEST"      # the website asks to move the main account's cash into the crypto pot
 POTS = {0: "general", 1: "combos", 2: "crypto", 3: "sports"}
 CRYPTO_POT = 2                      # the money pot Kalshi uses for crypto markets
 
@@ -222,20 +224,99 @@ class Bot:
         except (KeyError, ValueError):
             self.state.pot_check = {}
             return
-        if (now - asked).total_seconds() < 60:
+        if (now - asked).total_seconds() < int(check.get("wait", 60)):
             return
         before, after = Decimal(check.get("before") or "0"), self._crypto_pot(0)
-        self.state.pot_check = {}
         if after is not None and after > before + Decimal("0.01"):
+            self.state.pot_check = {}
             self.state.notice = (f"{self.clock_words(now)}: Kalshi moved money into the crypto pot "
                                  f"(${before:.2f} → ${after:.2f}). The bot can bet with it now.")
             log.info(self.state.notice)
-        else:
-            self.state.notice = (f"{self.clock_words(now)}: Kalshi took the setting, but after a minute it still "
-                                 f"hasn't moved any money into the crypto pot (${before:.2f}). The bot can't "
-                                 "move money between pots itself; Kalshi hasn't opened that to bots yet. "
-                                 "Move it by hand in Kalshi, or ask Kalshi support to.")
+        elif check.get("kind") == "move":
+            status = ""
+            if check.get("transfer_id"):
+                try:
+                    status = str(self.client.pot_move(check["transfer_id"]).get("status", ""))
+                except Exception as e:
+                    status = f"couldn't ask ({kalshi_words(e)})"
+            if status.lower() in ("pending", "processing", "queued", "in_progress") and \
+                    (now - asked).total_seconds() < 600:
+                check["wait"] = int(check.get("wait", 20)) + 30      # still going: look again soon
+                return
+            self.state.pot_check = {}
+            self.state.notice = (f"{self.clock_words(now)}: the move didn't show up: the crypto pot still has "
+                                 f"${before:.2f}" + (f" (Kalshi says the move is: {status})" if status else "") +
+                                 ". Nothing was sent twice. Send me this message.")
             log.warning(self.state.notice)
+        else:
+            self.state.pot_check = {}
+            self.state.notice = (f"{self.clock_words(now)}: Kalshi took the setting, but after a minute it still "
+                                 f"hasn't moved any money into the crypto pot (${before:.2f}). Tap the \"Move ... "
+                                 "into the crypto pot\" button instead.")
+            log.warning(self.state.notice)
+        self.ledger.save_state(self.state)
+
+    def _apply_pot_move_request(self) -> None:
+        """Website button: move the main account's cash from the other pots into the crypto pot."""
+        path = os.path.join(self.ledger.folder, POT_MOVE_FILE)
+        if not os.path.exists(path):
+            return
+        try:
+            with open(path, encoding="utf-8") as fh:
+                req = json.load(fh)
+        except (OSError, ValueError):
+            req = {}
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+        now = self.clock.now()
+        try:
+            pots = self.client.subaccount_shards().get(0, {})
+        except Exception as e:
+            self.state.notice = f"{self.clock_words(now)}: couldn't read your pots: {kalshi_words(e)}"
+            log.error(self.state.notice)
+            self.ledger.save_state(self.state)
+            return
+        before = pots.get(CRYPTO_POT, Decimal("0"))
+        moves = [(k, v.quantize(Decimal("0.01"), rounding="ROUND_DOWN")) for k, v in sorted(pots.items())
+                 if k != CRYPTO_POT and v >= Decimal("0.01")]
+        if not moves:
+            self.state.notice = f"{self.clock_words(now)}: nothing to move; all your cash is already in the crypto pot."
+            log.info(self.state.notice)
+            self.ledger.save_state(self.state)
+            return
+        done, last_id = [], ""
+        for i, (shard, amount) in enumerate(moves):
+            client_id = f"{req.get('id') or uuid.uuid4()}"
+            if i:
+                client_id = str(uuid.uuid5(uuid.UUID(client_id), str(shard)))
+            # Write it down before asking, so a lost reply is never followed by a second move.
+            self.state.pot_check = {"at": now.isoformat(), "before": str(before), "kind": "move", "wait": 20,
+                                    "client_id": client_id}
+            self.ledger.save_state(self.state)
+            try:
+                last_id = self.client.move_between_pots(shard, CRYPTO_POT, amount, transfer_id=client_id)
+                done.append(f"${amount:.2f} from {pot_name(shard)}")
+                log.info("asked Kalshi to move $%s from the %s pot to the crypto pot (transfer %s)",
+                         amount, pot_name(shard), last_id or "?")
+            except KalshiError as e:
+                self.state.notice = (f"{self.clock_words(now)}: Kalshi said no to moving ${amount:.2f} from "
+                                     f"{pot_name(shard)} to crypto: {kalshi_words(e)}")
+                log.error(self.state.notice)
+                if not done:
+                    self.state.pot_check = {}
+                break
+            except Exception as e:
+                self.state.notice = (f"{self.clock_words(now)}: lost contact while asking Kalshi to move the money "
+                                     f"({e}). The bot won't ask again by itself; check the pots in a minute.")
+                log.error(self.state.notice)
+                break
+        if done:
+            self.state.pot_check["transfer_id"] = last_id
+            self.state.notice = (f"{self.clock_words(now)}: asked Kalshi to move {', '.join(done)} into the crypto "
+                                 "pot. Checking in a few seconds that it arrived.")
+        self.last_accounts = None
         self.ledger.save_state(self.state)
 
     def _apply_allocation_request(self) -> None:
@@ -344,6 +425,7 @@ class Bot:
         if self.broker.live:
             self._retry_setup(now)
             self._apply_allocation_request()
+            self._apply_pot_move_request()
             self._apply_transfer_request()
             self._refresh_accounts(now)
         self._goal_check()   # before any new bet, so the goal pauses betting in time
@@ -600,18 +682,12 @@ class Bot:
             try:
                 self.client.transfer(frm, to, cents, req.get("id"), exchange_index=CRYPTO_POT)
             except KalshiError as e:
-                if e.status != 404 or to == 0:
+                if e.status != 404:
                     raise
-                # Kalshi keeps each subaccount per pot. One made before the bot knew about pots
-                # lives in the general pot only, so make it in the crypto pot (once) and try again.
-                n = self.client.create_subaccount(CRYPTO_POT)
-                log.info("made Kalshi subaccount %s in the crypto pot", n)
-                self.state.subaccounts = sorted(set(self.state.subaccounts) | {n})
-                if n != to:
-                    raise KalshiError(0, f"{account_name(to)} isn't in the crypto pot (it was made before the bot "
-                                         f"knew about pots), so Kalshi made subaccount {n} there instead. On "
-                                         f"Settings, set the play to subaccount {n}, then move the money again.")
-                self.client.transfer(frm, to, cents, None, exchange_index=CRYPTO_POT)
+                # Kalshi keeps subaccounts per pot; this one has no crypto-pot side yet. Don't make
+                # new subaccounts here (each tap would make another); just say so.
+                raise KalshiError(0, f"Kalshi says {account_name(to) if to else account_name(frm)} has no crypto "
+                                     "pot (404 not found). Keep your plays on your main account for now.")
             self.state.notice = (f"Moved ${cents / 100:.2f} from {account_name(frm)} to {account_name(to)} "
                                  "(crypto pot).")
             log.info(self.state.notice)
@@ -629,13 +705,10 @@ class Bot:
             return
         self.last_accounts = now
         try:
-            if getattr(self.broker, "accounts", [0]) == [0] and hasattr(self.client, "balance_summary"):
-                total, pots = self.client.balance_summary()
-                cash = {0: total}
-                self.state.shards = {"0": {str(k): str(v) for k, v in sorted(pots.items())}}
-            elif hasattr(self.client, "subaccount_shards"):
+            if hasattr(self.client, "subaccount_shards"):
                 split = self.client.subaccount_shards()
-                cash = {n: sum(p.values(), Decimal("0")) for n, p in split.items()}
+                cash = {n: sum(p.values(), Decimal("0")) for n, p in split.items()
+                        if n in getattr(self.broker, "accounts", [0]) or n == 0}
                 self.state.shards = {str(n): {str(k): str(v) for k, v in sorted(p.items())}
                                      for n, p in sorted(split.items())}
             elif hasattr(self.broker, "balances"):

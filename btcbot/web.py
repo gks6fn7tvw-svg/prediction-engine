@@ -1451,7 +1451,7 @@ def watch_section(d: dict) -> str:
     return "".join(out)
 
 
-def start_history(app: App, days: int) -> str:
+def start_history(app: App, days: int, series: list | None = None) -> str:
     """Download past markets for backtests in the background (website stays usable)."""
     job = app.history_job
     if job.get("state") == "running":
@@ -1462,6 +1462,7 @@ def start_history(app: App, days: int) -> str:
     folder = mode_folder(s)
     os.makedirs(folder, exist_ok=True)
     path = os.path.join(folder, "history.csv")
+    series = [m for m in (series or s.markets[:1]) if m]
     app.history_job = job = {"state": "running", "msg": "Starting...", "days": days,
                              "started": datetime.now(timezone.utc).isoformat()}
 
@@ -1473,9 +1474,24 @@ def start_history(app: App, days: int) -> str:
                 from .kalshi import load_private_key
                 private_key = load_private_key(key_path)
             client = KalshiClient(s.api_base, key_id=key_id, private_key=private_key, timeout=15)
-            summary = app.history_collect(client, client.session, s.markets[0], days, path,
-                                          progress=lambda m: job.update(msg=m))
-            job.update(state="done", msg=summary)
+            names = dict(MARKETS)
+            done = []
+            with open(path + ".all", "w", encoding="utf-8") as out:
+                for i, one in enumerate(series):
+                    name = names.get(one, one)
+                    part = f"{path}.{one}"
+                    summary = app.history_collect(client, client.session, one, days, part,
+                                                  progress=lambda m, name=name: job.update(msg=f"{name}: {m}"))
+                    done.append(f"{name}: {summary}")
+                    try:
+                        with open(part, encoding="utf-8") as fh:
+                            text = fh.read()
+                        os.remove(part)
+                    except OSError:
+                        text = ""
+                    out.write(text if i == 0 or not text else text.split("\n", 1)[-1])
+            os.replace(path + ".all", path)
+            job.update(state="done", msg=" | ".join(done))
         except Exception as e:     # shown on the page; never crashes the website
             job.update(state="error", msg=f"stopped: {e}")
     threading.Thread(target=run, daemon=True).start()
@@ -1495,9 +1511,13 @@ def history_section(app: App) -> str:
             'waiting days: Kalshi\'s minute-by-minute prices, each result and its official settlement number, '
             'and Bitcoin\'s minute-by-minute price. It takes a few minutes and uses only free public data. '
             'It also checks whether your Kalshi account can read the official index the markets settle on.</p>'
-            f'{status}<form method="post" action="/history" style="display:flex;gap:8px;align-items:end">'
+            f'{status}<form method="post" action="/history">'
+            '<label>Markets</label><select name="series">'
+            + "".join(f'<option value="{esc(m)}">{esc(n)} 15-minute</option>' for m, n in MARKETS)
+            + '<option value="all">All of them (takes longer)</option></select>'
+            '<div style="display:flex;gap:8px;align-items:end">'
             '<div style="flex:1"><label>Days back</label><input name="days" value="14" inputmode="numeric"></div>'
-            '<button class="btn2" style="flex:1">Collect history</button></form>'
+            '<button class="btn2" style="flex:1">Collect history</button></div></form>'
             f'{link}</div>')
 
 
@@ -1795,7 +1815,8 @@ class Handler(BaseHTTPRequestHandler):
                 days = max(1, min(60, int(float(field(form, "days", "14") or 14))))
             except ValueError:
                 days = 14
-            start_history(self.app, days)
+            pick = field(form, "series")
+            start_history(self.app, days, [m for m, _ in MARKETS] if pick == "all" else [pick] if pick else None)
             return self._redirect("/settings#history")
         if url.path == "/trade":
             s, _ = self.app.settings()

@@ -39,8 +39,9 @@ PRODUCTS = {
     "BTC": {"coinbase": "BTC-USD", "kraken": "XBTUSD", "bitstamp": "btcusd"},
     "ETH": {"coinbase": "ETH-USD", "kraken": "ETHUSD", "bitstamp": "ethusd"},
     "SOL": {"coinbase": "SOL-USD", "kraken": "SOLUSD", "bitstamp": "solusd"},
+    "XRP": {"coinbase": "XRP-USD", "kraken": "XRPUSD", "bitstamp": "xrpusd"},
 }
-SERIES_COIN = {"KXBTC": "BTC", "KXETH": "ETH", "KXSOL": "SOL"}
+SERIES_COIN = {"KXBTC": "BTC", "KXETH": "ETH", "KXSOL": "SOL", "KXXRP": "XRP"}
 
 _pool = concurrent.futures.ThreadPoolExecutor(max_workers=3)
 
@@ -189,7 +190,7 @@ def summary(rows: list[dict]) -> dict:
 
 
 # ---- live score: our chance for each side, compared with Kalshi's price -------------------
-CANDLE_PATHS = {"BTC": "BTC-USD", "ETH": "ETH-USD", "SOL": "SOL-USD"}
+CANDLE_PATHS = {"BTC": "BTC-USD", "ETH": "ETH-USD", "SOL": "SOL-USD", "XRP": "XRP-USD"}
 PROXY_ERROR = 3.0   # $: our stand-in index vs the real one (adds a little doubt near the target)
 
 

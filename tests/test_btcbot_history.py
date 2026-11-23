@@ -103,15 +103,17 @@ class TestHistoryPage(WebCase):
         self.app.history_collect = fake_collect
         _, body, _ = self.call(f"/settings?key={KEY}")
         self.assertIn("Collect history", body)
-        self.call("/history", data={"key": KEY, "days": "7"})
+        self.call("/history", data={"key": KEY, "days": "7", "series": "all"})
         for _ in range(50):
             if self.app.history_job.get("state") == "done":
                 break
             time.sleep(0.05)
         _, body, _ = self.call("/settings", cookie=f"btcbot_key={KEY}")
-        self.assertIn("Done:</b> 7 days done", body)
+        self.assertIn("Done:</b> Bitcoin: 7 days done | Ethereum: 7 days done", body)
         _, text, _ = self.call("/history.csv", cookie=f"btcbot_key={KEY}")
-        self.assertIn("KXBTC15M-1", text)
+        self.assertEqual(text.count("market,close_time"), 1)          # one header for all markets
+        self.assertEqual(text.count("KXBTC15M-1"), 4)   # Bitcoin, Ethereum, Solana, XRP
+        self.assertIn("Solana 15-minute", body)
 
 
 if __name__ == "__main__":

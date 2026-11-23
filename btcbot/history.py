@@ -18,7 +18,7 @@ from datetime import datetime, timezone
 COLUMNS = ["market", "close_time", "target", "result", "settled_value", "minutes_left",
            "up_bid", "up_ask", "up_bid_low", "up_bid_high", "up_ask_low", "up_ask_high", "volume",
            "btc_open", "btc_high", "btc_low", "btc_close"]
-COINBASE = {"KXBTC": "BTC-USD", "KXETH": "ETH-USD", "KXSOL": "SOL-USD"}
+COINBASE = {"KXBTC": "BTC-USD", "KXETH": "ETH-USD", "KXSOL": "SOL-USD", "KXXRP": "XRP-USD"}
 MAX_PERIODS = 9000          # Kalshi allows 10,000 candle periods per batch request
 
 

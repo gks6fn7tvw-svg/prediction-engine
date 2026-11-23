@@ -1128,7 +1128,9 @@ def play_form(i: int, p: dict, opt, inp) -> str:
         f'<label>Skip if fewer contracts are offered than</label>{inp(pre + "depth", plain(c.get("min_contracts_at_price")))}'
         f'<label>Only buy if its side rose over the last N seconds</label>{inp(pre + "rising", plain(c.get("favorite_rising_seconds")))}'
         f'<label>Only buy if the price is this many $ past the target</label>{inp(pre + "dist", plain(c.get("btc_distance_min_dollars")))}'
-        '<p class="hint">Blank = off.</p></details>'
+        '<p class="hint">Blank = off. In the last few minutes the "$ past the target" check uses the bot\'s '
+        'running average (what Kalshi settles on) instead of Bitcoin\'s live price. Example: 25 for a last-minute '
+        'play skips close calls, where the average is within $25 of the target.</p></details>'
         f'<div class="row2"><button class="btn2" name="action" value="copy:{i}">Copy this play</button>'
         f'<button class="danger" name="action" value="delete:{i}" onclick="return confirm(this.dataset.q)" '
         f'data-q="{confirm}">Delete</button></div>'
@@ -1328,7 +1330,8 @@ def watch_section(d: dict) -> str:
                    f'{"+" if f["would"] >= 0 else "-"}{money(f["would"])}</div></div>')
     out.append('<p class="hint">Compared with what really happened, after fees. Change the numbers on Settings '
                '(Last-minute watch). <a href="/watch.csv" style="color:#8fb0ff">Download the results</a> · '
-               '<a href="/lastminute.csv" style="color:#8fb0ff">Download today\'s second-by-second data</a></p></div>')
+               'second-by-second data: <a href="/lastminute.csv" style="color:#8fb0ff">today</a> · '
+               '<a href="/lastminute.csv?days=3" style="color:#8fb0ff">last 3 days</a></p></div>')
     return "".join(out)
 
 
@@ -1531,7 +1534,20 @@ class Handler(BaseHTTPRequestHandler):
             else:
                 day_dir = os.path.join(folder, "lastminute")
                 days = sorted(os.listdir(day_dir)) if os.path.isdir(day_dir) else []
-                path, empty = (os.path.join(day_dir, days[-1]) if days else ""), ",".join(lastminute.DATA_COLUMNS) + "\n"
+                try:
+                    want = max(1, min(14, int((query.get("days") or ["1"])[0])))
+                except ValueError:
+                    want = 1
+                empty = ",".join(lastminute.DATA_COLUMNS) + "\n"
+                text = ""
+                for i, day in enumerate(days[-want:]):
+                    try:
+                        with open(os.path.join(day_dir, day), encoding="utf-8") as fh:
+                            body = fh.read()
+                    except OSError:
+                        continue
+                    text += body if not text else body.split("\n", 1)[-1]   # one header only
+                return self._send(200, text or empty, ctype="text/csv; charset=utf-8")
             try:
                 with open(path, encoding="utf-8") as fh:
                     text = fh.read()

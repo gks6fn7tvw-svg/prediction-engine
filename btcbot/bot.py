@@ -497,7 +497,7 @@ class Bot:
             for q in quotes.values():
                 for play in self.s.plays:
                     if play.enabled:
-                        self._maybe_enter(play, q, now, spots.get(q.series))
+                        self._maybe_enter(play, q, now, self._distance_price(q, now, spots.get(q.series)))
         else:
             self._say("block", reason)
         self._watch(quotes, now)
@@ -1118,6 +1118,20 @@ class Bot:
                 del self.trackers[ticker]
                 self.estimates.pop(ticker, None)
         self._watch_resolve(now)
+
+    def _distance_price(self, q: rules.Quote, now: datetime, spot):
+        """Price for the "this many $ past the target" check.
+
+        In the final stretch: the bot's running estimate of the settlement average (what
+        actually decides the market). Example: target $61,300, Bitcoin at $61,325 with 10
+        seconds left, but the first 50 seconds averaged $61,295, so the average heads to
+        about $61,299: Down by $1, a coin flip, even though the live price says Up by $25.
+        Before that (or if the watch is off): Bitcoin's live price.
+        """
+        est, tr = self.estimates.get(q.ticker), self.trackers.get(q.ticker)
+        if est is not None and tr is not None and tr.samples and (now - tr.samples[-1][0]).total_seconds() <= 5:
+            return est.projected
+        return spot
 
     def _watch_data(self, q: rules.Quote, now: datetime, est, sources: int) -> None:
         """Second-by-second record of the final stretch, for checking ideas later."""

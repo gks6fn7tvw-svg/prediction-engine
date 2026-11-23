@@ -194,7 +194,9 @@ def check_entry(play: Play, q: Quote, now: datetime, history=None, spot: Decimal
             return EntryCheck(False, "spot price or target missing for the distance check", side, ask)
         gap = spot - q.target if side == "yes" else q.target - spot
         if gap < c.btc_distance_min_dollars:
-            return EntryCheck(False, f"price is only ${gap} past the target (wanted ${c.btc_distance_min_dollars})", side, ask)
+            where = f"only ${gap:,.0f} past" if gap >= 0 else f"${-gap:,.0f} on the wrong side of"
+            return EntryCheck(False, f"Bitcoin is {where} the target (wanted ${c.btc_distance_min_dollars} past)",
+                              side, ask)
     limit = min(play.max_price, ask + play.slippage_cents * CENT)
     return EntryCheck(True, "ok", side, ask, limit)
 

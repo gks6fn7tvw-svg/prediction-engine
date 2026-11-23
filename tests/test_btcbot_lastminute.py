@@ -213,3 +213,48 @@ class TestWatchPages(WebCase):
         _, body, _ = self.call(f"/?key={KEY}")
         self.assertIn("the average is heading <b>$35 below</b> the target (Down ahead)", body)
         self.assertIn("20 of 60 seconds counted", body)
+
+
+class TestCloseCallFilter(LiveCase):
+    """A last-minute favorite play with 'this many $ past the target' uses the running average."""
+    LATE = {"name": "second", "buy": "favorite", "min_price": 0.88, "max_price": 0.95,
+            "act_from_minutes_left": 1, "act_until_minutes_left": 0,
+            "conditions": {"btc_distance_min_dollars": 25}}
+
+    def setup_bot(self):
+        self.make([self.LATE])
+        self.bot.spot_fn = lambda product: D("60030")       # live price: $30 above the target
+        self.prices = iter([])
+
+    def step(self, seconds_left, price, yes_bid, yes_ask):
+        self.bot.index_fn = lambda coin: (D(price), 3)
+        return self.at(0, yes_bid, yes_ask, seconds=seconds_left)
+
+    def test_skips_when_the_average_is_a_close_call(self):
+        self.setup_bot()
+        for s in range(75, 20, -1):                          # most of the minute below the target
+            self.step(s, "59990", 0.05, 0.06)
+        with self.assertLogs("btcbot", level="INFO") as logs:
+            self.step(20, "60030", 0.90, 0.91)               # now $30 up, Up at 91c
+        self.assertEqual(self.client.orders, [])
+        self.assertIn("on the wrong side of the target", "\n".join(logs.output))
+
+    def test_buys_when_the_average_is_clearly_past(self):
+        self.setup_bot()
+        for s in range(75, 20, -1):
+            self.step(s, "60040", 0.88, 0.89)
+        self.step(20, "60040", 0.90, 0.91)
+        self.assertEqual(len(self.client.orders), 1)
+
+
+class TestDownloadDays(WebCase):
+    def test_last_three_days_in_one_file(self):
+        from btcbot.settings import load, mode_folder
+        folder = os.path.join(mode_folder(load(self.path)), "lastminute")
+        for day, gap in (("2026-11-21.csv", "-1"), ("2026-11-22.csv", "-2"), ("2026-11-23.csv", "-3")):
+            lastminute.append_csv(os.path.join(folder, day), lastminute.DATA_COLUMNS, {"market": "M", "gap": gap})
+        _, text, _ = self.call("/lastminute.csv?days=3", cookie=f"btcbot_key={KEY}")
+        self.assertEqual(text.count("time,market"), 1)
+        self.assertEqual([line.split(",")[7] for line in text.strip().split("\n")[1:]], ["-1", "-2", "-3"])
+        _, text, _ = self.call("/lastminute.csv", cookie=f"btcbot_key={KEY}")
+        self.assertNotIn(",-1,", text)

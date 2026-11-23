@@ -64,6 +64,11 @@ SETUP_FILE = "SETUP_REQUEST"        # the website asks to set up subaccounts aga
 ALLOCATION_FILE = "ALLOCATION_REQUEST"  # the website asks Kalshi to keep money in the crypto pot
 POT_MOVE_FILE = "POT_MOVE_REQUEST"      # the website asks to move the main account's cash into the crypto pot
 MAKE_SUB_FILE = "MAKE_SUBACCOUNT_REQUEST"  # the website asks for a new subaccount inside the crypto pot
+TRADE_FILE = "TRADE_REQUEST"        # the website asks to buy or sell right now (a trade you make yourself)
+MANUAL = "manual"                   # the play name trades you make on the website are recorded under
+TRADE_MAX_AGE = 15                  # seconds: an older trade request is dropped (prices have moved)
+WAKE_FILES = ("TRADE_REQUEST", "TRANSFER_REQUEST", "POT_MOVE_REQUEST", "ALLOCATION_REQUEST",
+              "MAKE_SUBACCOUNT_REQUEST", "SETUP_REQUEST")
 POTS = {0: "general", 1: "combos", 2: "crypto", 3: "sports"}
 CRYPTO_POT = 2                      # the money pot Kalshi uses for crypto markets
 DEFEND_FROM = Decimal("0.5")        # guard/crowd watch only bets bought as the favorite (cheap bets start "losing")
@@ -139,7 +144,7 @@ def run_together(real: "Bot", fake: "Bot", should_stop=None) -> None:
             waits.append(fake.s.slow_seconds)
         finally:
             log.removeFilter(tag)
-        real.clock.sleep(min(waits))
+        real.nap(min(waits))
 
 
 class Bot:
@@ -523,6 +528,7 @@ class Bot:
             self._refresh_accounts(now)
         self._goal_check()   # before any new bet, so the goal pauses betting in time
         quotes = self._fetch_quotes(now)
+        self._apply_trade_request(quotes, now)
         for pos in list(self.state.open_positions()):
             q = quotes.get(pos.ticker)
             if q is not None:
@@ -583,7 +589,122 @@ class Bot:
             except Exception:
                 log.exception("unexpected problem; trying again shortly")
                 wait = self.s.slow_seconds
-            self.clock.sleep(wait)
+            self.nap(wait)
+
+    def nap(self, seconds: float) -> None:
+        """Sleep, but wake within a quarter second when the website asks for something (like a trade)."""
+        paths = [os.path.join(self.ledger.folder, f) for f in WAKE_FILES]
+        for _ in range(max(1, int(seconds / 0.25 + 0.999))):
+            if any(os.path.exists(p) for p in paths):
+                return
+            self.clock.sleep(min(0.25, seconds))
+
+    # ---- trades you make yourself on the website ------------------------------
+    def _apply_trade_request(self, quotes: dict, now: datetime) -> None:
+        path = os.path.join(self.ledger.folder, TRADE_FILE)
+        if not os.path.exists(path):
+            return
+        try:
+            with open(path, encoding="utf-8") as fh:
+                req = json.load(fh)
+        except (OSError, ValueError):
+            req = {}
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+        try:
+            note = self._trade(req, quotes, now)
+        except Exception as e:   # never let a button press stop the bot
+            note = f"not done: {e}"
+            log.exception("trade from the website failed")
+        self.state.trade_note = f"{self.clock_words(now)}: {note}"
+        log.info("%s: %s", MANUAL, note)
+        self.ledger.save_state(self.state)
+
+    def _trade(self, req: dict, quotes: dict, now: datetime) -> str:
+        asked = rules.parse_time(req.get("at"))
+        if asked is None or abs((now - asked).total_seconds()) > TRADE_MAX_AGE:
+            return "not done: the bot got the request too late, and prices may have moved. Try again."
+        if self.state.alert:
+            return "not done: the bot is stopped for safety (see the warning at the top)."
+        side = req.get("side")
+        if side not in ("yes", "no"):
+            return "not done: pick Up or Down."
+        word = "Up" if side == "yes" else "Down"
+        if req.get("action") == "sell":
+            return self._manual_sell(req, side, quotes)
+        try:
+            n = Decimal(str(req.get("contracts", 1)))
+        except ArithmeticError:
+            n = Decimal("0")
+        if n != n.to_integral_value() or not 1 <= n <= 500:
+            return "not done: contracts must be a whole number from 1 to 500."
+        series = req.get("series") or (self.s.markets[0] if self.s.markets else "")
+        open_now = [q for q in quotes.values() if q.series == series and q.close_time and q.close_time > now]
+        if not open_now:
+            return "not done: no open market right now (prices didn't load). Try again in a moment."
+        q = min(open_now, key=lambda x: x.close_time)
+        ask = q.ask(side)
+        if ask is None:
+            return f"not bought: nobody is selling {word} in {self.market_words(q)} right now."
+        cap = Decimal(str(req["max_price"])) if req.get("max_price") not in (None, "") else None
+        limit = min(cap if cap is not None else ask + Decimal("0.02"), Decimal("0.99"))
+        what = f"{n:g} {word} in {self.market_words(q)}"
+        if ask > limit:
+            return f"not bought: {word} costs {cents_words(ask)} now, more than your {cents_words(limit)}."
+        mult = self.multipliers.get(q.series, ONE)
+        try:
+            fill = self.broker.buy(q, side, n, limit, mult, account=0)
+        except KalshiError as e:
+            if "insufficient_balance" in (e.text or ""):
+                return (f"not bought: not enough money in your main account's crypto pot for {what} at up to "
+                        f"{cents_words(limit)}.")
+            return f"not bought: Kalshi said {kalshi_words(e)}"
+        except Exception as e:
+            if not self.broker.live:
+                raise
+            log.error("%s: lost contact while buying (%s); checking what Kalshi shows", MANUAL, e)
+            fill = self._recover_buy(q, side, limit, mult, 0)
+        if fill is None and self.broker.live:
+            fill = self._recover_buy(q, side, limit, mult, 0)
+        if fill is None:
+            return f"didn't fill: {what} at up to {cents_words(limit)}; {self._miss_reason(q, side, limit)}."
+        pos = Position(MANUAL, q.ticker, q.series, side, plain(fill.contracts), str(fill.price), str(fill.fee),
+                       now.isoformat(), q.close_time.isoformat() if q.close_time else "", 0)
+        self.state.set_positions(self.state.open_positions() + [pos])
+        self.state.day_trades += 1
+        if not self.broker.live:
+            self.state.paper_cash = str(self.broker.cash)
+        return (f"BOUGHT {fill.contracts:g} {word} in {self.market_words(q)} at "
+                f"{cents_words(fill.price)} (fee {cents_words(fill.fee)}).")
+
+    def _manual_sell(self, req: dict, side: str, quotes: dict) -> str:
+        ticker = req.get("ticker")
+        word = "Up" if side == "yes" else "Down"
+        held = [p for p in self.state.open_positions() if p.play == MANUAL and p.ticker == ticker and p.side == side]
+        if not held:
+            return "not sold: that bet isn't open anymore."
+        pos = held[0]
+        q = quotes.get(ticker)
+        bid = q.bid(side) if q is not None else None
+        if bid is None:
+            return "not sold: nobody is buying that side right now."
+        floor = max(bid - Decimal("0.02"), Decimal("0.01"))
+        mult = self.multipliers.get(pos.series, ONE)
+        try:
+            fill = self.broker.sell(q, side, pos.d("contracts"), floor, mult, account=pos.subaccount)
+        except KalshiError as e:
+            return f"not sold: Kalshi said {kalshi_words(e)}"
+        except Exception as e:
+            if not self.broker.live:
+                raise
+            log.error("%s: lost contact while selling (%s); checking what Kalshi shows", MANUAL, e)
+            fill = self._recover_sell(pos, floor, mult)
+        if fill is None:
+            return f"didn't sell: tried at {cents_words(floor)} or more; the price moved."
+        self._close(pos, fill.contracts, "sold_by_you", fill, None)
+        return f"SOLD {fill.contracts:g} {word} at {cents_words(fill.price)} (fee {cents_words(fill.fee)})."
 
     # ---- pieces --------------------------------------------------------------
     def _fetch_quotes(self, now: datetime) -> dict:

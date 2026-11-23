@@ -234,6 +234,16 @@ amount, and the biggest single bet. Goal mode replaces the bet sizes:
 It can't make a play without a real edge reach the goal; it only stops a good
 play from betting too little or too much. Try it with pretend money first.
 
+## Make a trade (from the website)
+
+The Overview has a **Make a trade** box under the prices (tap a price to jump there):
+contracts, an optional "most I'll pay", and **Buy Up** / **Buy Down**. The website only
+writes a request; the bot (which wakes within a quarter second) buys in the market closing
+next, at the price on screen plus up to 2 cents (or your limit), from the main account's
+crypto pot, and records it as the play `manual` so the records check stays right. Each
+open manual bet has a **Sell now** button. Requests older than 15 seconds are dropped.
+With real money this works only on the 🔒 locked link (and asks to confirm).
+
 ## Pretend-only plays (beside real money)
 
 Tick **🧪 Pretend money only** on a play (or `pretend: true`) to test it with pretend

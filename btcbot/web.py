@@ -31,8 +31,8 @@ from . import keystore
 from . import ledger as L
 from .kalshi import KalshiClient, KalshiError
 from . import lastminute
-from .bot import (ALLOCATION_FILE, MAKE_SUB_FILE, PAPER_RESET_FILE, POT_MOVE_FILE, SETUP_FILE, TRANSFER_FILE,
-                  account_name, pot_name)
+from .bot import (ALLOCATION_FILE, MAKE_SUB_FILE, MANUAL, PAPER_RESET_FILE, POT_MOVE_FILE, SETUP_FILE,
+                  TRADE_FILE, TRANSFER_FILE, account_name, pot_name)
 from .rules import Quote, parse_time
 from .secure import SecureLink
 from .settings import (LIVE_CONFIRM_TEXT, PACKAGE_DIR, SIZE_MODES, Settings, SettingsError, load, load_raw,
@@ -280,6 +280,7 @@ class App:
         self.updater = update_code
         self.restarter = restart_soon
         self.moved = ""
+        self.trade_sent = ""   # "sent to the bot" message for the trade box
         self.flash = ""               # one-time message for the Settings page
         self.secure_link: SecureLink | None = None
         self.key_tester = test_key
@@ -394,7 +395,7 @@ class App:
         except OSError:
             settings_time = 0
         held = sorted(f'{p["play"]}|{p["ticker"]}' for p in all_positions(d))
-        extra = [d["state"].alert, d["state"].notice] if d["state"] else []
+        extra = [d["state"].alert, d["state"].notice, d["state"].trade_note] if d["state"] else []
         d["sig"] = hashlib.sha1(json.dumps([settings_time, len(d["rows"]), held, d["paused"], extra])
                                 .encode()).hexdigest()[:12]
         return d
@@ -749,8 +750,15 @@ def open_bet(pos: dict, play, d: dict, show_play: bool = False) -> str:
                  f'<div class="sub">{money(change)} if sold</div>')
     else:
         right = '<span class="dim">open</span>'
+    sell = ""
+    if pos["play"] == MANUAL and (mins is None or mins > 0) and d.get("can_trade"):
+        sell = (f'<form method="post" action="/trade" style="margin:6px 0 0">'
+                f'<input type="hidden" name="action" value="sell"><input type="hidden" name="side" value="{esc(pos["side"])}">'
+                f'<input type="hidden" name="ticker" value="{esc(pos["ticker"])}">'
+                f'<button class="btn2" style="padding:6px 10px;font-size:14px" onclick="return confirm(\'Sell this '
+                f'bet now at the price buyers are paying?\')">Sell now</button></form>')
     return (f'<div class="bet"><div>{side_tag(pos["side"])}<b>{n:g} × {cents_text(paid)}</b>'
-            f'<div class="sub">{esc(when)}{" · " + esc(" ".join(plan)) if plan else ""}</div></div>'
+            f'<div class="sub">{esc(when)}{" · " + esc(" ".join(plan)) if plan else ""}</div>{sell}</div>'
             f'<div class="amt">{right}</div></div>')
 
 
@@ -782,8 +790,9 @@ def market_cards(d: dict) -> str:
 
     def box(series, word, arrow, p, fav):
         value = f' data-k="{esc(series)}-{word}" data-v="{p}"' if p is not None else ""
-        return (f'<div class="price{" fav" if fav else ""}">{arrow} {word}'
-                f'<b{value}>{cents_text(p) if p is not None else "—"}</b></div>')
+        return (f'<a href="#trade" onclick="pickSide(\'{"yes" if word == "Up" else "no"}\')" '
+                f'class="price{" fav" if fav else ""}" style="text-decoration:none;color:inherit">{arrow} {word}'
+                f'<b{value}>{cents_text(p) if p is not None else "—"}</b></a>')
 
     out = []
     for series, m in soonest.items():
@@ -876,6 +885,7 @@ def overview_page(app: App, secure: bool = False) -> str:
             f'<div class="card"><span>All time</span><b>{money(total["profit"])}</b><span>{bets(total["trades"])}</span></div>'
             '</div>')
     parts.append(f'<div id="live-markets">{market_cards(d)}</div>')
+    parts.append(trade_box(app, d, secure))
     if all_positions(d):
         parts.append(f'<h2>Open bets · {len(all_positions(d))}</h2>'
                      f'<div class="box" id="live-open">{overview_open_bets(d)}</div>')
@@ -894,7 +904,9 @@ def overview_page(app: App, secure: bool = False) -> str:
         play = by_name.get(name)
         ps = L.stats([r for r in d["rows"] if r["play"] == name])
         opened = sum(1 for p in positions if p["play"] == name)
-        desc = describe_play(play, s) if play else "Removed or renamed. Its past bets are kept here."
+        desc = (describe_play(play, s) if play else
+                "Trades you made yourself on the website (Make a trade)." if name == MANUAL else
+                "Removed or renamed. Its past bets are kept here.")
         if play and s.mode == "live":
             desc += (" 🧪 <b>Pretend money only.</b>" if play.pretend
                      else f" Uses {esc(account_name(play.subaccount))}.")
@@ -1045,6 +1057,46 @@ def goal_box(d: dict, s: Settings, st) -> str:
     return "".join(out)
 
 
+def trade_box(app: "App", d: dict, secure: bool) -> str:
+    """Buy right now from the website (the bot places it, so its records stay right)."""
+    s, st = d["s"], d.get("state")
+    real = s.mode == "live"
+    d["can_trade"] = secure or not real
+    out = ['<h2 id="trade">Make a trade</h2><div class="box">']
+    if app.trade_sent:
+        out.append(f'<div class="box ok" style="margin:0 0 10px">{esc(app.trade_sent)}</div>')
+        app.trade_sent = ""
+    if st is not None and st.trade_note:
+        bad = st.trade_note.split(": ", 1)[-1].startswith(("not ", "didn't"))
+        out.append(f'<p class="{"bad" if bad else "hint"}" style="margin-top:0">Last trade: {esc(st.trade_note)}</p>')
+    if not d["can_trade"]:
+        link = app.secure_link
+        where = (f' <a href="{esc(link.url())}/?key={esc(app.key)}#trade" style="color:#8fb0ff">Open it</a>.'
+                 if link is not None and link.ready else "")
+        out.append(f'<p class="hint">Trading with real money works only on the 🔒 locked link.{where}</p></div>')
+        return "".join(out)
+    names = dict(MARKETS)
+    pick = "".join(f'<option value="{esc(m)}">{esc(names.get(m, m))}</option>' for m in s.markets)
+    market = (f'<label>Market</label><select name="series">{pick}</select>' if len(s.markets) > 1
+              else f'<input type="hidden" name="series" value="{esc(s.markets[0])}">')
+    money = "real money from your main account\'s crypto pot" if real else "pretend money"
+    ask = (f' onclick="return confirm(\'Buy with REAL money now?\')"' if real else "")
+    out.append(
+        '<form method="post" action="/trade"><input type="hidden" name="action" value="buy">'
+        f'<input type="hidden" name="side" id="trade-side" value="yes">{market}'
+        '<div class="row2"><div><label>Contracts</label>'
+        '<input name="contracts" value="1" inputmode="numeric"></div>'
+        '<div><label>Most I\'ll pay (¢)</label><input name="max" inputmode="decimal" placeholder="price + 2"></div></div>'
+        '<div class="row2">'
+        f'<button name="side" value="yes"{ask}>▲ Buy Up</button>'
+        f'<button name="side" value="no"{ask} style="background:#7a2a33">▼ Buy Down</button></div>'
+        f'<p class="hint">Buys right away in the market closing next, at the price on screen (up to 2¢ more, or '
+        f'your limit), with {money}. Your trades show up as the play "{MANUAL}"; each open one has a Sell now '
+        'button.</p></form></div>'
+        '<script>function pickSide(v){var e=document.getElementById("trade-side");if(e)e.value=v;}</script>')
+    return "".join(out)
+
+
 def all_positions(d: dict) -> list:
     """Open bets: real ones first, then pretend-only plays' (when the bot uses real money)."""
     st = d.get("state")
@@ -1061,11 +1113,12 @@ def play_open_bets(d: dict, name: str, play) -> str:
     return "".join(open_bet(p, play, d) for p in positions) or '<div class="empty">None right now.</div>'
 
 
-def live_parts(app: App, name: str | None) -> dict:
+def live_parts(app: App, name: str | None, secure: bool = False) -> dict:
     """The parts of a page that change every second, for /api/live."""
     d = app.snapshot()
     if d["s"] is None:
         return {"sig": "settings-problem", "parts": {}}
+    d["can_trade"] = secure or d["s"].mode != "live"
     parts = {"live-running": running_box(d), "live-markets": market_cards(d)}
     if name is None:
         if all_positions(d):
@@ -1076,9 +1129,11 @@ def live_parts(app: App, name: str | None) -> dict:
     return {"sig": d["sig"], "parts": parts}
 
 
-def play_page(app: App, name: str) -> str:
+def play_page(app: App, name: str, secure: bool = False) -> str:
     d = app.snapshot()
     s = d["s"]
+    if s is not None:
+        d["can_trade"] = secure or s.mode != "live"
     if s is None:
         return overview_page(app)
     by_name = {p.name: p for p in s.plays}
@@ -1554,9 +1609,9 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(200, overview_page(self.app, self.secure), set_cookie=from_link)
         if url.path == "/api/live":
             name = (query.get("play") or [None])[0]
-            return self._send(200, json.dumps(live_parts(self.app, name)), ctype="application/json")
+            return self._send(200, json.dumps(live_parts(self.app, name, self.secure)), ctype="application/json")
         if url.path == "/play":
-            return self._send(200, play_page(self.app, (query.get("name") or [""])[0]), set_cookie=from_link)
+            return self._send(200, play_page(self.app, (query.get("name") or [""])[0], self.secure), set_cookie=from_link)
         if url.path == "/settings":
             done = (query.get("done") or [""])[0]
             return self._send(200, settings_page(self.app, message=DONE_MESSAGES.get(done), secure=self.secure),
@@ -1639,6 +1694,40 @@ class Handler(BaseHTTPRequestHandler):
                     self.app.moved = ("Asked Kalshi to keep your money in the crypto pot. Check back in a minute."
                                       if choice == "2" else "Asked Kalshi to stop moving money between pots.")
             return self._redirect("/#money")
+        if url.path == "/trade":
+            s, _ = self.app.settings()
+            if s is None:
+                return self._redirect("/")
+            if s.mode == "live" and not self.secure:
+                self.app.trade_sent = "Not sent: real-money trades only work on the 🔒 locked link."
+                return self._redirect("/#trade")
+            action = field(form, "action", "buy")
+            req = {"id": str(uuid.uuid4()), "action": "sell" if action == "sell" else "buy",
+                   "side": field(form, "side"), "at": datetime.now(timezone.utc).isoformat()}
+            try:
+                if req["action"] == "buy":
+                    req["series"] = field(form, "series") or s.markets[0]
+                    req["contracts"] = int(float(field(form, "contracts", "1") or 1))
+                    cap = number(form, "max", "Most I'll pay", blank_ok=True)
+                    if cap is not None:
+                        if not 1 <= cap <= 99:
+                            raise SettingsError("Most I'll pay: use 1 to 99 cents")
+                        req["max_price"] = str(Decimal(str(cap)) / 100)
+                else:
+                    req["ticker"] = field(form, "ticker")
+            except (SettingsError, ValueError) as e:
+                self.app.trade_sent = f"Not sent: {e}"
+                return self._redirect("/#trade")
+            folder = mode_folder(s)
+            os.makedirs(folder, exist_ok=True)
+            tmp = os.path.join(folder, TRADE_FILE + ".tmp")
+            with open(tmp, "w", encoding="utf-8") as fh:
+                json.dump(req, fh)
+            os.replace(tmp, os.path.join(folder, TRADE_FILE))
+            word = "Up" if req["side"] == "yes" else "Down"
+            self.app.trade_sent = (f"Sent to the bot: {'sell' if req['action'] == 'sell' else 'buy'} {word}. "
+                                   "The result shows below in a second or two.")
+            return self._redirect("/#trade")
         if url.path == "/subaccount":
             s, _ = self.app.settings()
             if s is not None and s.mode == "live":

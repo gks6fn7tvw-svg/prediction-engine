@@ -8,6 +8,7 @@ Anyone without the private key in the link gets nothing.
 from __future__ import annotations
 
 import copy
+import gzip
 import hashlib
 import hmac
 import html
@@ -1544,10 +1545,19 @@ class Handler(BaseHTTPRequestHandler):
                 return True, False
         return False, False
 
-    def _send(self, status: int, body: str, set_cookie: bool = False, ctype="text/html; charset=utf-8"):
+    def _send(self, status: int, body: str, set_cookie: bool = False, ctype="text/html; charset=utf-8",
+              compress: bool = False):
         data = body.encode("utf-8")
+        # Squeeze the once-a-second updates (and downloads) to save the server's free monthly data.
+        # Pages that show the private link are never compressed (keeps them safe from size-guessing tricks).
+        gz = compress and len(data) > 512 and "gzip" in (self.headers.get("Accept-Encoding") or "")
+        if gz:
+            data = gzip.compress(data, compresslevel=6)
         self.send_response(status)
         self.send_header("Content-Type", ctype)
+        if gz:
+            self.send_header("Content-Encoding", "gzip")
+            self.send_header("Vary", "Accept-Encoding")
         self.send_header("Content-Length", str(len(data)))
         self.send_header("Cache-Control", "no-store")
         self.send_header("X-Frame-Options", "DENY")
@@ -1609,7 +1619,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(200, overview_page(self.app, self.secure), set_cookie=from_link)
         if url.path == "/api/live":
             name = (query.get("play") or [None])[0]
-            return self._send(200, json.dumps(live_parts(self.app, name, self.secure)), ctype="application/json")
+            return self._send(200, json.dumps(live_parts(self.app, name, self.secure)), ctype="application/json",
+                              compress=True)
         if url.path == "/play":
             return self._send(200, play_page(self.app, (query.get("name") or [""])[0], self.secure), set_cookie=from_link)
         if url.path == "/settings":
@@ -1637,13 +1648,13 @@ class Handler(BaseHTTPRequestHandler):
                     except OSError:
                         continue
                     text += body if not text else body.split("\n", 1)[-1]   # one header only
-                return self._send(200, text or empty, ctype="text/csv; charset=utf-8")
+                return self._send(200, text or empty, ctype="text/csv; charset=utf-8", compress=True)
             try:
                 with open(path, encoding="utf-8") as fh:
                     text = fh.read()
             except OSError:
                 text = empty
-            return self._send(200, text, ctype="text/csv; charset=utf-8")
+            return self._send(200, text, ctype="text/csv; charset=utf-8", compress=True)
         if url.path == "/trades.csv":
             s, _ = self.app.settings()
             book = "paper" if (query.get("book") or [""])[0] == "pretend" else None
@@ -1653,7 +1664,7 @@ class Handler(BaseHTTPRequestHandler):
                     text = fh.read()
             except OSError:
                 text = ",".join(L.TRADE_COLUMNS) + "\n"
-            return self._send(200, text, ctype="text/csv; charset=utf-8")
+            return self._send(200, text, ctype="text/csv; charset=utf-8", compress=True)
         return self._send(404, page("Not found", '<div class="box">Not found.</div>', ""))
 
     def _post(self):

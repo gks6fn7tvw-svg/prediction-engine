@@ -124,3 +124,28 @@ class TestTradeBox(WebCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestSmallerUpdates(WebCase):
+    def test_live_updates_are_compressed_when_the_phone_accepts_it(self):
+        import gzip
+        import urllib.request
+        from datetime import datetime, timedelta, timezone
+        from btcbot.settings import load, mode_folder
+        folder = mode_folder(load(self.path))
+        os.makedirs(folder, exist_ok=True)
+        close = datetime.now(timezone.utc) + timedelta(minutes=5)
+        rows = [{"ticker": f"KXBTC15M-{i}", "series": "KXBTC15M", "close_time": close.isoformat(),
+                 "yes_bid": "0.40", "yes_ask": "0.42", "target": "60000"} for i in range(3)]
+        with open(os.path.join(folder, "market.json"), "w") as fh:
+            json.dump({"updated": datetime.now(timezone.utc).isoformat(), "markets": rows}, fh)
+        req = urllib.request.Request(f"http://127.0.0.1:{self.port}/api/live",
+                                     headers={"Cookie": f"btcbot_key={KEY}", "Accept-Encoding": "gzip"})
+        with urllib.request.urlopen(req, timeout=5) as r:
+            raw = r.read()
+            self.assertEqual(r.headers.get("Content-Encoding"), "gzip")
+        data = json.loads(gzip.decompress(raw))
+        self.assertIn("live-markets", data["parts"])
+        self.assertLess(len(raw), len(gzip.decompress(raw)))
+        _, body, headers = self.call(f"/?key={KEY}")            # pages with the private link: never compressed
+        self.assertNotIn("Content-Encoding", headers)

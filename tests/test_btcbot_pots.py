@@ -82,9 +82,14 @@ class PotExchange(FakeExchange):
     def balance_summary(self):
         return sum(self.pots.values()), dict(self.pots)
 
+    moves_money = True
+
+    def target_allocation(self):
+        return dict(self.allocations[-1]) if self.allocations else {}
+
     def set_target_allocation(self, shares):
         self.allocations.append(dict(shares))
-        if shares:
+        if shares and self.moves_money:
             total = sum(self.pots.values())
             self.pots = {k: (total if k in shares else D(0)) for k in set(self.pots) | set(shares)}
 
@@ -137,9 +142,25 @@ class TestBotUsesTheCryptoPot(LiveCase):
             json.dump({"shard": 2}, fh)
         self.crypto_at(7.5, 0.80, 0.82)
         self.assertEqual(ex.allocations, [{2: 100}])
-        self.assertIn("crypto pot", self.bot.state.notice)
+        self.assertIn("it now says: crypto 100%", self.bot.state.notice)
         self.assertFalse(os.path.exists(os.path.join(self.ledger.folder, ALLOCATION_FILE)))
         self.assertEqual(self.bot.state.shards["0"]["2"], "20")
+        self.crypto_at(6.5, 0.80, 0.82)               # a minute later: say whether it moved
+        self.assertIn("Kalshi moved money into the crypto pot ($0.00 → $", self.bot.state.notice)
+
+    def test_says_plainly_when_kalshi_moves_nothing(self):
+        ex = PotExchange(general=7.54, crypto=0.88)
+        ex.moves_money = False
+        self.make([MAIN], exchange=ex)
+        self.crypto_at(12, 0.50, 0.52)                # first balance read: $0.88 in crypto
+        with open(os.path.join(self.ledger.folder, ALLOCATION_FILE), "w") as fh:
+            json.dump({"shard": 2}, fh)
+        self.crypto_at(11.9, 0.50, 0.52)
+        self.assertIn("Checking in a minute", self.bot.state.notice)
+        with self.assertLogs("btcbot", level="WARNING") as logs:
+            self.crypto_at(10.8, 0.50, 0.52)
+        self.assertIn("still hasn't moved any money into the crypto pot ($0.88)", self.bot.state.notice)
+        self.assertIn("Move it by hand", "\n".join(logs.output))
 
     def test_turning_it_off(self):
         ex = PotExchange()
@@ -169,6 +190,7 @@ class TestWebsitePots(WebCase):
         ledger.save_state(state)
         _, body, _ = self.call(f"/?key={KEY}")
         self.assertIn("$0.00</b> in the crypto pot", body)
+        self.assertIn("bot can't use: general $8.42", body)
         self.assertIn("Keep my money in the crypto pot", body)
         status, _, _ = self.call("/pots", data={"key": KEY, "pot": "2"})
         self.assertEqual(status, 303)

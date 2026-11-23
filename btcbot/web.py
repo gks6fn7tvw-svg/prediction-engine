@@ -905,8 +905,11 @@ def money_section(d: dict) -> str:
         crypto = pots.get("2")
         where = ""
         if cash is not None and pots:
+            others = " · ".join(f"{pot_name(int(k))} ${float(v):.2f}" for k, v in sorted(pots.items())
+                                if k != "2" and float(v) >= 0.01)
             where = (f' · <b>${float(crypto or 0):.2f}</b> in the crypto pot'
-                     + (" ⚠️" if float(crypto or 0) < 1 and float(cash) >= 1 else ""))
+                     + (" ⚠️" if float(crypto or 0) < 1 and float(cash) >= 1 else "")
+                     + (f'<br><span class="dim">bot can\'t use: {esc(others)}</span>' if others else ""))
         rows += (f'<div class="bet"><div><b>{esc(account_name(n).capitalize())}</b>'
                  f'<div class="sub">{esc(names) or "no play uses it"}{where}</div></div>'
                  f'<div class="amt">{"$%.2f" % float(cash) if cash is not None else "not set up yet"}</div></div>')

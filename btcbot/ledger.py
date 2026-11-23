@@ -51,6 +51,7 @@ class State:
     setup_note: str = ""                          # real money: why a play's subaccount isn't ready
     shards: dict = field(default_factory=dict)    # real money: {account: {pot: dollars}} (Kalshi money pots)
     subaccounts: list = field(default_factory=list)  # real money: subaccounts known to exist on Kalshi
+    pot_check: dict = field(default_factory=dict)  # real money: crypto pot before asking Kalshi to fill it
     goal_start: str = ""                          # goal mode: money when it was switched on
     goal_note: str = ""                           # goal mode: why it stopped (reached / fell below)
 

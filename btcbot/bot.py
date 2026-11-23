@@ -205,6 +205,39 @@ class Bot:
         log.info("plays use Kalshi subaccounts: %s", ", ".join(
             f"{p.name}={p.subaccount}" for p in self.s.plays if p.enabled))
 
+    def clock_words(self, t: datetime) -> str:
+        return t.astimezone(ZoneInfo(self.s.day_timezone)).strftime("%I:%M %p").lstrip("0").lower()
+
+    def _crypto_pot(self, account: int = 0) -> Decimal | None:
+        value = (self.state.shards.get(str(account)) or {}).get(str(CRYPTO_POT))
+        return Decimal(value) if value not in (None, "") else None
+
+    def _check_pot_moved(self, now: datetime) -> None:
+        """A minute after the pot setting: say plainly whether Kalshi actually moved any money."""
+        check = self.state.pot_check
+        if not check:
+            return
+        try:
+            asked = datetime.fromisoformat(check["at"])
+        except (KeyError, ValueError):
+            self.state.pot_check = {}
+            return
+        if (now - asked).total_seconds() < 60:
+            return
+        before, after = Decimal(check.get("before") or "0"), self._crypto_pot(0)
+        self.state.pot_check = {}
+        if after is not None and after > before + Decimal("0.01"):
+            self.state.notice = (f"{self.clock_words(now)}: Kalshi moved money into the crypto pot "
+                                 f"(${before:.2f} → ${after:.2f}). The bot can bet with it now.")
+            log.info(self.state.notice)
+        else:
+            self.state.notice = (f"{self.clock_words(now)}: Kalshi took the setting, but after a minute it still "
+                                 f"hasn't moved any money into the crypto pot (${before:.2f}). The bot can't "
+                                 "move money between pots itself; Kalshi hasn't opened that to bots yet. "
+                                 "Move it by hand in Kalshi, or ask Kalshi support to.")
+            log.warning(self.state.notice)
+        self.ledger.save_state(self.state)
+
     def _apply_allocation_request(self) -> None:
         path = os.path.join(self.ledger.folder, ALLOCATION_FILE)
         if not os.path.exists(path):
@@ -219,14 +252,23 @@ class Bot:
         except OSError:
             pass
         shard = req.get("shard")
+        now = self.clock.now()
         try:
             if shard is None:
                 self.client.set_target_allocation({})
-                self.state.notice = "Kalshi no longer moves your money between pots by itself."
+                self.state.pot_check = {}
+                self.state.notice = f"{self.clock_words(now)}: Kalshi no longer moves your money between pots."
             else:
                 self.client.set_target_allocation({int(shard): 100})
-                self.state.notice = (f"Kalshi will keep your money in its {pot_name(int(shard))} pot "
-                                     "(it checks every 10 seconds). Your own bets in the app still work.")
+                try:
+                    got = self.client.target_allocation()
+                    said = ", ".join(f"{pot_name(k)} {v}%" for k, v in sorted(got.items())) or "off"
+                except Exception as e:
+                    said = f"couldn't read it back ({kalshi_words(e)})"
+                before = self._crypto_pot(0)
+                self.state.pot_check = {"at": now.isoformat(), "before": str(before or 0)}
+                self.state.notice = (f"{self.clock_words(now)}: Kalshi took the setting (it now says: {said}). "
+                                     "Checking in a minute whether it really moves the money.")
             log.info(self.state.notice)
             self.last_accounts = None
         except Exception as e:
@@ -594,6 +636,7 @@ class Bot:
         for n in getattr(self, "ready_accounts", {0}):
             cash.setdefault(n, Decimal("0"))            # a new, empty subaccount still exists
         self.state.accounts = {str(k): str(v) for k, v in sorted(cash.items())}
+        self._check_pot_moved(now)
 
     def _apply_paper_reset(self) -> None:
         """Paper mode only: set the pretend money to the amount the website asked for.

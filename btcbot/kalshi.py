@@ -167,6 +167,12 @@ class KalshiClient:
             out[idx] = out.get(idx, Decimal("0")) + (dollars(b.get("balance")) or Decimal("0"))
         return out
 
+    def target_allocation(self) -> dict[int, int]:
+        """How Kalshi is set to spread the money across pots (percent each; {} = off)."""
+        data = self._request("GET", "/portfolio/target_balance_allocation", signed=True)
+        items = data.get("allocations") or data.get("target_balance_allocation", {}).get("allocations") or []
+        return {int(a.get("exchange_index", 0)): int(a.get("percent", 0)) for a in items}
+
     def set_target_allocation(self, shares: dict[int, int]) -> None:
         """Ask Kalshi to keep the money spread across shards like this (percent each; {} turns it off)."""
         self._request("POST", "/portfolio/target_balance_allocation", signed=True, body={

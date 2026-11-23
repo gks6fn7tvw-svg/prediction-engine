@@ -39,6 +39,7 @@ class Conditions:
     favorite_rising_seconds: Decimal | None = None
     btc_distance_min_dollars: Decimal | None = None
     min_score: Decimal | None = None          # only buy if the live score for that side is at least this (1-10)
+    levels: tuple | None = None               # only buy at these levels (1, 2, 3); None = any level
 
 
 @dataclass
@@ -75,6 +76,8 @@ class Play:
     size: Size | None = None      # None = use the default size
     subaccount: int = 0           # Kalshi subaccount for real money (0 = main account)
     pretend: bool = False         # always pretend money, even when the bot uses real money
+    max_buys: int = 1             # buys per market (same side); more than 1 = add when a new chance shows up
+    seconds_between_buys: Decimal = Decimal("60")
 
     @property
     def has_exits(self) -> bool:
@@ -132,6 +135,20 @@ class Settings:
         return play.size if play is not None and play.size is not None else self.default_size
 
 
+def _levels(value, p: str) -> tuple | None:
+    """[2, 3] or "2,3" -> (2, 3). Blank or all three = any level."""
+    if value in (None, "", []):
+        return None
+    items = value if isinstance(value, (list, tuple)) else str(value).replace(" ", "").split(",")
+    try:
+        got = tuple(sorted({int(v) for v in items if str(v) != ""}))
+    except ValueError:
+        raise SettingsError(f"{p}.levels must be some of 1, 2, 3, like [2, 3]")
+    if not got or any(v not in (1, 2, 3) for v in got):
+        raise SettingsError(f"{p}.levels must be some of 1, 2, 3, like [2, 3]")
+    return None if got == (1, 2, 3) else got
+
+
 def _play(raw: dict, i: int) -> Play:
     name = str(raw.get("name") or f"play{i + 1}").strip()
     p = f"plays[{name}]"
@@ -161,15 +178,20 @@ def _play(raw: dict, i: int) -> Play:
         favorite_rising_seconds=_dec(c.get("favorite_rising_seconds"), f"{p}.favorite_rising_seconds", 1, 900, True),
         btc_distance_min_dollars=_dec(c.get("btc_distance_min_dollars"), f"{p}.btc_distance_min_dollars", 0, None, True),
         min_score=_dec(c.get("min_score"), f"{p}.min_score", 1, 10, True),
+        levels=_levels(c.get("levels"), p),
     )
     size = raw.get("size")
     sub = _dec(raw.get("subaccount", 0) or 0, f"{p}.subaccount", 0, 63)
     if sub != sub.to_integral_value():
         raise SettingsError(f"{p}.subaccount must be a whole number from 0 to 63")
+    buys = _dec(raw.get("max_buys_per_market", 1) or 1, f"{p}.max_buys_per_market", 1, 10)
+    if buys != buys.to_integral_value():
+        raise SettingsError(f"{p}.max_buys_per_market must be a whole number from 1 to 10")
     return Play(name, bool(raw.get("enabled", True)), buy, lo, hi, start, end,
                 _dec(raw.get("slippage_cents", 0), f"{p}.slippage_cents", 0, 20), tp, sl, conditions,
                 _size(size, f"{p}.size", 0) if isinstance(size, dict) and size else None, int(sub),
-                bool(raw.get("pretend", False)))
+                bool(raw.get("pretend", False)), int(buys),
+                _dec(raw.get("seconds_between_buys", 60), f"{p}.seconds_between_buys", 0, 900))
 
 
 def parse(raw: dict) -> Settings:

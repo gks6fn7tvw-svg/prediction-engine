@@ -269,6 +269,16 @@ Two settings make it: **What it buys → Our pick** (the side our chance says wi
 **Only buy if its live score is at least 7** (under Extra conditions). The button
 "+ Add the deal play (pretend money)" sets it up: 5 to 1 minutes left, 1 contract, any price.
 
+Each play can also choose **Levels it buys at** (tick ¹ ² ³; all ticked = any) and
+**Buys per market** (more than 1 = it buys again, same side, at least `seconds_between_buys`
+apart, default 60, while the bet is still open and the rules still pass). If the pick
+switches sides it stops adding: buying both sides in one account cancels out on Kalshi.
+The website's trade box blocks the same thing (hold Up → Buy Down says "Sell now first").
+
+Backtest of the last 5 minutes, our pick, buying at each minute mark that qualifies (up to
+3 per market): score 7+ any level 94 bets +$12.77 · level ² only 33 bets, won 9 in 10,
++$6.79 · ² and ³ 57 bets +$8.47 · score 6+ about even (too loose) · 8+ 40 bets +$9.70.
+
 Why: in the backtest, buying the likely winner at Kalshi's price lost a little at every
 level (Kalshi's price already knows who's likely to win, and the fee takes the rest).
 Main (favorite 70-85¢ at 8-7 minutes) lost $16.53 over 642 bets. The one rule that made

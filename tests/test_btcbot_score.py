@@ -14,6 +14,23 @@ from test_btcbot_web import KEY, WebCase
 
 
 class TestMath(unittest.TestCase):
+    def test_settings_for_levels_and_buys(self):
+        from btcbot.settings import SettingsError, parse
+        from test_btcbot import base_settings
+
+        def play(**kw):
+            d = dict(DEAL, conditions=dict(DEAL["conditions"]))
+            d["conditions"].update(kw.pop("conditions", {}))
+            d.update(kw)
+            return parse(base_settings(plays=[d])).plays[0]
+        self.assertEqual(play().conditions.levels, None)
+        self.assertEqual(play(conditions={"levels": "2,3"}).conditions.levels, (2, 3))
+        self.assertEqual(play(conditions={"levels": [1, 2, 3]}).conditions.levels, None)
+        self.assertEqual((play().max_buys, play(max_buys_per_market=3).max_buys), (1, 3))
+        for bad in ({"conditions": {"levels": [4]}}, {"max_buys_per_market": 11}, {"max_buys_per_market": 1.5}):
+            with self.assertRaises(SettingsError):
+                play(**bad)
+
     def test_levels(self):
         self.assertEqual([lastminute.confidence(c) for c in (0.5, 0.69, 0.70, 0.89, 0.90, 0.99)], [1, 1, 2, 2, 3, 3])
         self.assertEqual(lastminute.LEVEL_WORDS[3], "about 19 in 20")
@@ -141,6 +158,49 @@ class TestDealPlay(TestBotScore):
         self.bot.spot_fn = lambda product: self.price
         self.bot.step()
         self.assertEqual(self.bot.state.open_positions(), [])
+
+
+class TestDealExtras(TestBotScore):
+    def deal(self, **over):
+        d = dict(DEAL, conditions=dict(DEAL["conditions"]))
+        for k, v in over.items():
+            (d["conditions"] if k == "levels" else d)[k] = v
+        return d
+
+    def test_levels_it_buys_at(self):
+        self.make([self.deal(levels=[3])])
+        self.run_bot(4, 0.69, 0.70)                       # $40 ahead at 4 min: level 2, so no
+        self.assertEqual(self.bot.state.open_positions(), [])
+        self.assertIn("is level 2 (wanted 3)", self.bot.last_reason.get("deal|" + TICKER, ""))
+        self.make([self.deal(levels=[2, 3])])
+        self.run_bot(4, 0.69, 0.70)
+        self.assertEqual(len(self.bot.state.open_positions()), 1)
+
+    def test_buys_again_up_to_3_times_a_minute_apart(self):
+        self.make([self.deal(max_buys_per_market=3)])
+        self.run_bot(4, 0.69, 0.70)
+        self.run_bot(3, 0.69, 0.70, 30)                   # only 30 seconds later: wait
+        self.assertEqual(len(self.bot.state.open_positions()), 1)
+        self.run_bot(3, 0.69, 0.70)                       # a minute later and still a deal
+        self.run_bot(2, 0.69, 0.70)
+        self.run_bot(1, 0.69, 0.70)                       # already 3 buys
+        held = self.bot.state.open_positions()
+        self.assertEqual([p.side for p in held], ["yes", "yes", "yes"])
+        self.assertEqual(len(self.client.orders), 3)
+
+    def test_never_adds_the_other_side(self):
+        self.make([self.deal(max_buys_per_market=3)])
+        self.run_bot(4, 0.69, 0.70)                       # bought Up
+        self.price = D("59960")                           # now we pick Down, and it's cheap
+        self.run_bot(3, 0.55, 0.56)
+        self.assertEqual([p.side for p in self.bot.state.open_positions()], ["yes"])
+        self.assertIn("buying both would cancel out", self.bot.last_reason.get("deal|" + TICKER, ""))
+
+    def test_one_buy_by_default(self):
+        self.make([DEAL])
+        self.run_bot(4, 0.69, 0.70)
+        self.run_bot(3, 0.69, 0.70)
+        self.assertEqual(len(self.bot.state.open_positions()), 1)
 
 
 class TestScorePage(WebCase):

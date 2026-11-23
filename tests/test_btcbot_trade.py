@@ -34,6 +34,19 @@ class TestRealMoneyTrades(LiveCase):
         self.bot.check_records({TICKER: None}, self.clock.t)  # Kalshi and the records agree
         self.assertEqual(self.bot.state.alert, "")
 
+    def test_buy_more_of_the_same_side_but_not_the_other(self):
+        self.make([MAIN])
+        ask(self.ledger.folder, self.clock, 12, action="buy", side="yes", contracts=1, series="KXBTC15M")
+        self.at(12, 0.68, 0.70)
+        ask(self.ledger.folder, self.clock, 11.5, action="buy", side="yes", contracts=1, series="KXBTC15M")
+        self.at(11.5, 0.70, 0.72)
+        self.assertEqual(len(self.bot.state.open_positions()), 2)          # added to the Up bet
+        ask(self.ledger.folder, self.clock, 11, action="buy", side="no", contracts=1, series="KXBTC15M")
+        self.at(11, 0.70, 0.72)
+        self.assertEqual(len(self.client.orders), 2)                       # Down was not bought
+        self.assertIn("you already hold Up", self.bot.state.trade_note)
+        self.assertIn("Sell now", self.bot.state.trade_note)
+
     def test_price_above_your_limit(self):
         self.make([MAIN])
         ask(self.ledger.folder, self.clock, 12, action="buy", side="yes", contracts=1, max_price="0.75")

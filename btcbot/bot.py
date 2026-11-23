@@ -656,6 +656,13 @@ class Bot:
         if not open_now:
             return "not done: no open market right now (prices didn't load). Try again in a moment."
         q = min(open_now, key=lambda x: x.close_time)
+        other = [p for p in self.state.open_positions()
+                 if p.ticker == q.ticker and p.side != side and (p.subaccount or 0) == 0
+                 and (self.broker.live or p.play == MANUAL)]
+        if other:
+            held = "Up" if other[0].side == "yes" else "Down"
+            return (f"not bought: you already hold {held} in {self.market_words(q)}. Buying {word} too would "
+                    f"cancel it out on Kalshi. To switch sides, tap Sell now on the {held} bet first.")
         ask = q.ask(side)
         if ask is None:
             return f"not bought: nobody is selling {word} in {self.market_words(q)} right now."
@@ -1037,14 +1044,36 @@ class Bot:
             return f"reached {self.s.max_trades_per_day} trades today; done until tomorrow"
         return None
 
+    @staticmethod
+    def _max_tries(play) -> int:
+        """Order tries per play per market (every buy uses one): 5, plus 2 more for each extra buy allowed."""
+        return MAX_ORDER_TRIES + 2 * (play.max_buys - 1)
+
     def _maybe_enter(self, play, q: rules.Quote, now: datetime, spot) -> None:
         key = f"{play.name}|{q.ticker}"
-        if key in self.state.entered or self.state.attempts.get(key, 0) >= MAX_ORDER_TRIES:
+        bought = self.state.entered.count(key)
+        if bought >= play.max_buys or f"{key}|stop" in self.state.entered \
+                or self.state.attempts.get(key, 0) >= self._max_tries(play):
             return
+        held = None
+        if bought:
+            # Adding to a bet: only while it's still open, not too soon after the last buy, same side.
+            mine = [p for p in self.state.open_positions() if p.play == play.name and p.ticker == q.ticker]
+            if not mine:
+                return          # it already sold out of this market: don't buy back in
+            last = max((rules.parse_time(p.opened_at) for p in mine if rules.parse_time(p.opened_at)), default=None)
+            if last is not None and (now - last).total_seconds() < float(play.seconds_between_buys):
+                return
+            held = mine[0].side
         chk = rules.check_entry(play, q, now, self.history.get(q.ticker), spot, self.scores.get(q.ticker))
         if not chk.ok:
             if chk.reason != "outside time window":
                 self._say(key, f"{play.name}: skip {q.ticker}: {chk.reason}")
+            return
+        if held is not None and chk.side != held:
+            self._say(key, f"{play.name}: no more buys in {self.market_words(q)}: it now wants "
+                           f"{rules.side_name(chk.side)} but holds {rules.side_name(held)} "
+                           f"(buying both would cancel out on Kalshi)")
             return
         acct = self._account(play)
         if self.broker.live and acct not in self.ready_accounts:
@@ -1095,7 +1124,7 @@ class Bot:
             log.error("%s: lost contact while buying in %s (%s); not retrying this market", play.name, q.ticker, e)
             fill = self._recover_buy(q, chk.side, chk.limit, mult, acct)
             if fill is None:
-                self.state.entered.append(key)
+                self.state.entered.append(f"{key}|stop")      # unsure what happened: no more buys here
                 self.ledger.save_state(self.state)
                 return
         if fill is None and self.broker.live:
@@ -1109,8 +1138,8 @@ class Bot:
             log.info("%s: %s %s didn't fill: tried to buy at up to %s with %s; %s. %s", play.name,
                      self.market_words(q), rules.side_name(chk.side), cents_words(chk.limit),
                      time_left_words(q, now), self._miss_reason(q, chk.side, chk.limit),
-                     f"Will try again ({tries} of {MAX_ORDER_TRIES} tries used)." if tries < MAX_ORDER_TRIES
-                     else "That was the last try for this market.")
+                     f"Will try again ({tries} of {self._max_tries(play)} tries used)."
+                     if tries < self._max_tries(play) else "That was the last try for this market.")
             return
         pos = Position(play.name, q.ticker, q.series, chk.side, plain(fill.contracts), str(fill.price),
                        str(fill.fee), now.isoformat(), q.close_time.isoformat() if q.close_time else "", acct)
@@ -1121,8 +1150,9 @@ class Bot:
         self.state.day_trades += 1
         if not self.broker.live:
             self.state.paper_cash = str(self.broker.cash)
-        log.info("%s: BOUGHT %s %s x%s at %s (fee $%s), %.1f min left", play.name, q.ticker,
-                 rules.side_name(chk.side), fill.contracts, fill.price, fill.fee, q.minutes_left(now))
+        log.info("%s: BOUGHT %s %s x%s at %s (fee $%s), %.1f min left%s", play.name, q.ticker,
+                 rules.side_name(chk.side), fill.contracts, fill.price, fill.fee, q.minutes_left(now),
+                 f" (buy {bought + 1} of up to {play.max_buys})" if play.max_buys > 1 else "")
         if self.broker.live and self.state.setup_note and self.last_setup:
             self.last_setup = now - timedelta(seconds=SETUP_RETRY_SECONDS - 30)   # set up subaccounts soon
         if self.broker.live:

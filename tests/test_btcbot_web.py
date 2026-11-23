@@ -281,6 +281,17 @@ class TestPlayButtons(WebCase):
         self.call("/settings", data=dict(form, action="save"))
         deal = load(self.path).plays[-1]
         self.assertEqual((deal.buy, deal.conditions.min_score, deal.pretend), ("pick", D(7), True))
+        self.assertEqual((deal.max_buys, deal.conditions.levels), (3, None))   # all three levels ticked = any
+        form = self.form_from_page()
+        i = len(load(self.path).plays) - 1
+        form.pop(f"p{i}_lvl1", None)                       # untick level 1
+        form[f"p{i}_minscore"], form[f"p{i}_buys"] = "8", "2"
+        self.call("/settings", data=dict(form, action="save"))
+        deal = load(self.path).plays[-1]
+        self.assertEqual((deal.conditions.levels, deal.conditions.min_score, deal.max_buys), ((2, 3), D(8), 2))
+        _, body, _ = self.call("/settings", cookie=f"btcbot_key={KEY}")
+        self.assertIn(f'name="p{i}_lvl1" value="1">', body)          # shown unticked
+        self.assertIn(f'name="p{i}_lvl2" value="1" checked>', body)
 
     def test_add_copy_rename_and_delete(self):
         form = self.form_from_page()

@@ -47,6 +47,8 @@ plays:
     slippage_cents: 0      # pay up to this many cents more than the price you see
     subaccount: 0          # real money only: Kalshi subaccount for this play (0 = main account)
     pretend: false         # true = this play always uses pretend money, even when the bot uses real money
+    max_buys_per_market: 1 # more than 1 = buy again (same side) while the rules still pass
+    seconds_between_buys: 60
 
     # When it may act (minutes left before the market closes)
     act_from_minutes_left: 8
@@ -63,6 +65,7 @@ plays:
       favorite_rising_seconds: null   # the side must be higher than it was this many seconds ago
       btc_distance_min_dollars: null  # price must be this many $ past the target (uses Coinbase)
       min_score: null                 # 1-10: only buy if the live score for that side is at least this
+      levels: null                    # e.g. [2, 3]: only buy when that side is level 2 or 3 (null = any)
 
   # Second play (optional). Off until you set enabled: true.
   - name: second

@@ -207,6 +207,15 @@ def check_entry(play: Play, q: Quote, now: datetime, history=None, spot: Decimal
             where = f"only ${gap:,.0f} past" if gap >= 0 else f"${-gap:,.0f} on the wrong side of"
             return EntryCheck(False, f"Bitcoin is {where} the target (wanted ${c.btc_distance_min_dollars} past)",
                               side, ask)
+    if c.levels is not None:
+        up = (score or {}).get("chance_up")
+        if up is None:
+            return EntryCheck(False, f"no live level for {side_name(side)} yet", side, ask)
+        from .lastminute import confidence
+        level = confidence(up if side == "yes" else 1 - up)
+        if level not in c.levels:
+            wanted = " or ".join(str(v) for v in c.levels)
+            return EntryCheck(False, f"{side_name(side)} is level {level} (wanted {wanted})", side, ask)
     if c.min_score is not None:
         got = (score or {}).get("up" if side == "yes" else "down")
         if not isinstance(got, int):

@@ -149,7 +149,7 @@ def run_together(real: "Bot", fake: "Bot", should_stop=None) -> None:
 
 class Bot:
     def __init__(self, settings: Settings, client: KalshiClient, broker, ledger: Ledger,
-                 state: State, clock=None, spot_fn=None, index_fn=None):
+                 state: State, clock=None, spot_fn=None, index_fn=None, sigma_fn=None):
         self.s = settings
         self.client = client
         self.broker = broker
@@ -160,6 +160,10 @@ class Bot:
         # Last-minute watch: a stand-in for Kalshi's settlement index (median of exchanges).
         self.index_fn = index_fn or (lambda coin: lastminute.index_proxy(client.session, coin))
         self.trackers: dict[str, lastminute.Tracker] = {}
+        # Live score: how jumpy the coin has been ($ per second), refreshed once a minute.
+        self.sigma_fn = sigma_fn or (lambda coin: lastminute.candles_sigma(client.session, coin))
+        self.sigmas: dict = {}
+        self.scores: dict = {}
         self.estimates: dict[str, lastminute.Estimate] = {}
         self.plays = {p.name: p for p in settings.plays}
         self.history = defaultdict(lambda: deque(maxlen=2000))
@@ -543,6 +547,7 @@ class Bot:
         else:
             self._say("block", reason)
         self._watch(quotes, now)
+        self._score(quotes, now)
         self._share_prices(quotes, now)
         self._settle(now)
         self.check_records(quotes, now)
@@ -558,6 +563,10 @@ class Bot:
         rows = []
         for q in quotes.values():
             row = q.as_row()
+            sc = self.scores.get(q.ticker)
+            if sc is not None:
+                row.update(chance_up=f"{sc['chance_up']:.3f}", score_up=sc["up"], score_down=sc["down"],
+                           score_best=sc["best"])
             est = self.estimates.get(q.ticker)
             if est is not None:
                 row.update(est_projected=str(est.projected.quantize(Decimal("0.01"))),
@@ -1227,6 +1236,11 @@ class Bot:
             play = self.plays.get(pos.play)
             if play is not None and play.has_exits and pos.ticker in quotes:
                 return self.s.fast_seconds
+        if self.s.watch.score and any(q.close_time and 0 < (q.close_time - now).total_seconds() <= 900
+                                      for q in quotes.values()):
+            fast_enough = min(5.0, self.s.slow_seconds)     # keep the live score fresh
+        else:
+            fast_enough = self.s.slow_seconds
         watch = float(self.s.watch.seconds)
         if watch and any(q.close_time and -1 <= (q.close_time - now).total_seconds() <= watch + self.s.slow_seconds
                          for q in quotes.values()):
@@ -1234,7 +1248,7 @@ class Bot:
         if any(rules.parse_time(p.close_time) and now >= rules.parse_time(p.close_time)
                for p in self.state.open_positions()):
             return max(self.s.fast_seconds, 5.0)
-        return self.s.slow_seconds
+        return fast_enough
 
     # ---- last-minute watch (logs ideas; never sends an order) ----------------
     def _watch(self, quotes: dict, now: datetime) -> None:
@@ -1423,6 +1437,102 @@ class Bot:
             except OSError as err:
                 self._say("watch-file", f"could not save a last-minute result ({err})")
             del self.state.watch[key]
+
+    # ---- live score (1-10 for each side) ---------------------------------------
+    def _sigma(self, coin: str, now: datetime) -> float | None:
+        hit = self.sigmas.get(coin)
+        if hit is None or (now - hit[0]).total_seconds() >= 60:
+            try:
+                value = self.sigma_fn(coin)
+            except Exception:
+                value = None
+            if value is None and hit is not None:
+                value = hit[1]          # keep the last good one
+            self.sigmas[coin] = hit = (now, value)
+        return hit[1]
+
+    def _score(self, quotes: dict, now: datetime) -> None:
+        """Our chance for each side vs Kalshi's price, as 1-10 (5 = fair), plus snapshots to check later."""
+        if not self.s.watch.score:
+            return
+        spot_cache: dict = {}
+        for q in quotes.values():
+            if q.close_time is None or q.target is None:
+                continue
+            left = (q.close_time - now).total_seconds()
+            if not 0 < left <= 900:
+                continue
+            coin = lastminute.coin_for(q.series)
+            sigma = self._sigma(coin, now) if coin else None
+            if sigma is None:
+                continue
+            est, tr = self.estimates.get(q.ticker), self.trackers.get(q.ticker)
+            if est is not None and tr is not None and tr.samples and (now - tr.samples[-1][0]).total_seconds() <= 5:
+                mean = float(est.projected)
+            else:
+                product = spot_product(q.series)
+                if product not in spot_cache:
+                    try:
+                        spot_cache[product] = self.spot_fn(product) if product else None
+                    except Exception:
+                        spot_cache[product] = None
+                if spot_cache[product] is None:
+                    continue
+                mean = float(spot_cache[product])
+            p = lastminute.chance_up(mean, float(q.target), left, sigma)
+            up_ask, down_ask = q.ask("yes"), q.ask("no")
+            su = lastminute.score(p, float(up_ask) if up_ask is not None else None)
+            sd = lastminute.score(1 - p, float(down_ask) if down_ask is not None else None)
+            best = "yes" if (su or 0) >= (sd or 0) else "no"
+            self.scores[q.ticker] = {"chance_up": p, "up": su, "down": sd, "best": best}
+            self._score_snapshot(q, now, left, p, up_ask, down_ask, su, sd, best)
+        for ticker in list(self.scores):
+            if ticker not in quotes:
+                del self.scores[ticker]
+        self._score_resolve(now)
+
+    def _score_snapshot(self, q, now, left, p, up_ask, down_ask, su, sd, best) -> None:
+        pending = self.state.score_pending.setdefault(q.ticker, {"close": q.close_time.isoformat(), "snaps": []})
+        taken = {s["checkpoint"] for s in pending["snaps"]}
+        for cp in lastminute.CHECKPOINTS:
+            if cp not in taken and cp - 20 < left <= cp:
+                pending["snaps"].append({
+                    "checkpoint": cp, "time": now.isoformat(timespec="seconds"), "seconds_left": int(left),
+                    "chance_up": f"{p:.3f}", "up_cost": str(up_ask or ""), "down_cost": str(down_ask or ""),
+                    "up_score": su or "", "down_score": sd or "", "best": rules.side_name(best),
+                    "best_score": (su if best == "yes" else sd) or ""})
+
+    def _score_resolve(self, now: datetime) -> None:
+        for ticker, pending in list(self.state.score_pending.items()):
+            close = rules.parse_time(pending.get("close"))
+            if close is None or now < close + timedelta(seconds=SETTLE_DELAY):
+                continue
+            if not pending.get("snaps"):
+                del self.state.score_pending[ticker]
+                continue
+            key = f"score|{ticker}"
+            last = self.last_settle_check.get(key)
+            if last and (now - last).total_seconds() < SETTLE_RECHECK:
+                continue
+            self.last_settle_check[key] = now
+            try:
+                result = self.client.market(ticker).get("result")
+            except Exception:
+                continue
+            if result not in ("yes", "no"):
+                if now - close > timedelta(hours=2):
+                    del self.state.score_pending[ticker]
+                continue
+            path = os.path.join(self.ledger.folder, "scores.csv")
+            for snap in pending["snaps"]:
+                row = dict(snap, market=ticker, result=rules.side_name(result),
+                           best_won="yes" if snap["best"] == rules.side_name(result) else "no")
+                try:
+                    lastminute.append_csv(path, lastminute.SCORE_COLUMNS, row)
+                except OSError as e:
+                    self._say("score-file", f"could not save a score result ({e})")
+                    break
+            del self.state.score_pending[ticker]
 
     def _say(self, key: str, message: str) -> None:
         """Log a message only when it changes, so the log stays readable."""

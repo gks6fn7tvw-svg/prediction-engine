@@ -499,6 +499,7 @@ def form_to_raw(form: dict, current: dict) -> dict:
             "follow_max_cents": number(form, "lm_follow_max", "Follow: highest price"),
             "crowd_seconds": number(form, "lm_crowd_s", "Copy the crowd: seconds before the close"),
             "crowd_cents": number(form, "lm_crowd_p", "Copy the crowd: price"),
+            "score": bool(field(form, "lm_score")),
         }
     plays = []
     for i in range(int(field(form, "play_count", "0") or 0)):
@@ -804,6 +805,17 @@ def market_cards(d: dict) -> str:
         fav_up = up is not None and down is not None and up >= down
         target = f' · target ${float(m["target"]):,.2f}' if m.get("target") else ""
         stale = f' · prices {int(age)}s old' if age > 10 else ""
+        sc = ""
+        if m.get("score_up") not in (None, "") or m.get("score_down") not in (None, ""):
+            up_s, down_s = m.get("score_up") or "–", m.get("score_down") or "–"
+            best = "Up" if m.get("score_best") == "yes" else "Down"
+            top = up_s if best == "Up" else down_s
+            chance = float(m.get("chance_up") or 0.5)
+            mine = chance if best == "Up" else 1 - chance
+            tone = "#7ee2a8" if isinstance(top, int) and top >= 7 else "#ffd27a" if isinstance(top, int) and top >= 5 else "#ff9da4"
+            sc = (f'<p class="hint" style="margin-top:6px"><b style="color:{tone}">Score now: {best} {top}/10</b> '
+                  f'(our chance {mine * 100:.0f}%) · ▲ Up {up_s} · ▼ Down {down_s}. '
+                  '5 = Kalshi\'s price is fair; higher = cheap for its chance.</p>')
         est = ""
         if m.get("est_gap") not in (None, "") and mins * 60 <= 600:
             gap = float(m["est_gap"])
@@ -815,7 +827,7 @@ def market_cards(d: dict) -> str:
                    f'<span>{countdown(mins * 60)} left</span></div>'
                    f'<div class="prices">{box(series, "Up", "▲", up, fav_up)}'
                    f'{box(series, "Down", "▼", down, not fav_up)}</div>'
-                   f'<p class="hint">Price to buy right now{target}{stale}</p>{est}</div>')
+                   f'<p class="hint">Price to buy right now{target}{stale}</p>{sc}{est}</div>')
     return "".join(out)
 
 
@@ -1368,6 +1380,8 @@ def watch_form(w: dict, inp) -> str:
         '<h2 id="lastminute">Last-minute watch</h2><div class="box">'
         f'<div class="check"><input type="checkbox" name="lm_on" value="1"{" checked" if on else ""}>'
         '<span>Watch the last minute (never sends orders)</span></div>'
+        f'<div class="check"><input type="checkbox" name="lm_score" value="1"{" checked" if w.get("score", True) else ""}>'
+        '<span>Show a live 1-10 score for Up and Down</span></div>'
         '<p class="hint">Kalshi decides Up or Down by Bitcoin\'s average over the final 60 seconds. The bot keeps '
         'its own running average and writes down what two ideas would have done, then checks them after the '
         'close. Nothing here buys or sells.</p>'
@@ -1419,10 +1433,17 @@ def watch_section(d: dict) -> str:
                    f'(1 contract each); {f["wins"]} won</div></div>'
                    f'<div class="amt {"pos" if f["would"] >= 0 else "neg"}">'
                    f'{"+" if f["would"] >= 0 else "-"}{money(f["would"])}</div></div>')
+    srows = lastminute.read_watch(os.path.join(d["folder"], "scores.csv"))
+    if srows:
+        ss = lastminute.score_summary(srows)
+        parts_ = [f"{label}: won {w} of {n}" for label, (w, n) in ss.items() if n]
+        out.append('<div class="bet"><div><b>Score track record</b><div class="sub">When the best side scored '
+                   + esc(" · ".join(parts_) or "no results yet") + '</div></div></div>')
     out.append('<p class="hint">Compared with what really happened, after fees. Change the numbers on Settings '
                '(Last-minute watch). <a href="/watch.csv" style="color:#8fb0ff">Download the results</a> · '
                'second-by-second data: <a href="/lastminute.csv" style="color:#8fb0ff">today</a> · '
-               '<a href="/lastminute.csv?days=3" style="color:#8fb0ff">last 3 days</a></p></div>')
+               '<a href="/lastminute.csv?days=3" style="color:#8fb0ff">last 3 days</a> · '
+               '<a href="/scores.csv" style="color:#8fb0ff">scores</a></p></div>')
     return "".join(out)
 
 
@@ -1627,11 +1648,13 @@ class Handler(BaseHTTPRequestHandler):
             done = (query.get("done") or [""])[0]
             return self._send(200, settings_page(self.app, message=DONE_MESSAGES.get(done), secure=self.secure),
                               set_cookie=from_link)
-        if url.path in ("/watch.csv", "/lastminute.csv"):
+        if url.path in ("/watch.csv", "/lastminute.csv", "/scores.csv"):
             s, _ = self.app.settings()
             folder = mode_folder(s) if s else ""
             if url.path == "/watch.csv":
                 path, empty = os.path.join(folder, "watch.csv"), ",".join(lastminute.WATCH_COLUMNS) + "\n"
+            elif url.path == "/scores.csv":
+                path, empty = os.path.join(folder, "scores.csv"), ",".join(lastminute.SCORE_COLUMNS) + "\n"
             else:
                 day_dir = os.path.join(folder, "lastminute")
                 days = sorted(os.listdir(day_dir)) if os.path.isdir(day_dir) else []

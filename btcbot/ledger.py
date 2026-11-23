@@ -55,6 +55,7 @@ class State:
     crypto_subaccounts: list = field(default_factory=list)  # real money: subaccounts made inside the crypto pot
     watch: dict = field(default_factory=dict)     # last-minute watch: ideas waiting for their market's result
     trade_note: str = ""                          # result of the last trade made on the website
+    score_pending: dict = field(default_factory=dict)  # live score snapshots waiting for their market's result
     goal_start: str = ""                          # goal mode: money when it was switched on
     goal_note: str = ""                           # goal mode: why it stopped (reached / fell below)
 

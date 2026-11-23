@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import concurrent.futures
 import csv
+import math
 import os
 import statistics
 from dataclasses import dataclass, field
@@ -184,4 +185,75 @@ def summary(rows: list[dict]) -> dict:
         wins = sum(1 for r in rs if Decimal(r.get("would_profit") or "0") > 0)
         helped = sum(1 for r in rs if Decimal(r.get("difference") or "0") > 0)
         out[kind] = {"count": len(rs), "difference": diff, "would": would, "wins": wins, "helped": helped}
+    return out
+
+
+# ---- live score: our chance for each side, compared with Kalshi's price -------------------
+CANDLE_PATHS = {"BTC": "BTC-USD", "ETH": "ETH-USD", "SOL": "SOL-USD"}
+PROXY_ERROR = 3.0   # $: our stand-in index vs the real one (adds a little doubt near the target)
+
+
+def candles_sigma(session, coin: str, minutes: int = 30, timeout: float = 4.0) -> float | None:
+    """How jumpy the coin has been: typical $ move per second, from Coinbase's 1-minute candles."""
+    product = CANDLE_PATHS.get(coin)
+    if not product:
+        return None
+    try:
+        r = session.get(f"https://api.exchange.coinbase.com/products/{product}/candles",
+                        params={"granularity": 60}, timeout=timeout)
+        rows = r.json()
+        closes = [float(c[4]) for c in sorted(rows, key=lambda c: c[0])][-(minutes + 1):]
+    except Exception:
+        return None
+    moves = [b - a for a, b in zip(closes, closes[1:])]
+    if len(moves) < 5:
+        return None
+    per_minute = statistics.pstdev(moves)
+    return per_minute / 60 ** 0.5 if per_minute > 0 else None
+
+
+def _phi(z: float) -> float:
+    import math
+    return 0.5 * (1 + math.erf(z / math.sqrt(2)))
+
+
+def chance_up(mean: float, target: float, seconds_left: float, sigma: float) -> float:
+    """Chance the final 60-second average ends at or above the target.
+
+    Before the last minute: Bitcoin can wander for (seconds_left - 60) seconds, then the
+    average over the final minute smooths part of the rest. Inside the last minute: only the
+    seconds still to come can move it, and they count for (seconds_left / 60) of the average.
+    `mean` is the current price before the last minute, or the running projection inside it.
+    """
+    import math
+    t = max(float(seconds_left), 0.5)
+    if t > WINDOW:
+        sd = sigma * math.sqrt(t - WINDOW + WINDOW / 3)
+    else:
+        sd = sigma * (t / WINDOW) * math.sqrt(t / 3)
+    sd = math.sqrt(sd * sd + PROXY_ERROR ** 2)
+    return _phi((mean - target) / sd)
+
+
+def score(chance: float, ask: float | None) -> int | None:
+    """1-10: 5 = Kalshi's price is fair; higher = that side looks cheap for its chance (fee included)."""
+    if ask is None or ask <= 0:
+        return None
+    import math
+    fee = math.ceil(0.07 * ask * (1 - ask) * 100 - 1e-9) / 100
+    edge = chance - (ask + fee)
+    return max(1, min(10, math.floor(5 + edge * 25 + 0.5)))
+
+
+SCORE_COLUMNS = ["time", "market", "seconds_left", "chance_up", "up_cost", "down_cost", "up_score",
+                 "down_score", "best", "best_score", "result", "best_won"]
+CHECKPOINTS = (600, 300, 240, 180, 120, 60, 30)   # seconds left when a score is written down
+
+
+def score_summary(rows: list[dict]) -> dict:
+    """How often the best side won, by how high it scored."""
+    out = {}
+    for label, lo, hi in (("8-10", 8, 10), ("6-7", 6, 7), ("1-5", 1, 5)):
+        rs = [r for r in rows if r.get("best_won") in ("yes", "no") and lo <= int(r.get("best_score") or 0) <= hi]
+        out[label] = (sum(1 for r in rs if r["best_won"] == "yes"), len(rs))
     return out

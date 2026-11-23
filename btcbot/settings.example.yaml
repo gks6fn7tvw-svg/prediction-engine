@@ -114,3 +114,4 @@ last_minute:
   follow_max_cents: 85        # ...and that side costs 85c or less, "would buy 1"
   crowd_seconds: 90           # copy the crowd: in the last 90 seconds...
   crowd_cents: 50             # ...if a bet you hold falls to 50c (others selling it), "would sell"
+  score: true                 # live 1-10 score for Up and Down on the website (5 = Kalshi's price is fair)

@@ -107,6 +107,41 @@ def spot_product(series: str) -> str | None:
     return None
 
 
+class PretendTag(logging.Filter):
+    """Marks every log line from the pretend-money bot, so the activity never mixes it up with real bets."""
+    PREFIX = "pretend money · "
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        if not str(record.msg).startswith(self.PREFIX):
+            record.msg = self.PREFIX + str(record.msg)
+        return True
+
+
+def run_together(real: "Bot", fake: "Bot", should_stop=None) -> None:
+    """Real money and pretend-only plays side by side: one loop, two separate sets of books."""
+    real.load_fees()
+    fake.load_fees()
+    log.info("bot started in %s mode, watching %s", real.s.mode.upper(), ", ".join(real.s.markets))
+    log.info("pretend money only: %s", ", ".join(p.name for p in fake.s.plays if p.enabled))
+    tag = PretendTag()
+    while not (should_stop and should_stop()):
+        waits = []
+        try:
+            waits.append(real.step())
+        except Exception:
+            log.exception("unexpected problem; trying again shortly")
+            waits.append(real.s.slow_seconds)
+        log.addFilter(tag)
+        try:
+            waits.append(fake.step())
+        except Exception:
+            log.exception("unexpected problem; trying again shortly")
+            waits.append(fake.s.slow_seconds)
+        finally:
+            log.removeFilter(tag)
+        real.clock.sleep(min(waits))
+
+
 class Bot:
     def __init__(self, settings: Settings, client: KalshiClient, broker, ledger: Ledger,
                  state: State, clock=None, spot_fn=None, index_fn=None):

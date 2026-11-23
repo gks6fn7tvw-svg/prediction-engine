@@ -234,6 +234,16 @@ amount, and the biggest single bet. Goal mode replaces the bet sizes:
 It can't make a play without a real edge reach the goal; it only stops a good
 play from betting too little or too much. Try it with pretend money first.
 
+## Pretend-only plays (beside real money)
+
+Tick **🧪 Pretend money only** on a play (or `pretend: true`) to test it with pretend
+money while the other plays use real money. The bot then runs two sets of books in one
+loop: the real plays (live folder, Kalshi orders) and the pretend-only plays (paper
+folder, `PaperBroker`, its own pretend money and daily limits). Pretend-only plays never
+send an order, need no subaccount, and their results never count toward the real totals.
+Their log lines start with "pretend money ·". The Pause button stops both; "Reset pretend
+money" on Settings resets the pretend-only plays' money.
+
 ## Last-minute watch (no orders)
 
 Kalshi settles each 15-minute market on the simple average of the 60 once-a-second

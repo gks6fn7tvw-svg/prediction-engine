@@ -46,6 +46,7 @@ plays:
     max_price: 0.85        # and at most 85c
     slippage_cents: 0      # pay up to this many cents more than the price you see
     subaccount: 0          # real money only: Kalshi subaccount for this play (0 = main account)
+    pretend: false         # true = this play always uses pretend money, even when the bot uses real money
 
     # When it may act (minutes left before the market closes)
     act_from_minutes_left: 8

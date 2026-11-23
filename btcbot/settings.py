@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass, field
+from dataclasses import replace, dataclass, field
 from decimal import Decimal
 
 import yaml
@@ -73,6 +73,7 @@ class Play:
     conditions: Conditions
     size: Size | None = None      # None = use the default size
     subaccount: int = 0           # Kalshi subaccount for real money (0 = main account)
+    pretend: bool = False         # always pretend money, even when the bot uses real money
 
     @property
     def has_exits(self) -> bool:
@@ -165,7 +166,8 @@ def _play(raw: dict, i: int) -> Play:
         raise SettingsError(f"{p}.subaccount must be a whole number from 0 to 63")
     return Play(name, bool(raw.get("enabled", True)), buy, lo, hi, start, end,
                 _dec(raw.get("slippage_cents", 0), f"{p}.slippage_cents", 0, 20), tp, sl, conditions,
-                _size(size, f"{p}.size", 0) if isinstance(size, dict) and size else None, int(sub))
+                _size(size, f"{p}.size", 0) if isinstance(size, dict) and size else None, int(sub),
+                bool(raw.get("pretend", False)))
 
 
 def parse(raw: dict) -> Settings:
@@ -196,6 +198,8 @@ def parse(raw: dict) -> Settings:
         # would cancel each other's opposite bets and leave the records wrong.
         used: dict[int, str] = {}
         for p in plays:
+            if p.pretend:
+                continue          # pretend plays never touch Kalshi money
             if p.enabled and p.subaccount in used:
                 raise SettingsError(
                     f"with real money, every play that's on needs its own Kalshi subaccount: "
@@ -292,6 +296,22 @@ def _watch(raw: dict) -> Watch:
               crowd_seconds=_dec(raw.get("crowd_seconds", 90), "last_minute.crowd_seconds", 5, 600),
               crowd_price=cents(raw.get("crowd_cents", 50), "last_minute.crowd_cents"))
     return w
+
+
+def split_pretend(settings: Settings) -> tuple[Settings, Settings | None]:
+    """Real money with some plays set to "pretend money only": two sets of settings.
+
+    The real-money bot keeps every play but only the real ones are on; the pretend bot
+    (paper mode, its own pretend money and records) has only the pretend ones on. Plays
+    that are off in one still finish any bet they already hold there.
+    """
+    if settings.mode != "live" or not any(p.pretend and p.enabled for p in settings.plays):
+        return settings, None
+    real = replace(settings, plays=[replace(p, enabled=p.enabled and not p.pretend) for p in settings.plays])
+    fake = replace(settings, mode="paper", live_confirm="",
+                   plays=[replace(p, enabled=p.enabled and p.pretend) for p in settings.plays],
+                   watch=Watch(enabled=False))
+    return real, fake
 
 
 def mode_folder(settings: Settings, mode: str | None = None) -> str:

@@ -19,11 +19,11 @@ from zoneinfo import ZoneInfo
 import requests
 
 from . import keystore, rules
-from .bot import Bot, RealClock
+from .bot import Bot, RealClock, run_together
 from .broker import LiveBroker, PaperBroker
 from .kalshi import KalshiClient, KalshiError, load_private_key
 from .ledger import Ledger, score
-from .settings import DEFAULT_PATH, SettingsError, load, mode_folder
+from .settings import DEFAULT_PATH, SettingsError, load, mode_folder, split_pretend
 
 
 def setup_logging(folder: str, tz: str) -> None:
@@ -83,10 +83,20 @@ def cmd_run(settings, path: str = DEFAULT_PATH) -> None:
             logging.getLogger("btcbot").warning("LIVE MODE: real money (balance not read yet: %s)", e)
     else:
         broker = PaperBroker(Decimal(state.paper_cash))
-    bot = Bot(settings, client, broker, ledger, state, RealClock())
+    real_s, fake_s = split_pretend(settings)
+    bot = Bot(real_s, client, broker, ledger, state, RealClock())
     if settings.live:
         bot.prepare_live()
-    bot.run_forever(settings_watcher(path))
+    if fake_s is None:
+        bot.run_forever(settings_watcher(path))
+        return
+    # Plays switched to "pretend money only" run beside the real ones, with their own
+    # pretend money and records (the paper folder), and never touch Kalshi money.
+    fake_ledger = Ledger(mode_folder(settings, "paper"))
+    fake_state = fake_ledger.load_state(settings.paper_balance)
+    fake = Bot(fake_s, client, PaperBroker(Decimal(fake_state.paper_cash)), fake_ledger, fake_state, bot.clock)
+    fake.stop_file = bot.stop_file          # the Pause button stops both
+    run_together(bot, fake, settings_watcher(path))
 
 
 def cmd_check(settings) -> None:

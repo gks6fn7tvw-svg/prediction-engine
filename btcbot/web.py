@@ -258,7 +258,7 @@ def tail_log(path: str, lines: int = 25, play: str | None = None) -> list[str]:
             for level in ("INFO ", "WARNING ", "ERROR "):
                 if msg.startswith(level):
                     msg, warn = msg[len(level):], level != "INFO "
-            if play is not None and not msg.startswith(f"{play}:"):
+            if play is not None and not msg.replace("pretend money · ", "", 1).startswith(f"{play}:"):
                 continue
             hh, mm = int(line[11:13]), line[14:16]
             line = f"{(hh % 12) or 12}:{mm} {'pm' if hh >= 12 else 'am'}  {'⚠️ ' if warn else ''}{msg}"
@@ -287,7 +287,7 @@ class App:
         self._client = None
         self._lock = threading.Lock()
         self._price_cache: dict = {}
-        self._rows_cache = (None, [])
+        self._rows_cache: dict = {}   # slot -> (file stamp, rows)
 
     def _fetch_from_kalshi(self, api_base: str, series: str) -> list:
         if self._client is None or self._client.base_url != api_base.rstrip("/"):
@@ -318,16 +318,18 @@ class App:
             d["market"] = {**d["market"], **{t: {**d["market"].get(t, {}), **r} for t, r in fetched.items()}}
             d["market_age"] = 0.0
 
-    def trades(self, path: str) -> list:
+    def trades(self, path: str, slot: str = "main") -> list:
         """The trade list, read again only when the file changes."""
         try:
             st = os.stat(path)
             stamp = (st.st_mtime_ns, st.st_size)
         except OSError:
             return []
-        if self._rows_cache[0] != stamp:
-            self._rows_cache = (stamp, L.read_trades(path))
-        return self._rows_cache[1]
+        stamp = (path,) + stamp
+        hit = self._rows_cache.get(slot)
+        if hit is None or hit[0] != stamp:
+            hit = self._rows_cache[slot] = (stamp, L.read_trades(path))
+        return hit[1]
 
     def settings(self) -> tuple[Settings | None, str | None]:
         try:
@@ -359,6 +361,22 @@ class App:
             d["state"], d["age"] = None, None
         d["paused"] = os.path.exists(os.path.join(folder, "STOP"))
         d["rows"] = self.trades(os.path.join(folder, "trades.csv"))
+        d["real_rows"] = d["rows"]
+        d["pretend_positions"], d["pretend_cash"] = [], None
+        pretend = {p.name for p in s.plays if p.pretend} if s.mode == "live" else set()
+        d["pretend_names"] = pretend
+        if pretend:
+            # Real money with some plays on "pretend money only": their bets live in the pretend books.
+            paper = mode_folder(s, "paper")
+            fake_rows = self.trades(os.path.join(paper, "trades.csv"), slot="paper")
+            d["rows"] = [r for r in d["rows"] if r["play"] not in pretend] + \
+                        [r for r in fake_rows if r["play"] in pretend]
+            try:
+                fake = L.Ledger(paper).load_state(s.paper_balance)
+                d["pretend_positions"] = [q for q in fake.positions if q["play"] in pretend]
+                d["pretend_cash"] = fake.paper_cash
+            except (OSError, ValueError):
+                pass
         d["market"], d["market_age"] = {}, None
         try:
             with open(os.path.join(folder, "market.json"), encoding="utf-8") as fh:
@@ -375,7 +393,7 @@ class App:
             settings_time = os.stat(self.settings_path).st_mtime_ns
         except OSError:
             settings_time = 0
-        held = sorted(f'{p["play"]}|{p["ticker"]}' for p in (d["state"].positions if d["state"] else []))
+        held = sorted(f'{p["play"]}|{p["ticker"]}' for p in all_positions(d))
         extra = [d["state"].alert, d["state"].notice] if d["state"] else []
         d["sig"] = hashlib.sha1(json.dumps([settings_time, len(d["rows"]), held, d["paused"], extra])
                                 .encode()).hexdigest()[:12]
@@ -407,8 +425,8 @@ class App:
                 plays.pop(i)
                 done = "deleted"
             elif action == "reset_paper":
-                if raw.get("mode", "paper") != "paper":
-                    raise SettingsError("pretend money can only be reset in paper mode")
+                if raw.get("mode", "paper") != "paper" and not any(p.get("pretend") for p in plays):
+                    raise SettingsError("pretend money can only be reset in paper mode or for pretend-only plays")
                 done = "reset"
             elif action != "save":
                 raise SettingsError("that button didn't work; please try again")
@@ -416,7 +434,7 @@ class App:
             raise SettingsError("that button didn't work; please reload the page and try again")
         s = save_raw(self.settings_path, raw)
         if done == "reset":
-            folder = mode_folder(s)
+            folder = mode_folder(s, "paper")
             os.makedirs(folder, exist_ok=True)
             with open(os.path.join(folder, PAPER_RESET_FILE), "w", encoding="utf-8") as fh:
                 fh.write(str(s.paper_balance))
@@ -490,6 +508,7 @@ def form_to_raw(form: dict, current: dict) -> dict:
         play = {
             "name": name,
             "enabled": bool(field(form, p + "enabled")),
+            "pretend": bool(field(form, p + "pretend")),
             "buy": field(form, p + "buy", "favorite"),
             "min_price": number(form, p + "min", f"{label} lowest price", scale=100),
             "max_price": number(form, p + "max", f"{label} highest price", scale=100),
@@ -715,7 +734,7 @@ def open_bet(pos: dict, play, d: dict, show_play: bool = False) -> str:
     when = (f"closes {clock(close, zone)} · {countdown(mins * 60)} left" if mins is not None and mins > 0
             else "closed · waiting for the result")
     if show_play:
-        when = f"{pos['play']} · {when}"
+        when = f"{pos['play']}{' (pretend)' if pos['play'] in d.get('pretend_names', ()) else ''} · {when}"
     plan = []
     if play is not None and play.take_profit is not None:
         plan.append(f"sells at {cents_text(play.take_profit)}")
@@ -793,7 +812,7 @@ def market_cards(d: dict) -> str:
 def play_names(d: dict) -> list:
     """Plays in the settings first, then old plays that still have bets on record."""
     names = [p.name for p in d["s"].plays]
-    held = [p["play"] for p in (d["state"].positions if d.get("state") else [])]
+    held = [p["play"] for p in all_positions(d)]
     return names + [n for n in dict.fromkeys([r["play"] for r in d["rows"]] + held) if n not in names]
 
 
@@ -838,7 +857,7 @@ def overview_page(app: App, secure: bool = False) -> str:
                      'style="color:#8fb0ff">Open it</a> and add it to your home screen instead of this one. '
                      '<span class="hint">If it won\'t load, tick "Allow HTTPS traffic" on the server in Google '
                      'Cloud (one time).</span></div>')
-    total = L.stats(d["rows"])
+    total = L.stats(d.get("real_rows", d["rows"]))
     if st is not None and s.mode == "paper" and Decimal(st.paper_cash) < LOW_MONEY:
         parts.append(f'<div class="box bad"><b>Pretend money is almost gone (${float(st.paper_cash):.2f}),</b> '
                      'so the plays can\'t place new bets. '
@@ -857,22 +876,28 @@ def overview_page(app: App, secure: bool = False) -> str:
             f'<div class="card"><span>All time</span><b>{money(total["profit"])}</b><span>{bets(total["trades"])}</span></div>'
             '</div>')
     parts.append(f'<div id="live-markets">{market_cards(d)}</div>')
-    if st is not None and st.positions:
-        parts.append(f'<h2>Open bets · {len(st.positions)}</h2>'
+    if all_positions(d):
+        parts.append(f'<h2>Open bets · {len(all_positions(d))}</h2>'
                      f'<div class="box" id="live-open">{overview_open_bets(d)}</div>')
     history = G.history(s) if s.goal.enabled else []
     if s.goal.enabled and st is not None:
         parts.append(goal_box(d, s, st))
     parts.append("<h2>Your plays</h2>")
+    if d.get("pretend_names"):
+        cash = d.get("pretend_cash")
+        parts.append(f'<p class="hint">🧪 Pretend-only plays bet with pretend money'
+                     f'{f" (${float(cash):.2f} left)" if cash is not None else ""}; their results never count '
+                     'toward your real money above.</p>')
     by_name = {p.name: p for p in s.plays}
-    positions = st.positions if st is not None else []
+    positions = all_positions(d)
     for name in play_names(d):
         play = by_name.get(name)
         ps = L.stats([r for r in d["rows"] if r["play"] == name])
         opened = sum(1 for p in positions if p["play"] == name)
         desc = describe_play(play, s) if play else "Removed or renamed. Its past bets are kept here."
         if play and s.mode == "live":
-            desc += f" Uses {esc(account_name(play.subaccount))}."
+            desc += (" 🧪 <b>Pretend money only.</b>" if play.pretend
+                     else f" Uses {esc(account_name(play.subaccount))}.")
         if play and play.enabled and s.goal.enabled:
             e = G.edge([r for r in history if r["play"] == name])
             share = G.bet_share(e, s.goal.boldness, s.goal.max_bet_pct)
@@ -915,12 +940,12 @@ def money_section(d: dict) -> str:
     s, st = d["s"], d["state"]
     accounts = {int(k): v for k, v in (st.accounts if st else {}).items()}
     for p in s.plays:
-        if p.enabled:
+        if p.enabled and not p.pretend:
             accounts.setdefault(p.subaccount, None)
     shards = (st.shards if st else {}) or {}
     rows = ""
     for n in sorted(accounts):
-        names = ", ".join(p.name for p in s.plays if p.enabled and p.subaccount == n)
+        names = ", ".join(p.name for p in s.plays if p.enabled and not p.pretend and p.subaccount == n)
         cash = accounts[n]
         pots = shards.get(str(n)) or {}
         crypto = pots.get("2")
@@ -990,7 +1015,7 @@ def goal_money(s: Settings, st) -> Decimal | None:
         return Decimal(st.paper_cash) + sum((p.cost for p in opened), Decimal("0"))
     if not st.accounts:
         return None
-    accts = {p.subaccount for p in s.plays if p.enabled}
+    accts = {p.subaccount for p in s.plays if p.enabled and not p.pretend}
     cash = sum((Decimal(v) for k, v in st.accounts.items() if int(k) in accts), Decimal("0"))
     return cash + sum((p.cost for p in opened if p.subaccount in accts), Decimal("0"))
 
@@ -1020,13 +1045,19 @@ def goal_box(d: dict, s: Settings, st) -> str:
     return "".join(out)
 
 
+def all_positions(d: dict) -> list:
+    """Open bets: real ones first, then pretend-only plays' (when the bot uses real money)."""
+    st = d.get("state")
+    return (st.positions if st is not None else []) + d.get("pretend_positions", [])
+
+
 def overview_open_bets(d: dict) -> str:
     by_name = {p.name: p for p in d["s"].plays}
-    return "".join(open_bet(p, by_name.get(p["play"]), d, show_play=True) for p in d["state"].positions)
+    return "".join(open_bet(p, by_name.get(p["play"]), d, show_play=True) for p in all_positions(d))
 
 
 def play_open_bets(d: dict, name: str, play) -> str:
-    positions = [p for p in (d["state"].positions if d.get("state") else []) if p["play"] == name]
+    positions = [p for p in all_positions(d) if p["play"] == name]
     return "".join(open_bet(p, play, d) for p in positions) or '<div class="empty">None right now.</div>'
 
 
@@ -1037,7 +1068,7 @@ def live_parts(app: App, name: str | None) -> dict:
         return {"sig": "settings-problem", "parts": {}}
     parts = {"live-running": running_box(d), "live-markets": market_cards(d)}
     if name is None:
-        if d["state"] is not None and d["state"].positions:
+        if all_positions(d):
             parts["live-open"] = overview_open_bets(d)
     else:
         play = {p.name: p for p in d["s"].plays}.get(name)
@@ -1074,14 +1105,15 @@ def play_page(app: App, name: str) -> str:
         parts.append(f'<div class="box"><b>{esc(verdict[:1].upper() + verdict[1:])}</b>'
                      f'<p class="hint">"Needs" is the win rate this play must beat to make money. Luck can move a '
                      f'win rate about ±{100 * ps["luck"]:.0f} points at {bets(ps["trades"])}.</p></div>')
-    positions = [p for p in (d["state"].positions if d.get("state") else []) if p["play"] == name]
+    positions = [p for p in all_positions(d) if p["play"] == name]
     parts.append(f'<h2>Open bets · {len(positions)}</h2><div class="box" id="live-open">'
                  f'{play_open_bets(d, name, play)}</div>')
     parts.append(f'<h2>Closed bets · {len(rows)}</h2><div class="box">')
     parts.append("".join(closed_bet(r, zone) for r in reversed(rows[-60:])) or '<div class="empty">None yet.</div>')
     if len(rows) > 60:
         parts.append(f'<p class="hint">Showing the newest 60 of {len(rows)}.</p>')
-    parts.append('<p class="hint"><a href="/trades.csv" style="color:#8fb0ff">Download every bet</a></p></div>')
+    book = "?book=pretend" if name in d.get("pretend_names", ()) else ""
+    parts.append(f'<p class="hint"><a href="/trades.csv{book}" style="color:#8fb0ff">Download every bet</a></p></div>')
     parts.append(activity_box("What it did lately", os.path.join(d["folder"], "bot.log"), "log-play", play=name))
     if play is not None:
         parts.append(f'<a class="btn btn2" href="/settings#play-{s.plays.index(play)}">Edit this play</a>')
@@ -1105,6 +1137,9 @@ def play_form(i: int, p: dict, opt, inp) -> str:
         f'<label>Name</label><input name="{pre}name" value="{esc(name)}" maxlength="40">'
         f'<div class="check"><input type="checkbox" name="{pre}enabled" value="1"'
         f'{" checked" if on else ""}><span>This play is on</span></div>'
+        f'<div class="check"><input type="checkbox" name="{pre}pretend" value="1"'
+        f'{" checked" if p.get("pretend") else ""}><span>🧪 Pretend money only (even when the bot uses real '
+        'money)</span></div>'
         f'<label>What it buys</label><select name="{pre}buy">{opt(BUY_CHOICES, p.get("buy", "favorite"))}</select>'
         f'<div class="row2"><div><label>Lowest price (¢)</label>{inp(pre + "min", cents(p.get("min_price", 0.7)))}</div>'
         f'<div><label>Highest price (¢)</label>{inp(pre + "max", cents(p.get("max_price", 0.85)))}</div></div>'
@@ -1177,10 +1212,10 @@ def settings_page(app: App, raw: dict | None = None, message: str | None = None,
             f'{" checked" if m in markets else ""}><span>{esc(n)} 15-minute</span></div>'
             for m, n in MARKETS) + f'<label>Other series (comma separated)</label>{inp("market_other", other, "text")}</div>')
     reset = ""
-    if raw.get("mode", "paper") == "paper":
+    if raw.get("mode", "paper") == "paper" or any(p.get("pretend") for p in raw.get("plays") or []):
         try:
             s = load(app.settings_path)
-            now_cash = L.Ledger(mode_folder(s)).load_state(s.paper_balance).paper_cash
+            now_cash = L.Ledger(mode_folder(s, "paper")).load_state(s.paper_balance).paper_cash
             reset = f'<p class="hint">Pretend money right now: ${float(now_cash):.2f}</p>'
         except (SettingsError, OSError, ValueError):
             pass
@@ -1556,7 +1591,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(200, text, ctype="text/csv; charset=utf-8")
         if url.path == "/trades.csv":
             s, _ = self.app.settings()
-            path = os.path.join(mode_folder(s), "trades.csv") if s else ""
+            book = "paper" if (query.get("book") or [""])[0] == "pretend" else None
+            path = os.path.join(mode_folder(s, book), "trades.csv") if s else ""
             try:
                 with open(path, encoding="utf-8") as fh:
                     text = fh.read()

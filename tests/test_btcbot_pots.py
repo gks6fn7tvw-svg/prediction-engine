@@ -10,7 +10,7 @@ from btcbot.kalshi import KalshiClient, KalshiError
 from btcbot.rules import Quote
 
 from test_btcbot import market
-from test_btcbot_live import MAIN, FakeExchange, LiveCase
+from test_btcbot_live import CHEAP, MAIN, FakeExchange, LiveCase
 from test_btcbot_web import KEY, WebCase
 
 
@@ -154,8 +154,8 @@ class TestBotUsesTheCryptoPot(LiveCase):
             self.crypto_at(7.5, 0.80, 0.82)
         self.assertEqual(self.client.orders, [])
         text = "\n".join(logs.output)
-        self.assertIn("crypto money pot", text)
-        self.assertIn("Keep my money in the crypto pot", text)
+        self.assertIn("only $0.00 in your main account's crypto pot", text)
+        self.assertIn("into the crypto pot\" in the Kalshi money box", text)
 
     def test_bets_with_whats_in_the_crypto_pot(self):
         self.make([MAIN], exchange=PotExchange(general=0, crypto=10))
@@ -245,6 +245,11 @@ class TestEmptySubaccounts(LiveCase):
 
     def test_empty_subaccount_counts_as_set_up(self):
         ex = FakeExchange(subaccounts=(0, 1))          # subaccount 1 exists but holds $0
+        from btcbot.ledger import Ledger
+        ledger = Ledger(self.dir)
+        st = ledger.load_state(D(0))
+        st.crypto_subaccounts = [1]                    # the bot made it in the crypto pot earlier
+        ledger.save_state(st)
         self.make([dict(MAIN, subaccount=1)], ex)
         self.assertEqual(getattr(ex, "created", 0), 0)
         self.assertIn(1, self.bot.ready_accounts)
@@ -463,3 +468,44 @@ class TestMakeSubaccountButton(WebCase):
         self.assertIn("Made so far: 2.", body)
         self.call("/subaccount", data={"key": KEY})
         self.assertTrue(os.path.exists(os.path.join(folder, MAKE_SUB_FILE)))
+
+
+class ShardExchange(FakeExchange):
+    """Subaccounts live in particular pots (exchange shards); numbers are handed out in order."""
+
+    def __init__(self, where):
+        super().__init__(subaccounts=tuple(where))
+        self.where = {n: set(s) for n, s in where.items()}
+        self.made = []
+
+    def subaccount_shards(self):
+        return {n: {s: (self.cash.get(n, D(0)) if s == 2 else D(0)) for s in pots} for n, pots in self.where.items()}
+
+    def create_subaccount(self, exchange_index=None):
+        n = max(self.where) + 1
+        self.where[n] = {exchange_index or 0}
+        self.cash[n] = D(0)
+        self.made.append((n, exchange_index))
+        return n
+
+
+class TestSubaccountsInTheCryptoPot(LiveCase):
+    SECOND = {"name": "second", "buy": "favorite", "min_price": 0.88, "max_price": 0.95,
+              "act_from_minutes_left": 1, "act_until_minutes_left": 0}
+
+    def test_one_made_outside_the_crypto_pot_waits_and_says_which_number(self):
+        ex = ShardExchange({0: {2, 3}, 1: {0}})        # like Seth's: 1 was made in the general pot
+        self.make([MAIN, dict(self.SECOND, subaccount=1)], ex)
+        self.assertEqual(ex.made, [])                  # nothing new made
+        self.assertNotIn(1, self.bot.ready_accounts)
+        self.assertIn("made outside the crypto pot", self.bot.state.setup_note)
+        self.assertIn("change it to 2", self.bot.state.setup_note)
+
+    def test_new_numbers_are_made_in_the_crypto_pot_once(self):
+        ex = ShardExchange({0: {2, 3}, 1: {0}})
+        self.make([MAIN, dict(self.SECOND, subaccount=2), dict(CHEAP, subaccount=3)], ex)
+        self.assertEqual(ex.made, [(2, 2), (3, 2)])
+        self.assertEqual(self.bot.ready_accounts, {0, 2, 3})
+        self.assertEqual(self.bot.state.setup_note, "")
+        self.make([MAIN, dict(self.SECOND, subaccount=2), dict(CHEAP, subaccount=3)], ex)   # restart
+        self.assertEqual(ex.made, [(2, 2), (3, 2)])

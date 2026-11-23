@@ -124,10 +124,13 @@ class Bot:
 
     # ---- real money: subaccounts ------------------------------------------
     def prepare_live(self) -> None:
-        """Make sure every play's Kalshi subaccount exists, making any that are missing.
+        """Make sure every play's Kalshi subaccount exists INSIDE the crypto pot.
 
-        Making subaccounts needs Kalshi's Advanced API level, which Kalshi grants for
-        free once one of your last 100 orders came from the API (the bot's first bet).
+        Kalshi keeps subaccounts per money pot, and these markets use the crypto pot (2).
+        A missing number is made there. A number that exists only in another pot can't be
+        used (Kalshi answers 404), so the play waits and the website says which number to
+        pick instead. Making subaccounts needs Kalshi's Advanced API level, which Kalshi
+        grants for free once one of your last 100 orders came from the API.
         """
         needed = sorted({p.subaccount for p in self.s.plays if p.enabled})
         self.broker.accounts = sorted(set(needed) | {0})
@@ -138,21 +141,21 @@ class Bot:
         if needed == [0]:
             self.state.setup_note = ""
             return
+        crypto = {0} | {int(n) for n in self.state.crypto_subaccounts}
+        exists = {0} | {int(n) for n in self.state.subaccounts}
         try:
-            have = set(self.client.subaccount_balances()) | {0}
+            if hasattr(self.client, "subaccount_shards"):
+                listed = self.client.subaccount_shards()
+                exists |= set(listed)
+                crypto |= {n for n, pots in listed.items() if CRYPTO_POT in pots}
+            else:
+                listed = self.client.subaccount_balances()
+                exists |= set(listed)
+                crypto |= set(listed)
         except Exception as e:
             log.error("could not list your Kalshi subaccounts (%s)", e)
-            have = {0}
-        # Kalshi's list leaves out subaccounts with no money in them, so also count the ones
-        # the bot already knows about, and ask Kalshi about each missing one directly.
-        have |= {int(n) for n in self.state.subaccounts}
-        for n in [n for n in needed if n not in have]:
-            try:
-                self.client.balance_dollars(n)
-                have.add(n)
-            except Exception:
-                pass
-        missing = [n for n in needed if n not in have]
+        exists |= crypto
+        missing = [n for n in needed if n not in exists]
         if missing:
             try:
                 level = self.client.api_level()
@@ -168,40 +171,48 @@ class Bot:
                     problem = f"Kalshi said: {kalshi_words(e)}"
                     log.error("Kalshi would not upgrade the API level (%s). It needs one bet placed by the "
                               "bot first: run a single play on subaccount 0 for one bet, then try again.", e)
-            # Kalshi numbers them 1, 2, 3, ... in order, so making #3 means making #2 first. Never make
-            # more than that (a restart must not keep making new ones).
-            for _ in range(max(0, max(missing) - max(have))):
+            # Kalshi numbers new subaccounts in order. Never make more than the highest number
+            # needed (they are written down, so a restart doesn't make them again).
+            for _ in range(max(missing)):
                 try:
                     n = self.client.create_subaccount(CRYPTO_POT)
                 except Exception as e:
                     log.error("could not make a Kalshi subaccount (%s)", e)
                     problem = problem or f"Making it failed. Kalshi said: {kalshi_words(e)}"
                     break
-                fresh = n not in have
-                have.add(n)
-                log.info("made Kalshi subaccount %s", n)
-                if not fresh or n > max(missing):
-                    problem = (f"Kalshi made subaccount {n} instead. Set the play to use subaccount {n} "
-                               "on Settings.")
+                exists.add(n)
+                crypto.add(n)
+                self.state.crypto_subaccounts = sorted(set(self.state.crypto_subaccounts) | {n})
+                log.info("made Kalshi subaccount %s in the crypto pot", n)
+                if n > max(missing):
+                    problem = f"Kalshi made subaccount {n} instead. Set the play to subaccount {n} on Settings."
                     log.warning(problem)
                     break
-                if all(m in have for m in missing):
+                if all(m in exists for m in missing):
                     break
-        self.ready_accounts = {n for n in needed if n in have} | {0}
-        self.state.subaccounts = sorted(n for n in have if n != 0)
+        self.ready_accounts = {n for n in needed if n in crypto} | {0}
+        self.state.subaccounts = sorted(n for n in exists if n != 0)
         self.ledger.save_state(self.state)
-        not_ready = [n for n in needed if n not in have]
+        not_ready = [n for n in needed if n not in crypto]
+        wrong_pot = [n for n in not_ready if n in exists]
         if not_ready:
-            log.error("Kalshi subaccount(s) %s are not set up, so plays using them won't bet",
+            log.error("Kalshi subaccount(s) %s are not set up in the crypto pot, so plays using them won't bet",
                       ", ".join(map(str, not_ready)))
-            names = ", ".join(f"{account_name(n)} ({', '.join(p.name for p in self.s.plays if p.enabled and p.subaccount == n)})"
-                              for n in not_ready)
-            self.state.setup_note = (
-                f"Not set up on Kalshi yet: {names}. " +
-                ("Kalshi makes subaccounts only after the bot has placed one real bet from your main account. "
-                 "Once a play on your main account has bet, the bot sets them up by itself within 10 minutes."
-                 if upgrade_refused else "The bot tries again every 10 minutes.")
-                + (f" ({problem})" if problem else ""))
+            def who(n):
+                return f"{account_name(n)} ({', '.join(p.name for p in self.s.plays if p.enabled and p.subaccount == n)})"
+            parts = []
+            if wrong_pot:
+                spare = sorted(set(range(1, 64)) - exists)[:len(wrong_pot)]
+                parts.append(f"{', '.join(who(n) for n in wrong_pot)}: made outside the crypto pot, so it can't be "
+                             f"used. On Settings, change it to {' and '.join(map(str, spare))}; the bot then makes "
+                             "it in the crypto pot.")
+            others = [n for n in not_ready if n not in exists]
+            if others:
+                parts.append(f"Not set up on Kalshi yet: {', '.join(who(n) for n in others)}. " +
+                             ("Kalshi makes subaccounts only after the bot has placed one real bet from your main "
+                              "account; the bot tries again by itself." if upgrade_refused
+                              else "The bot tries again every 10 minutes."))
+            self.state.setup_note = " ".join(parts) + (f" ({problem})" if problem else "")
         else:
             self.state.setup_note = ""
             self.last_accounts = None   # show the new subaccounts soon
@@ -833,10 +844,11 @@ class Bot:
         n = rules.size_contracts(self.s, balance, chk.limit, open_cost, play, wanted)
         if n <= 0:
             if shard is not None and balance < chk.limit:
-                self._say(key, f"{play.name}: skip {self.market_words(q)}: only ${balance:.2f} in Kalshi's "
-                               f"{pot_name(shard)} money pot, not enough for 1 contract at {cents_words(chk.limit)}. "
-                               "Kalshi keeps money in separate pots and doesn't move it for bots; tap "
-                               "\"Keep my money in the crypto pot\" in the Kalshi money box on the website.")
+                fix = ("tap \"Move ... into the crypto pot\" in the Kalshi money box" if acct == 0 else
+                       f"move money into {account_name(acct)} in the Kalshi money box")
+                self._say(key, f"{play.name}: skip {self.market_words(q)}: only ${balance:.2f} in "
+                               f"{account_name(acct)}'s {pot_name(shard)} pot, not enough for 1 contract at "
+                               f"{cents_words(chk.limit)}. To fix: {fix}.")
             else:
                 self._say(key, f"{play.name}: skip {q.ticker}: trade size works out to 0 contracts "
                                f"(balance ${balance:.2f}, price {chk.limit}, share and size limits)")

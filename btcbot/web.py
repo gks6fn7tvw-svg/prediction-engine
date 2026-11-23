@@ -944,8 +944,9 @@ def money_section(d: dict) -> str:
                   '</form></div>' + notice)
     made = sorted(int(n) for n in (st.crypto_subaccounts if st else []))
     make_box = ('<form method="post" action="/subaccount"><button class="btn2">Make a subaccount in the crypto pot'
-                '</button></form><p class="hint">Each play that\'s on needs its own subaccount, made inside the '
-                'crypto pot. Then set the play to that number on Settings, save, and move money into it here.'
+                '</button></form><p class="hint">Each play that\'s on needs its own subaccount inside the crypto '
+                'pot. Easiest: on Settings give the play a new number (like 2 or 3) and save; the bot makes it in '
+                'the crypto pot by itself. Then move money into it here.'
                 + (f' Made so far: {", ".join(map(str, made))}.' if made else "") + '</p>')
     pots_box += make_box
     if numbers == [0]:   # nothing to move between yet

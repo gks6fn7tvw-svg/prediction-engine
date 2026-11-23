@@ -173,6 +173,8 @@ class Bot:
         self.last_reason: dict[str, str] = {}
         self.last_settle_check: dict[str, datetime] = {}
         self.fail_streak = 0
+        self.book_ok = True          # live order-book prices (turned off if Kalshi refuses them)
+        self.book_fails = 0
         self.stop_file = os.path.join(ledger.folder, "STOP")  # same folder as the trade log
         self.ready_accounts = {0}
         self.last_setup = None
@@ -725,8 +727,8 @@ class Bot:
                 for m in self.client.open_markets(series):
                     q = rules.Quote.from_market(m, series)
                     if q.ticker:
-                        quotes[q.ticker] = q
-                        mid = q.yes_mid()
+                        quotes[q.ticker] = self._live_book(q, now)
+                        mid = quotes[q.ticker].yes_mid()
                         if mid is not None:
                             self.history[q.ticker].append((now, mid))
                 self.fail_streak = 0
@@ -742,6 +744,35 @@ class Bot:
             if not h:
                 del self.history[ticker]
         return quotes
+
+    def _live_book(self, q: rules.Quote, now: datetime) -> rules.Quote:
+        """Use the order book's live prices for the market that's running now.
+
+        Kalshi's market list only updates its prices about every 30 seconds, so a jump to 90c
+        could still show as 70c there. Markets more than 15 minutes from closing keep the list's
+        prices (nothing trades on them yet), and so does any market whose book can't be read.
+        """
+        fn = getattr(self.client, "best_prices", None)
+        if fn is None or not self.book_ok or q.close_time is None \
+                or not 0 < (q.close_time - now).total_seconds() <= 900:
+            return q
+        try:
+            b = fn(q.ticker)
+        except Exception as e:
+            code = getattr(e, "status", None)
+            if code in (401, 403):
+                self.book_ok = False
+                log.warning("Kalshi won't share live order-book prices (%s); using the market list's prices", code)
+            else:
+                self.book_fails += 1
+                if self.book_fails in (1, 10) or self.book_fails % 100 == 0:
+                    log.warning("could not read the live order book for %s (%s)", q.ticker, e)
+            return q
+        if b.get("yes_bid") is None and b.get("yes_ask") is None:
+            return q        # an empty book this instant: keep the list's prices
+        from dataclasses import replace
+        return replace(q, yes_bid=b.get("yes_bid"), yes_ask=b.get("yes_ask"),
+                       yes_bid_size=b.get("yes_bid_size"), yes_ask_size=b.get("yes_ask_size"))
 
     def _spots(self, quotes: dict, now: datetime) -> dict:
         """Spot prices, fetched only when a play that needs them is in its window."""

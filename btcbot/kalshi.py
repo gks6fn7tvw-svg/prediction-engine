@@ -129,6 +129,37 @@ class KalshiClient:
     def market(self, ticker: str) -> dict:
         return self._request("GET", f"/markets/{ticker}").get("market", {})
 
+    def best_prices(self, ticker: str) -> dict:
+        """Live best prices from the order book.
+
+        The /markets list only refreshes its prices about every 30 seconds; the order book is
+        live. The book lists bids only: an Up ask is $1 minus the best Down bid.
+        Example: best Up bid 0.62, best Down bid 0.36 -> Up costs 0.64, Down costs 0.38.
+        """
+        signed = bool(self.key_id and self.private_key is not None)
+        data = self._request("GET", f"/markets/{ticker}/orderbook", signed=signed)
+        book = data.get("orderbook_fp") or {}
+        old = data.get("orderbook") or {}
+
+        def top(dollars_key: str, cents_key: str):
+            levels = book.get(dollars_key)
+            scale = Decimal("1")
+            if levels is None:
+                levels, scale = old.get(cents_key) or [], Decimal("100")
+            best = None
+            for lvl in levels or []:
+                try:
+                    p, n = Decimal(str(lvl[0])) / scale, Decimal(str(lvl[1]))
+                except Exception:
+                    continue
+                if n > 0 and Decimal("0") < p < Decimal("1") and (best is None or p > best[0]):
+                    best = (p, n)
+            return best
+
+        yes, no = top("yes_dollars", "yes"), top("no_dollars", "no")
+        return {"yes_bid": yes[0] if yes else None, "yes_bid_size": yes[1] if yes else None,
+                "yes_ask": Decimal("1") - no[0] if no else None, "yes_ask_size": no[1] if no else None}
+
     def series(self, series_ticker: str) -> dict:
         return self._request("GET", f"/series/{series_ticker}").get("series", {})
 

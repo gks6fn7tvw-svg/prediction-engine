@@ -254,6 +254,13 @@ close (`scores.csv`, "Score track record" on the Overview). On the first night o
 same math was about as accurate as Kalshi's own price in the last 5 minutes, and better
 near the end, on only 35 markets.
 
+**Live prices.** Kalshi's market list only refreshes its prices about every 30 seconds
+(the bot's own records showed the price changing at most twice a minute while Kalshi's
+history showed more moves). For the market that's running, the bot now reads the live
+order book every step (`KalshiClient.best_prices`), so the website, the score and the
+plays all use the current price. If Kalshi refuses the order book (401/403), it falls
+back to the list's prices and says so in the log.
+
 ## Backtest data (Settings → Collect history)
 
 Downloads the last N days of settled markets (`btcbot/history.py`): Kalshi's 1-minute Up

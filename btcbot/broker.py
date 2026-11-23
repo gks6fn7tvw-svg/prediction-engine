@@ -31,7 +31,7 @@ class PaperBroker:
     def __init__(self, cash: Decimal):
         self.cash = cash
 
-    def balance(self, account: int | None = None) -> Decimal:
+    def balance(self, account: int | None = None, shard: int | None = None) -> Decimal:
         return self.cash  # pretend money is one shared pot
 
     def buy(self, q: Quote, side: str, contracts: Decimal, limit: Decimal, multiplier: Decimal,
@@ -79,6 +79,7 @@ class LiveBroker:
         self.client = client
         self.accounts = sorted(set(accounts)) or [0]
         self._cache: tuple[float, dict] = (0.0, {})
+        self._shard_cache: dict = {}   # (account, shard) -> (when, dollars)
 
     def balances(self) -> dict[int, Decimal]:
         """Cash per subaccount, remembered for a moment (Kalshi limits balance checks to about 1 a second).
@@ -95,15 +96,31 @@ class LiveBroker:
         self._cache = (time.monotonic(), b)
         return b
 
-    def balance(self, account: int | None = None) -> Decimal:
+    def balance(self, account: int | None = None, shard: int | None = None) -> Decimal:
+        """Cash you can bet with. With a shard: only what's in that market's pot, which is all an
+        API order can use (Kalshi doesn't move money between pots for API orders)."""
+        if shard is not None and account is not None:
+            return self.shard_balance(account, shard)
         b = self.balances()
         if account is None:
             return sum((b.get(a, Decimal("0")) for a in self.accounts), Decimal("0"))
         return b.get(account, Decimal("0"))
 
+    def shard_balance(self, account: int, shard: int) -> Decimal:
+        hit = self._shard_cache.get((account, shard))
+        now = time.monotonic()
+        if hit and now - hit[0] < self.BALANCE_CACHE_SECONDS:
+            return hit[1]
+        if self.accounts == [0]:
+            value = self.client.balance_dollars(account, exchange_index=shard)
+        else:
+            value = self.client.subaccount_balances(exchange_index=shard).get(account, Decimal("0"))
+        self._shard_cache[(account, shard)] = (time.monotonic(), value)
+        return value
+
     def buy(self, q: Quote, side: str, contracts: Decimal, limit: Decimal, multiplier: Decimal,
             account: int = 0) -> Fill | None:
-        self._cache = (0.0, {})  # the balance is about to change
+        self._cache, self._shard_cache = (0.0, {}), {}  # the balance is about to change
         if side == "yes":
             resp = self.client.place_ioc(q.ticker, "bid", contracts, limit, subaccount=account)
         else:  # buying Down at `limit` = selling Up at 1 - limit
@@ -112,7 +129,7 @@ class LiveBroker:
 
     def sell(self, q: Quote, side: str, contracts: Decimal, min_price: Decimal, multiplier: Decimal,
              account: int = 0) -> Fill | None:
-        self._cache = (0.0, {})
+        self._cache, self._shard_cache = (0.0, {}), {}
         if side == "yes":
             resp = self.client.place_ioc(q.ticker, "ask", contracts, min_price, reduce_only=True,
                                          subaccount=account)

@@ -39,6 +39,7 @@ class Quote:
     yes_bid_size: Decimal | None
     yes_ask_size: Decimal | None
     target: Decimal | None
+    exchange_index: int | None = None   # Kalshi keeps money per "shard"; crypto markets are on shard 2
 
     @classmethod
     def from_market(cls, m: dict, series: str) -> "Quote":
@@ -61,6 +62,7 @@ class Quote:
             yes_bid_size=size("yes_bid_size_fp"),
             yes_ask_size=size("yes_ask_size_fp"),
             target=Decimal(str(strike)) if strike not in (None, "") else None,
+            exchange_index=int(m["exchange_index"]) if str(m.get("exchange_index", "")).isdigit() else None,
         )
 
     def as_row(self) -> dict:

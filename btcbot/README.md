@@ -172,6 +172,14 @@ account, and the bot's website shows them all. Making them needs Kalshi's
 Advanced API level, which Kalshi grants for free once one of your last 100 orders
 came from the API; the bot asks for it by itself.
 
+**Money pots:** Kalshi splits each account's cash into pots by kind of market
+("exchange shards"; crypto is pot 2). Orders from the app or website move money
+between pots for you; orders from a bot don't, so the crypto pot must already
+hold the money. The Overview shows how much is in the crypto pot. Tap **Keep my
+money in the crypto pot** once and Kalshi keeps it there (it checks every 10
+seconds); **Stop** turns that off. If the pot is short, the log says so instead
+of trying anyway.
+
 **Step 1: one play, main account, tiny bets** (this also qualifies you for subaccounts)
 
 1. **Make a Kalshi API key:** on kalshi.com, open your profile settings, find

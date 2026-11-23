@@ -30,7 +30,7 @@ from . import goal as G
 from . import keystore
 from . import ledger as L
 from .kalshi import KalshiClient, KalshiError
-from .bot import PAPER_RESET_FILE, SETUP_FILE, TRANSFER_FILE, account_name
+from .bot import ALLOCATION_FILE, PAPER_RESET_FILE, SETUP_FILE, TRANSFER_FILE, account_name, pot_name
 from .rules import Quote, parse_time
 from .secure import SecureLink
 from .settings import (LIVE_CONFIRM_TEXT, PACKAGE_DIR, SIZE_MODES, Settings, SettingsError, load, load_raw,
@@ -893,28 +893,43 @@ def money_section(d: dict) -> str:
     for p in s.plays:
         if p.enabled:
             accounts.setdefault(p.subaccount, None)
+    shards = (st.shards if st else {}) or {}
     rows = ""
     for n in sorted(accounts):
         names = ", ".join(p.name for p in s.plays if p.enabled and p.subaccount == n)
         cash = accounts[n]
+        pots = shards.get(str(n)) or {}
+        crypto = pots.get("2")
+        where = ""
+        if cash is not None and pots:
+            where = (f' · <b>${float(crypto or 0):.2f}</b> in the crypto pot'
+                     + (" ⚠️" if float(crypto or 0) < 1 and float(cash) >= 1 else ""))
         rows += (f'<div class="bet"><div><b>{esc(account_name(n).capitalize())}</b>'
-                 f'<div class="sub">{esc(names) or "no play uses it"}</div></div>'
+                 f'<div class="sub">{esc(names) or "no play uses it"}{where}</div></div>'
                  f'<div class="amt">{"$%.2f" % float(cash) if cash is not None else "not set up yet"}</div></div>')
+    pots_box = ""
+    if st is not None and shards:
+        pots_box = ('<p class="hint">Kalshi splits your cash into pots by kind of market. The bot can only bet '
+                    'with what\'s in the <b>crypto</b> pot. Your own bets in the app move money for you; '
+                    'bot bets don\'t. Example: $8 total but $0 in crypto = the bot can\'t buy.</p>'
+                    '<form method="post" action="/pots" style="display:flex;gap:8px;flex-wrap:wrap">'
+                    '<button class="btn2" name="pot" value="2">Keep my money in the crypto pot</button>'
+                    '<button class="btn2" name="pot" value="off" style="opacity:.7">Stop</button></form>')
     numbers = sorted(accounts)
     first_sub = next((n for n in numbers if n != 0), 0)
     choices = "".join(f'<option value="{n}">{esc(account_name(n))}</option>' for n in numbers)
     to_choices = "".join(f'<option value="{n}"{" selected" if n == first_sub else ""}>{esc(account_name(n))}</option>'
                          for n in numbers)
-    notice = f'<p class="hint">Last money move: {esc(st.notice)}</p>' if st and st.notice else ""
+    notice = f'<p class="hint">Last change: {esc(st.notice)}</p>' if st and st.notice else ""
     if st and st.setup_note:
         notice = (f'<div class="box warn" style="margin:8px 0">{esc(st.setup_note)}'
                   '<form method="post" action="/setup"><button class="btn2">Try setting up again now</button>'
                   '</form></div>' + notice)
     if numbers == [0]:   # nothing to move between yet
-        return ('<h2 id="money">Kalshi money</h2><div class="box">' + rows + notice +
-                '<p class="hint">Every play that\'s on uses your main account, so there\'s nothing to move. '
-                'This matters later, when plays get their own subaccounts.</p></div>')
-    return ('<h2 id="money">Kalshi money</h2><div class="box">' + rows + notice +
+        return ('<h2 id="money">Kalshi money</h2><div class="box">' + rows + notice + pots_box +
+                '<p class="hint">Every play that\'s on uses your main account, so there\'s nothing to move '
+                'between accounts.</p></div>')
+    return ('<h2 id="money">Kalshi money</h2><div class="box">' + rows + notice + pots_box +
             '<form method="post" action="/transfer">'
             f'<div class="row2"><div><label>Move from</label><select name="from">{choices}</select></div>'
             f'<div><label>To</label><select name="to">{to_choices}</select></div></div>'
@@ -1426,6 +1441,17 @@ class Handler(BaseHTTPRequestHandler):
             return self._redirect(f"/settings?done={done}" + (f"#play-{focus}" if focus is not None else ""))
         if url.path == "/transfer":
             self.app.moved = request_transfer(self.app, form)
+            return self._redirect("/#money")
+        if url.path == "/pots":
+            s, _ = self.app.settings()
+            if s is not None and s.mode == "live":
+                folder = mode_folder(s)
+                os.makedirs(folder, exist_ok=True)
+                choice = field(form, "pot")
+                with open(os.path.join(folder, ALLOCATION_FILE), "w", encoding="utf-8") as fh:
+                    json.dump({"shard": 2 if choice == "2" else None}, fh)
+                self.app.moved = ("Asked Kalshi to keep your money in the crypto pot. Check back in a few seconds."
+                                  if choice == "2" else "Asked Kalshi to stop moving money between pots.")
             return self._redirect("/#money")
         if url.path == "/setup":
             s, _ = self.app.settings()

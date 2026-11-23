@@ -102,6 +102,8 @@ class KalshiClient:
     def _request(self, method: str, path: str, params=None, body=None, signed=False) -> dict:
         if signed and not (self.key_id and self.private_key is not None):
             raise KalshiError(0, "this needs your Kalshi API key, but none is loaded")
+        if body is None and method in ("POST", "PUT"):
+            body = {}   # Kalshi wants a JSON body (and Content-Type) on every POST
         headers = self._headers(method, path) if signed else {"Accept": "application/json"}
         if body is not None:
             headers["Content-Type"] = "application/json"
@@ -133,16 +135,45 @@ class KalshiClient:
     # ---- account (needs key) --------------------------------------------
     # `subaccount` 0 is the main account; 1-63 are numbered subaccounts, which
     # keep their own money and positions (so two plays can hold opposite sides).
-    def balance_dollars(self, subaccount: int = 0) -> Decimal:
+    def _balance_data(self, subaccount: int = 0, exchange_index: int | None = None) -> dict:
         # Kalshi allows about one balance check a second (Basic and Advanced levels).
         wait = 1.1 - (time.monotonic() - self._last_balance)
         if wait > 0:
             self.sleep(wait)
-        params = {"subaccount": subaccount} if subaccount else None
+        params = {"subaccount": subaccount} if subaccount else {}
+        if exchange_index is not None:
+            params["exchange_index"] = exchange_index
         try:
-            data = self._request("GET", "/portfolio/balance", params=params, signed=True)
+            return self._request("GET", "/portfolio/balance", params=params or None, signed=True)
         finally:
             self._last_balance = time.monotonic()
+
+    def balance_summary(self) -> tuple[Decimal, dict[int, Decimal]]:
+        """Main account: (cash you can use, cash per shard), from one balance check."""
+        data = self._balance_data()
+        total = (Decimal(str(data["balance_dollars"])) if data.get("balance_dollars") not in (None, "")
+                 else Decimal(int(data.get("balance", 0))) / 100)
+        shards: dict[int, Decimal] = {}
+        for b in data.get("balance_breakdown") or []:
+            idx = int(b.get("exchange_index", 0))
+            shards[idx] = shards.get(idx, Decimal("0")) + (dollars(b.get("balance")) or Decimal("0"))
+        return total, shards
+
+    def shard_balances(self) -> dict[int, Decimal]:
+        """Cash per exchange shard (Kalshi keeps a separate pot per kind of market; crypto is shard 2)."""
+        out: dict[int, Decimal] = {}
+        for b in self._balance_data().get("balance_breakdown") or []:
+            idx = int(b.get("exchange_index", 0))
+            out[idx] = out.get(idx, Decimal("0")) + (dollars(b.get("balance")) or Decimal("0"))
+        return out
+
+    def set_target_allocation(self, shares: dict[int, int]) -> None:
+        """Ask Kalshi to keep the money spread across shards like this (percent each; {} turns it off)."""
+        self._request("POST", "/portfolio/target_balance_allocation", signed=True, body={
+            "allocations": [{"exchange_index": int(k), "percent": int(v)} for k, v in shares.items()]})
+
+    def balance_dollars(self, subaccount: int = 0, exchange_index: int | None = None) -> Decimal:
+        data = self._balance_data(subaccount, exchange_index)
         if data.get("balance_dollars") not in (None, ""):
             return Decimal(str(data["balance_dollars"]))
         return Decimal(int(data.get("balance", 0))) / 100
@@ -171,11 +202,24 @@ class KalshiClient:
                 out[p["ticker"]] = out.get(p["ticker"], Decimal("0")) + n
         return out
 
-    def subaccount_balances(self) -> dict[int, Decimal]:
-        """Cash in every subaccount (0 = main account), in dollars."""
+    def subaccount_shards(self) -> dict[int, dict[int, Decimal]]:
+        """Cash per subaccount, split by money pot: {subaccount: {shard: dollars}}."""
+        data = self._request("GET", "/portfolio/subaccounts/balances", signed=True)
+        out: dict[int, dict[int, Decimal]] = {}
+        for b in data.get("subaccount_balances", []):
+            n = int(b.get("subaccount_number", b.get("subaccount", 0)))
+            idx = int(b.get("exchange_index", 0))
+            pots = out.setdefault(n, {})
+            pots[idx] = pots.get(idx, Decimal("0")) + (dollars(b.get("balance")) or Decimal("0"))
+        return out
+
+    def subaccount_balances(self, exchange_index: int | None = None) -> dict[int, Decimal]:
+        """Cash in every subaccount (0 = main account), in dollars; one shard only if exchange_index is given."""
         data = self._request("GET", "/portfolio/subaccounts/balances", signed=True)
         out: dict[int, Decimal] = {}
         for b in data.get("subaccount_balances", []):
+            if exchange_index is not None and int(b.get("exchange_index", 0)) != exchange_index:
+                continue
             n = int(b.get("subaccount_number", b.get("subaccount", 0)))
             out[n] = out.get(n, Decimal("0")) + (dollars(b.get("balance")) or Decimal("0"))
         return out
@@ -202,7 +246,8 @@ class KalshiClient:
 
     def upgrade_api_level(self) -> None:
         """Ask for the free Advanced level (granted once one of the last 100 orders came from the API)."""
-        self._request("POST", "/account/api_usage_level/upgrade", signed=True)
+        # Kalshi refuses a POST without a JSON body ("invalid_content_type"), so send an empty one.
+        self._request("POST", "/account/api_usage_level/upgrade", body={}, signed=True)
 
     def place_ioc(self, ticker: str, yes_side: str, count: Decimal, yes_price: Decimal,
                   reduce_only: bool = False, subaccount: int = 0) -> dict:

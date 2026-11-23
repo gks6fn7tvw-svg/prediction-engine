@@ -465,7 +465,7 @@ class TestRealMoneyPages(WebCase):
         self.assertIn("Kalshi money", body)
         self.assertIn("Subaccount 2", body)
         self.assertIn("Uses subaccount 1.", body)
-        self.assertIn("Last money move: Moved $5.00", body)
+        self.assertIn("Last change: Moved $5.00", body)
         status, _, headers = self.call("/transfer", data={"key": KEY, "from": "0", "to": "2", "amount": "4.25"})
         self.assertEqual(status, 303)
         with open(os.path.join(folder, TRANSFER_FILE)) as fh:

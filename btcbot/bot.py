@@ -52,6 +52,12 @@ def account_name(n: int) -> str:
 PAPER_RESET_FILE = "PAPER_RESET"   # the website writes the new pretend balance here
 TRANSFER_FILE = "TRANSFER_REQUEST"  # the website asks to move money between subaccounts
 SETUP_FILE = "SETUP_REQUEST"        # the website asks to set up subaccounts again now
+ALLOCATION_FILE = "ALLOCATION_REQUEST"  # the website asks Kalshi to keep money in the crypto pot
+POTS = {0: "general", 1: "combos", 2: "crypto", 3: "sports"}
+
+
+def pot_name(shard) -> str:
+    return POTS.get(shard, f"#{shard}") if shard is not None else "main"
 CHECK_SECONDS = 10                  # real money: compare our records with Kalshi this often
 ACCOUNTS_SECONDS = 30               # real money: refresh subaccount cash for the website
 SETUP_RETRY_SECONDS = 600           # real money: try setting up missing subaccounts again this often
@@ -179,6 +185,35 @@ class Bot:
         log.info("plays use Kalshi subaccounts: %s", ", ".join(
             f"{p.name}={p.subaccount}" for p in self.s.plays if p.enabled))
 
+    def _apply_allocation_request(self) -> None:
+        path = os.path.join(self.ledger.folder, ALLOCATION_FILE)
+        if not os.path.exists(path):
+            return
+        try:
+            with open(path, encoding="utf-8") as fh:
+                req = json.load(fh)
+        except (OSError, ValueError):
+            req = {}
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+        shard = req.get("shard")
+        try:
+            if shard is None:
+                self.client.set_target_allocation({})
+                self.state.notice = "Kalshi no longer moves your money between pots by itself."
+            else:
+                self.client.set_target_allocation({int(shard): 100})
+                self.state.notice = (f"Kalshi will keep your money in its {pot_name(int(shard))} pot "
+                                     "(it checks every 10 seconds). Your own bets in the app still work.")
+            log.info(self.state.notice)
+            self.last_accounts = None
+        except Exception as e:
+            self.state.notice = f"Kalshi didn't accept the money-pot setting: {kalshi_words(e)}"
+            log.error(self.state.notice)
+        self.ledger.save_state(self.state)
+
     def _retry_setup(self, now: datetime) -> None:
         asked = os.path.join(self.ledger.folder, SETUP_FILE)
         if os.path.exists(asked):
@@ -246,6 +281,7 @@ class Bot:
         self._clear_notes_if_resumed()
         if self.broker.live:
             self._retry_setup(now)
+            self._apply_allocation_request()
             self._apply_transfer_request()
             self._refresh_accounts(now)
         self._goal_check()   # before any new bet, so the goal pauses betting in time
@@ -514,7 +550,16 @@ class Bot:
             return
         self.last_accounts = now
         try:
-            if hasattr(self.broker, "balances"):
+            if getattr(self.broker, "accounts", [0]) == [0] and hasattr(self.client, "balance_summary"):
+                total, pots = self.client.balance_summary()
+                cash = {0: total}
+                self.state.shards = {"0": {str(k): str(v) for k, v in sorted(pots.items())}}
+            elif hasattr(self.client, "subaccount_shards"):
+                split = self.client.subaccount_shards()
+                cash = {n: sum(p.values(), Decimal("0")) for n, p in split.items()}
+                self.state.shards = {str(n): {str(k): str(v) for k, v in sorted(p.items())}
+                                     for n, p in sorted(split.items())}
+            elif hasattr(self.broker, "balances"):
                 cash = self.broker.balances()          # shares the bot's remembered balance
             elif getattr(self.broker, "accounts", [0]) == [0]:
                 cash = {0: self.client.balance_dollars()}
@@ -587,8 +632,9 @@ class Bot:
         if self.broker.live and acct not in self.ready_accounts:
             self._say(key, f"{play.name}: skip {q.ticker}: its Kalshi subaccount {acct} isn't set up")
             return
+        shard = q.exchange_index if self.broker.live else None
         try:
-            balance = self.broker.balance(acct)
+            balance = self.broker.balance(acct, shard)
         except Exception as e:
             log.warning("could not read balance (%s); not trading this second", e)
             return
@@ -597,15 +643,31 @@ class Bot:
         wanted = self._goal_contracts(play, acct, balance, chk.limit) if self.s.goal.enabled else None
         n = rules.size_contracts(self.s, balance, chk.limit, open_cost, play, wanted)
         if n <= 0:
-            self._say(key, f"{play.name}: skip {q.ticker}: trade size works out to 0 contracts "
-                           f"(balance ${balance:.2f}, price {chk.limit}, share and size limits)")
+            if shard is not None and balance < chk.limit:
+                self._say(key, f"{play.name}: skip {self.market_words(q)}: only ${balance:.2f} in Kalshi's "
+                               f"{pot_name(shard)} money pot, not enough for 1 contract at {cents_words(chk.limit)}. "
+                               "Kalshi keeps money in separate pots and doesn't move it for bots; tap "
+                               "\"Keep my money in the crypto pot\" in the Kalshi money box on the website.")
+            else:
+                self._say(key, f"{play.name}: skip {q.ticker}: trade size works out to 0 contracts "
+                               f"(balance ${balance:.2f}, price {chk.limit}, share and size limits)")
             return
         self.state.attempts[key] = self.state.attempts.get(key, 0) + 1
         mult = self.multipliers.get(q.series, Decimal("1"))
         try:
             fill = self.broker.buy(q, chk.side, n, chk.limit, mult, account=acct)
         except KalshiError as e:
-            log.error("%s: buy order rejected: %s", play.name, e)
+            if "insufficient_balance" in (e.text or ""):
+                # Not marked done: if Kalshi refills the crypto pot, a later try (up to the limit) can still buy.
+                log.warning("%s: %s %s not bought: Kalshi says the %s money pot doesn't have enough for %s "
+                            "at %s. Kalshi keeps money in separate pots and doesn't move it for bots; tap "
+                            "\"Keep my money in the crypto pot\" in the Kalshi money box on the website.", play.name,
+                            self.market_words(q), rules.side_name(chk.side), pot_name(q.exchange_index),
+                            f"{n} contracts" if n != 1 else "1 contract", cents_words(chk.limit))
+                self.ledger.save_state(self.state)
+                self.last_accounts = None   # re-read the pots now
+                return
+            log.error("%s: buy order rejected: %s", play.name, kalshi_words(e))
             return
         except Exception as e:
             if not self.broker.live:

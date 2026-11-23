@@ -49,6 +49,7 @@ class State:
     notice: str = ""                              # last money-move result
     accounts: dict = field(default_factory=dict)  # real money: subaccount -> cash, for the website
     setup_note: str = ""                          # real money: why a play's subaccount isn't ready
+    shards: dict = field(default_factory=dict)    # real money: {account: {pot: dollars}} (Kalshi money pots)
     goal_start: str = ""                          # goal mode: money when it was switched on
     goal_note: str = ""                           # goal mode: why it stopped (reached / fell below)
 

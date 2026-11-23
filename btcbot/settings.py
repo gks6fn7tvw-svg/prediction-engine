@@ -112,6 +112,11 @@ class Settings:
     folder: str = "data"
     api_base: str = "https://external-api.kalshi.com/trade-api/v2"
     goal: Goal = field(default_factory=Goal)
+    watch: "Watch" = None
+
+    def __post_init__(self):
+        if self.watch is None:
+            self.watch = Watch()
 
     @property
     def live(self) -> bool:
@@ -218,6 +223,7 @@ def parse(raw: dict) -> Settings:
         folder=str(files.get("folder", "data")),
         api_base=str(raw.get("api_base", "https://external-api.kalshi.com/trade-api/v2")),
         goal=_goal(raw.get("goal") or {}),
+        watch=_watch(raw.get("last_minute") or {}),
     )
     if s.fast_seconds < 0.5 or s.slow_seconds < s.fast_seconds:
         raise SettingsError("polling: fast_seconds must be at least 0.5 and slow_seconds at least fast_seconds")
@@ -252,6 +258,35 @@ def _goal(raw: dict) -> Goal:
     if g.enabled and g.stop_below >= g.target:
         raise SettingsError("goal: the stop amount must be below the target")
     return g
+
+
+@dataclass
+class Watch:
+    """Last-minute watch: logs what a guard and a follow idea WOULD do. It never trades."""
+    enabled: bool = True
+    guard_seconds: Decimal = Decimal("90")     # guard looks this many seconds before the close
+    guard_margin: Decimal = Decimal("20")      # ...and acts once the estimate is this many $ against the bet
+    follow_seconds: Decimal = Decimal("60")    # follow looks this many seconds before the close
+    follow_margin: Decimal = Decimal("30")     # ...when the estimate is this many $ past the target
+    follow_max_price: Decimal = Decimal("0.85")  # ...and that side costs at most this
+
+    @property
+    def seconds(self) -> Decimal:
+        """How long before each close the bot watches (and checks every second)."""
+        return max(self.guard_seconds, self.follow_seconds, Decimal("60")) if self.enabled else Decimal("0")
+
+
+def _watch(raw: dict) -> Watch:
+    def cents(v, name):
+        d = _dec(v, name, 1, 99)
+        return d / 100 if d > 1 else d
+    w = Watch(enabled=bool(raw.get("enabled", True)),
+              guard_seconds=_dec(raw.get("guard_seconds", 90), "last_minute.guard_seconds", 5, 600),
+              guard_margin=_dec(raw.get("guard_margin_dollars", 20), "last_minute.guard_margin_dollars", 0),
+              follow_seconds=_dec(raw.get("follow_seconds", 60), "last_minute.follow_seconds", 5, 600),
+              follow_margin=_dec(raw.get("follow_margin_dollars", 30), "last_minute.follow_margin_dollars", 0),
+              follow_max_price=cents(raw.get("follow_max_cents", 85), "last_minute.follow_max_cents"))
+    return w
 
 
 def mode_folder(settings: Settings, mode: str | None = None) -> str:

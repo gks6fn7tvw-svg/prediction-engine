@@ -234,6 +234,27 @@ amount, and the biggest single bet. Goal mode replaces the bet sizes:
 It can't make a play without a real edge reach the goal; it only stops a good
 play from betting too little or too much. Try it with pretend money first.
 
+## Last-minute watch (no orders)
+
+Kalshi settles each 15-minute market on the simple average of the 60 once-a-second
+CF Benchmarks index prices (BRTI) in the final minute, compared with the target. Part of
+the answer is locked in as that minute passes, so fast traders reprice before Kalshi's
+page catches up. The bot keeps its own running estimate (`btcbot/lastminute.py`): the
+median of Coinbase, Kraken and Bitstamp mid prices (three of the index's seven
+exchanges; the index itself is a paid feed), averaged over the seconds already counted,
+with the current price filling the rest.
+
+It only watches. Two ideas are written down and checked after each close:
+- **Guard:** a bet you hold, when the estimate turns at least $X against it in the last
+  N seconds: "would sell now at the bid". Compared with holding to the end.
+- **Follow:** when the estimate is at least $X past the target in the last N seconds and
+  that side costs at most Y cents: "would buy 1". Win or loss after fees.
+
+Results: `watch.csv` (Overview: "Last-minute watch"); every second of the final stretch:
+`lastminute/<day>.csv` (two weeks kept). Settings: `last_minute:` or the website.
+Limits: the stand-in isn't the official index, the bot checks once a second from one
+server (the fastest traders react in well under a second), and a past pattern can fade.
+
 ## For reviewers (ChatGPT)
 
 - API details were checked against docs.kalshi.com on 2026-11-21: host

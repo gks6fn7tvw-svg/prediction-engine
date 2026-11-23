@@ -30,6 +30,7 @@ from . import goal as G
 from . import keystore
 from . import ledger as L
 from .kalshi import KalshiClient, KalshiError
+from . import lastminute
 from .bot import (ALLOCATION_FILE, MAKE_SUB_FILE, PAPER_RESET_FILE, POT_MOVE_FILE, SETUP_FILE, TRANSFER_FILE,
                   account_name, pot_name)
 from .rules import Quote, parse_time
@@ -313,7 +314,8 @@ class App:
                     self._price_cache[series] = (now, rows)
                 fetched.update({r["ticker"]: r for r in rows if r.get("ticker")})
         if fetched:
-            d["market"] = {**d["market"], **fetched}
+            # keep the bot's own extras (like the last-minute estimate) under Kalshi's fresher prices
+            d["market"] = {**d["market"], **{t: {**d["market"].get(t, {}), **r} for t, r in fetched.items()}}
             d["market_age"] = 0.0
 
     def trades(self, path: str) -> list:
@@ -466,6 +468,15 @@ def form_to_raw(form: dict, current: dict) -> dict:
             "boldness": field(form, "goal_boldness", "normal"),
             "stop_below": number(form, "goal_stop", "Goal stop", blank_ok=True) or 0,
             "max_bet_pct": number(form, "goal_max", "Biggest bet"),
+        }
+    if "lm_guard_s" in form:
+        raw["last_minute"] = {
+            "enabled": bool(field(form, "lm_on")),
+            "guard_seconds": number(form, "lm_guard_s", "Guard: seconds before the close"),
+            "guard_margin_dollars": number(form, "lm_guard_m", "Guard: dollars against the bet"),
+            "follow_seconds": number(form, "lm_follow_s", "Follow: seconds before the close"),
+            "follow_margin_dollars": number(form, "lm_follow_m", "Follow: dollars past the target"),
+            "follow_max_cents": number(form, "lm_follow_max", "Follow: highest price"),
         }
     plays = []
     for i in range(int(field(form, "play_count", "0") or 0)):
@@ -762,12 +773,18 @@ def market_cards(d: dict) -> str:
         fav_up = up is not None and down is not None and up >= down
         target = f' · target ${float(m["target"]):,.2f}' if m.get("target") else ""
         stale = f' · prices {int(age)}s old' if age > 10 else ""
+        est = ""
+        if m.get("est_gap") not in (None, "") and mins * 60 <= 600:
+            gap = float(m["est_gap"])
+            est = (f'<p class="hint">Last minute: the average is heading <b>${abs(gap):,.0f} '
+                   f'{"above" if gap >= 0 else "below"}</b> the target ({"Up" if gap >= 0 else "Down"} ahead) · '
+                   f'{int(m.get("est_locked") or 0)} of 60 seconds counted · our estimate, not Kalshi\'s</p>')
         out.append(f'<div class="box market"><div class="top"><span><b style="color:var(--text)">'
                    f'{esc(names.get(series, series))}</b> · closes {clock(t, zone)}</span>'
                    f'<span>{countdown(mins * 60)} left</span></div>'
                    f'<div class="prices">{box(series, "Up", "▲", up, fav_up)}'
                    f'{box(series, "Down", "▼", down, not fav_up)}</div>'
-                   f'<p class="hint">Price to buy right now{target}{stale}</p></div>')
+                   f'<p class="hint">Price to buy right now{target}{stale}</p>{est}</div>')
     return "".join(out)
 
 
@@ -870,6 +887,7 @@ def overview_page(app: App, secure: bool = False) -> str:
     parts.append('<a class="btn btn2" href="/settings#add">+ Add or change plays</a>')
     if s.mode == "live":
         parts.append(money_section(d))
+    parts.append(watch_section(d))
     parts.append(activity_box("Recent activity", os.path.join(d["folder"], "bot.log"), "log-all"))
     if not d["paused"]:
         parts.append('<form method="post" action="/pause"><button class="btn2" onclick="return confirm('
@@ -1166,7 +1184,7 @@ def settings_page(app: App, raw: dict | None = None, message: str | None = None,
                   'data-q="Set the pretend money to the amount above? Past bets are kept.">'
                   'Reset pretend money to this amount</button>')
     out.append(
-        goal_form(raw.get("goal") or {}, opt, inp) +
+        goal_form(raw.get("goal") or {}, opt, inp) + watch_form(raw.get("last_minute") or {}, inp) +
         '<h2 id="money">Money and limits (all plays)</h2><div class="box">'
         f'<label>Pretend starting money ($, paper mode)</label>{inp("paper_balance", plain(raw.get("paper_balance", 11)))}'
         f'{reset}'
@@ -1247,6 +1265,58 @@ def goal_form(g: dict, opt, inp) -> str:
         'an edge, then bets the share of its money that grows it fastest for that edge, and pauses at the goal. '
         'It can\'t make a play without an edge win; it only keeps a good play from betting too little or too much. '
         '0 = no stop.</p></div>')
+
+
+def watch_form(w: dict, inp) -> str:
+    on = w.get("enabled", True)
+    return (
+        '<h2 id="lastminute">Last-minute watch</h2><div class="box">'
+        f'<div class="check"><input type="checkbox" name="lm_on" value="1"{" checked" if on else ""}>'
+        '<span>Watch the last minute (never sends orders)</span></div>'
+        '<p class="hint">Kalshi decides Up or Down by Bitcoin\'s average over the final 60 seconds. The bot keeps '
+        'its own running average and writes down what two ideas would have done, then checks them after the '
+        'close. Nothing here buys or sells.</p>'
+        '<label><b>Guard</b>: sell a bet that\'s turning against you</label>'
+        f'<div class="row2"><div><label>Seconds before the close</label>{inp("lm_guard_s", plain(w.get("guard_seconds", 90)))}</div>'
+        f'<div><label>When the average is this many $ against it</label>{inp("lm_guard_m", plain(w.get("guard_margin_dollars", 20)))}</div></div>'
+        '<label><b>Follow</b>: buy the side the average says is winning</label>'
+        f'<div class="row2"><div><label>Seconds before the close</label>{inp("lm_follow_s", plain(w.get("follow_seconds", 60)))}</div>'
+        f'<div><label>When it\'s this many $ past the target</label>{inp("lm_follow_m", plain(w.get("follow_margin_dollars", 30)))}</div></div>'
+        f'<label>Follow only if that side costs at most (¢)</label>{inp("lm_follow_max", plain(w.get("follow_max_cents", 85)))}'
+        '<p class="hint">Example: Guard 90 and 20 = with 1:30 or less left, if the average is heading $20 or more to '
+        'the wrong side of your bet, note "would sell now". Follow 60, 30 and 85 = with a minute or less left, if '
+        'the average is $30 or more past the target and that side still costs 85¢ or less, note "would buy".</p>'
+        '</div>')
+
+
+def watch_section(d: dict) -> str:
+    """Overview: how the watched ideas would have done so far."""
+    s = d["s"]
+    if s is None or not s.watch.enabled:
+        return ""
+    rows = lastminute.read_watch(os.path.join(d["folder"], "watch.csv"))
+    sm = lastminute.summary(rows)
+    g, f = sm["guard"], sm["follow"]
+
+    def money(x):
+        return f"${abs(x):.2f}"
+    out = ['<h2 id="watch">Last-minute watch · no orders</h2><div class="box">']
+    if not rows:
+        out.append('<div class="empty">Nothing yet. It fills in as bets reach their last minute.</div>')
+    if g["count"]:
+        word = "saved" if g["difference"] >= 0 else "cost"
+        out.append(f'<div class="bet"><div><b>Guard</b><div class="sub">{g["count"]} times it would have sold early; '
+                   f'it would have helped {g["helped"]} of them</div></div>'
+                   f'<div class="amt {"pos" if g["difference"] >= 0 else "neg"}">{word} {money(g["difference"])}</div></div>')
+    if f["count"]:
+        out.append(f'<div class="bet"><div><b>Follow</b><div class="sub">{f["count"]} buys it would have made '
+                   f'(1 contract each); {f["wins"]} won</div></div>'
+                   f'<div class="amt {"pos" if f["would"] >= 0 else "neg"}">'
+                   f'{"+" if f["would"] >= 0 else "-"}{money(f["would"])}</div></div>')
+    out.append('<p class="hint">Compared with what really happened, after fees. Change the numbers on Settings '
+               '(Last-minute watch). <a href="/watch.csv" style="color:#8fb0ff">Download the results</a> · '
+               '<a href="/lastminute.csv" style="color:#8fb0ff">Download today\'s second-by-second data</a></p></div>')
+    return "".join(out)
 
 
 def real_money_section(app: App, raw: dict, secure: bool) -> str:
@@ -1440,6 +1510,21 @@ class Handler(BaseHTTPRequestHandler):
             done = (query.get("done") or [""])[0]
             return self._send(200, settings_page(self.app, message=DONE_MESSAGES.get(done), secure=self.secure),
                               set_cookie=from_link)
+        if url.path in ("/watch.csv", "/lastminute.csv"):
+            s, _ = self.app.settings()
+            folder = mode_folder(s) if s else ""
+            if url.path == "/watch.csv":
+                path, empty = os.path.join(folder, "watch.csv"), ",".join(lastminute.WATCH_COLUMNS) + "\n"
+            else:
+                day_dir = os.path.join(folder, "lastminute")
+                days = sorted(os.listdir(day_dir)) if os.path.isdir(day_dir) else []
+                path, empty = (os.path.join(day_dir, days[-1]) if days else ""), ",".join(lastminute.DATA_COLUMNS) + "\n"
+            try:
+                with open(path, encoding="utf-8") as fh:
+                    text = fh.read()
+            except OSError:
+                text = empty
+            return self._send(200, text, ctype="text/csv; charset=utf-8")
         if url.path == "/trades.csv":
             s, _ = self.app.settings()
             path = os.path.join(mode_folder(s), "trades.csv") if s else ""

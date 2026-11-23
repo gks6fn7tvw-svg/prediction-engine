@@ -14,6 +14,7 @@ from zoneinfo import ZoneInfo
 from . import goal as G
 from . import rules
 from .broker import Fill
+from . import lastminute
 from .kalshi import KalshiClient, KalshiError, coinbase_spot
 from .ledger import Ledger, Position, State
 from .settings import Settings
@@ -21,6 +22,13 @@ from .settings import Settings
 
 COINS = {"KXBTC": "Bitcoin", "KXETH": "Ethereum", "KXSOL": "Solana", "KXXRP": "XRP", "KXDOGE": "Dogecoin",
          "KXBNB": "BNB", "KXHYPE": "HYPE", "KXZEC": "Zcash"}
+
+
+ONE = Decimal("1")
+
+
+def signed(d: Decimal) -> str:
+    return f"+${d:.2f}" if d >= 0 else f"-${-d:.2f}"
 
 
 def cents_words(price) -> str:
@@ -100,7 +108,7 @@ def spot_product(series: str) -> str | None:
 
 class Bot:
     def __init__(self, settings: Settings, client: KalshiClient, broker, ledger: Ledger,
-                 state: State, clock=None, spot_fn=None):
+                 state: State, clock=None, spot_fn=None, index_fn=None):
         self.s = settings
         self.client = client
         self.broker = broker
@@ -108,6 +116,10 @@ class Bot:
         self.state = state
         self.clock = clock or RealClock()
         self.spot_fn = spot_fn or (lambda product: coinbase_spot(client.session, product))
+        # Last-minute watch: a stand-in for Kalshi's settlement index (median of exchanges).
+        self.index_fn = index_fn or (lambda coin: lastminute.index_proxy(client.session, coin))
+        self.trackers: dict[str, lastminute.Tracker] = {}
+        self.estimates: dict[str, lastminute.Estimate] = {}
         self.plays = {p.name: p for p in settings.plays}
         self.history = defaultdict(lambda: deque(maxlen=2000))
         self.multipliers: dict[str, Decimal] = {}
@@ -475,7 +487,6 @@ class Bot:
             self._refresh_accounts(now)
         self._goal_check()   # before any new bet, so the goal pauses betting in time
         quotes = self._fetch_quotes(now)
-        self._share_prices(quotes, now)
         for pos in list(self.state.open_positions()):
             q = quotes.get(pos.ticker)
             if q is not None:
@@ -489,6 +500,8 @@ class Bot:
                         self._maybe_enter(play, q, now, spots.get(q.series))
         else:
             self._say("block", reason)
+        self._watch(quotes, now)
+        self._share_prices(quotes, now)
         self._settle(now)
         self.check_records(quotes, now)
         self._goal_check()   # and again once bets have settled
@@ -500,7 +513,15 @@ class Bot:
         """Save the latest prices for the website (best effort; never stops trading)."""
         if not quotes:
             return
-        rows = [q.as_row() for q in quotes.values()]
+        rows = []
+        for q in quotes.values():
+            row = q.as_row()
+            est = self.estimates.get(q.ticker)
+            if est is not None:
+                row.update(est_projected=str(est.projected.quantize(Decimal("0.01"))),
+                           est_gap=str(est.gap.quantize(Decimal("0.01"))), est_locked=est.locked,
+                           est_price=str(est.price.quantize(Decimal("0.01"))))
+            rows.append(row)
         try:
             self.ledger.save_market(now, rows)
         except OSError as e:
@@ -1049,10 +1070,163 @@ class Bot:
             play = self.plays.get(pos.play)
             if play is not None and play.has_exits and pos.ticker in quotes:
                 return self.s.fast_seconds
+        watch = float(self.s.watch.seconds)
+        if watch and any(q.close_time and -1 <= (q.close_time - now).total_seconds() <= watch + self.s.slow_seconds
+                         for q in quotes.values()):
+            return self.s.fast_seconds
         if any(rules.parse_time(p.close_time) and now >= rules.parse_time(p.close_time)
                for p in self.state.open_positions()):
             return max(self.s.fast_seconds, 5.0)
         return self.s.slow_seconds
+
+    # ---- last-minute watch (logs ideas; never sends an order) ----------------
+    def _watch(self, quotes: dict, now: datetime) -> None:
+        w = self.s.watch
+        if not w.enabled:
+            return
+        prices: dict = {}
+        for q in quotes.values():
+            if q.close_time is None or q.target is None:
+                continue
+            left = (q.close_time - now).total_seconds()
+            if not 0 <= left <= float(w.seconds) + 1:
+                continue
+            coin = lastminute.coin_for(q.series)
+            if coin is None:
+                continue
+            if coin not in prices:
+                try:
+                    prices[coin] = self.index_fn(coin)
+                except Exception:
+                    prices[coin] = (None, 0)
+            price, sources = prices[coin]
+            tr = self.trackers.get(q.ticker)
+            if tr is None:
+                tr = self.trackers[q.ticker] = lastminute.Tracker(q.close_time, q.target)
+            if price is not None:
+                tr.add(now, price)
+            est = tr.estimate(now)
+            if est is None:
+                continue
+            self.estimates[q.ticker] = est
+            self._watch_data(q, now, est, sources)
+            self._watch_guard(q, now, est)
+            self._watch_follow(q, now, est)
+        for ticker, tr in list(self.trackers.items()):
+            if now - tr.close > timedelta(seconds=120):
+                del self.trackers[ticker]
+                self.estimates.pop(ticker, None)
+        self._watch_resolve(now)
+
+    def _watch_data(self, q: rules.Quote, now: datetime, est, sources: int) -> None:
+        """Second-by-second record of the final stretch, for checking ideas later."""
+        day = now.astimezone(ZoneInfo(self.s.day_timezone)).strftime("%Y-%m-%d")
+        folder = os.path.join(self.ledger.folder, "lastminute")
+        path = os.path.join(folder, f"{day}.csv")
+        try:
+            if not os.path.exists(path):
+                for old in sorted(os.listdir(folder))[:-13] if os.path.isdir(folder) else []:
+                    os.remove(os.path.join(folder, old))     # keep two weeks
+            lastminute.append_csv(path, lastminute.DATA_COLUMNS, {
+                "time": now.isoformat(timespec="seconds"), "market": q.ticker,
+                "seconds_left": int(est.seconds_left), "target": str(q.target), "price": str(est.price),
+                "sources": sources, "projected": str(est.projected.quantize(Decimal("0.01"))),
+                "gap": str(est.gap.quantize(Decimal("0.01"))),
+                "yes_bid": str(q.yes_bid or ""), "yes_ask": str(q.yes_ask or "")})
+        except OSError as e:
+            self._say("lastminute-file", f"could not save last-minute data ({e})")
+
+    def _watch_guard(self, q: rules.Quote, now: datetime, est) -> None:
+        w = self.s.watch
+        if est.seconds_left > float(w.guard_seconds):
+            return
+        for pos in self.state.open_positions():
+            key = f"guard|{pos.play}|{pos.ticker}"
+            if pos.ticker != q.ticker or key in self.state.watch:
+                continue
+            against = -est.gap if pos.side == "yes" else est.gap
+            bid = q.bid(pos.side)
+            if against < w.guard_margin or bid is None:
+                continue
+            n = pos.d("contracts")
+            fee = rules.taker_fee(n, bid, self.multipliers.get(q.series, ONE))
+            self.state.watch[key] = {
+                "kind": "guard", "play": pos.play, "market": pos.ticker, "side": pos.side, "contracts": str(n),
+                "price": str(bid), "fee": str(fee), "entry_price": pos.entry_price, "entry_fee": pos.entry_fee,
+                "seconds_left": int(est.seconds_left), "gap": str(est.gap.quantize(Decimal("1"))),
+                "close": q.close_time.isoformat()}
+            log.info("watch (no order sent): %s's %s %s: the guard would sell now at %s (%s, %s left)",
+                     pos.play, self.market_words(q), rules.side_name(pos.side), cents_words(bid),
+                     lastminute.gap_words(est), lastminute.seconds_words(est.seconds_left))
+
+    def _watch_follow(self, q: rules.Quote, now: datetime, est) -> None:
+        w = self.s.watch
+        key = f"follow|{q.ticker}"
+        if key in self.state.watch or not 3 <= est.seconds_left <= float(w.follow_seconds):
+            return
+        if abs(est.gap) < w.follow_margin:
+            return
+        side = est.favored()
+        ask = q.ask(side)
+        if ask is None or ask > w.follow_max_price:
+            return
+        fee = rules.taker_fee(ONE, ask, self.multipliers.get(q.series, ONE))
+        self.state.watch[key] = {
+            "kind": "follow", "play": "follow", "market": q.ticker, "side": side, "contracts": "1",
+            "price": str(ask), "fee": str(fee), "seconds_left": int(est.seconds_left),
+            "gap": str(est.gap.quantize(Decimal("1"))), "close": q.close_time.isoformat()}
+        log.info("watch (no order sent): follow would buy %s %s at %s (%s, %s left)", self.market_words(q),
+                 rules.side_name(side), cents_words(ask), lastminute.gap_words(est),
+                 lastminute.seconds_words(est.seconds_left))
+
+    def _watch_resolve(self, now: datetime) -> None:
+        """After the close: compare each idea with what really happened, and write it down."""
+        for key, e in list(self.state.watch.items()):
+            close = rules.parse_time(e.get("close"))
+            if close is None or now < close + timedelta(seconds=SETTLE_DELAY):
+                continue
+            last = self.last_settle_check.get(key)
+            if last and (now - last).total_seconds() < SETTLE_RECHECK:
+                continue
+            self.last_settle_check[key] = now
+            try:
+                result = self.client.market(e["market"]).get("result")
+            except Exception:
+                continue
+            if result not in ("yes", "no"):
+                if now - close > timedelta(hours=2):
+                    del self.state.watch[key]
+                continue
+            n, price, fee = Decimal(e["contracts"]), Decimal(e["price"]), Decimal(e["fee"])
+            won = result == e["side"]
+            q = rules.Quote(e["market"], e["market"].split("-")[0], close, "", None, None, None, None, None)
+            where = f"{self.market_words(q)} {rules.side_name(e['side'])}"
+            if e["kind"] == "guard":
+                entry, entry_fee = Decimal(e["entry_price"]), Decimal(e["entry_fee"])
+                held = (n if won else Decimal("0")) - n * entry - entry_fee
+                would = n * price - fee - n * entry - entry_fee
+                diff = would - held
+                verdict = (f"the guard would have saved ${diff:.2f}" if diff > 0
+                           else f"the guard would have cost ${-diff:.2f}")
+                log.info("watch result: %s's %s %s. Holding to the end: %s. Guard selling at %s: %s. So %s.",
+                         e["play"], where, "won" if won else "lost", signed(held), cents_words(price), signed(would),
+                         verdict)
+            else:
+                held = Decimal("0")
+                would = (ONE if won else Decimal("0")) - price - fee
+                diff = would
+                log.info("watch result: follow's %s at %s would have %s: %s per contract.", where,
+                         cents_words(price), "won" if won else "lost", signed(would))
+            try:
+                lastminute.append_csv(os.path.join(self.ledger.folder, "watch.csv"), lastminute.WATCH_COLUMNS, {
+                    "time": close.isoformat(), "kind": e["kind"], "play": e["play"], "market": e["market"],
+                    "side": rules.side_name(e["side"]), "contracts": e["contracts"],
+                    "seconds_left": e["seconds_left"], "gap_dollars": e["gap"], "price": e["price"],
+                    "entry_price": e.get("entry_price", ""), "result": rules.side_name(result),
+                    "would_profit": f"{would:.4f}", "held_profit": f"{held:.4f}", "difference": f"{diff:.4f}"})
+            except OSError as err:
+                self._say("watch-file", f"could not save a last-minute result ({err})")
+            del self.state.watch[key]
 
     def _say(self, key: str, message: str) -> None:
         """Log a message only when it changes, so the log stays readable."""

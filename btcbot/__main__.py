@@ -85,6 +85,8 @@ def cmd_run(settings, path: str = DEFAULT_PATH) -> None:
         broker = PaperBroker(Decimal(state.paper_cash))
     real_s, fake_s = split_pretend(settings)
     bot = Bot(real_s, client, broker, ledger, state, RealClock())
+    from .pressure import Watcher
+    bot.pressure = Watcher()                # records Coinbase's order book in the final stretch
     if settings.live:
         bot.prepare_live()
     if fake_s is None:
@@ -96,6 +98,7 @@ def cmd_run(settings, path: str = DEFAULT_PATH) -> None:
     fake_state = fake_ledger.load_state(settings.paper_balance)
     fake = Bot(fake_s, client, PaperBroker(Decimal(fake_state.paper_cash)), fake_ledger, fake_state, bot.clock)
     fake.stop_file = bot.stop_file          # the Pause button stops both
+    fake.pressure = bot.pressure            # one shared look at Coinbase's book
     run_together(bot, fake, settings_watcher(path))
 
 

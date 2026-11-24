@@ -128,6 +128,19 @@ class TestWatch(LiveCase):
         import json
         self.make([MAIN])
         self.bot.sigma_fn = lambda coin: 3.0                 # a calm day: about $3 a second
+
+        class Book:                                           # Coinbase's book, as the background looks saw it
+            wanted = 0
+
+            def want(self):
+                self.wanted += 1
+
+            def read(self):
+                return {"cb_mid": 59990.0, "cb_bid10": 1.5, "cb_ask10": 0.25, "cb_age": 0.4}
+        self.bot.pressure = Book()
+        self.bot.client.best_prices = lambda ticker: {        # Kalshi's line, from the live order book
+            "yes_bid": D("0.40"), "yes_ask": D("0.42"), "yes_bid_size": D(5), "yes_ask_size": D(8),
+            "yes_bid_depth": D(40), "yes_ask_depth": D(12)}
         self.price = D("59990")
         self.run_bot(0, 0.40, 0.42, seconds=31)
         self.run_bot(0, 0.40, 0.42, seconds=30)
@@ -141,6 +154,10 @@ class TestWatch(LiveCase):
         self.assertEqual((rows[-1]["sigma"], rows[-1]["level"], rows[-1]["soon"]), ("3.000", "3", "0"))   # Down, $10 under with 30 s left: a ³
         self.assertLess(float(rows[-1]["chance_up"]), 0.5)
         self.assertNotEqual(rows[-1]["score_up"], "")
+        self.assertEqual((rows[-1]["cb_bid10"], rows[-1]["cb_ask10"], rows[-1]["cb_age"]), ("1.5", "0.25", "0.4"))
+        self.assertEqual(self.bot.pressure.wanted, 2)
+        self.assertEqual([rows[-1][k] for k in ("up_bid_size", "up_ask_size", "up_bid_3c", "up_ask_3c")],
+                         ["5", "8", "40", "12"])
         with open(os.path.join(self.ledger.folder, "market.json")) as fh:
             m = json.load(fh)["markets"][0]
         self.assertEqual(m["est_gap"], "-10.00")

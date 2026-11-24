@@ -56,6 +56,14 @@ class TestBotUsesBook(BotCase):
         self.assertEqual(self.client.asked, [TICKER])
         self.assertEqual(self.bot.state.open_positions(), [])
 
+    def test_line_sizes_go_in_the_per_second_record(self):
+        b = book(0.23, 0.25)
+        b.update(yes_bid_depth=D(40), yes_ask_depth=D(12))
+        self.use(BookClient(b))
+        self.at(0.5, 0.20, 0.22)
+        when, saved = self.bot.kbook[TICKER]
+        self.assertEqual((when, saved["yes_bid_depth"]), (self.clock.t, D(40)))
+
     def test_buys_at_the_live_price(self):
         self.use(BookClient(book(0.23, 0.25)))   # list: Down 80c; book: Down 77c
         self.at(7.5, 0.20, 0.22)

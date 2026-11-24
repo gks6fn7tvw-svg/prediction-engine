@@ -237,7 +237,12 @@ WATCH_COLUMNS = ["time", "kind", "play", "market", "side", "contracts", "seconds
 DATA_COLUMNS = ["time", "market", "seconds_left", "target", "price", "sources", "projected", "gap",
                 "yes_bid", "yes_ask",
                 # what the card showed that second, so backtests can replay it exactly
-                "sigma", "chance_up", "score_up", "score_down", "level", "soon"]
+                "sigma", "chance_up", "score_up", "score_down", "level", "soon",
+                # Kalshi's line: contracts waiting at the best Up bid / ask, and within 3c of them
+                "up_bid_size", "up_ask_size", "up_bid_3c", "up_ask_3c",
+                # Coinbase's book: Bitcoin waiting to buy / sell within $10, $25, $50 (see pressure.py)
+                "cb_mid", "cb_bid10", "cb_ask10", "cb_bid25", "cb_ask25", "cb_bid50", "cb_ask50",
+                "cb_reach", "cb_age"]
 
 
 def append_csv(path: str, columns: list, row: dict) -> None:

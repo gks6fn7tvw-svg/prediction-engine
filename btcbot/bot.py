@@ -182,6 +182,8 @@ class Bot:
         self.fail_streak = 0
         self.book_ok = True          # live order-book prices (turned off if Kalshi refuses them)
         self.book_fails = 0
+        self.kbook = {}              # ticker -> (when, last order-book read), for the per-second record
+        self.pressure = None         # Coinbase book recorder (pressure.Watcher), set when running for real
         self.stop_file = os.path.join(ledger.folder, "STOP")  # same folder as the trade log
         self.ready_accounts = {0}
         self.last_setup = None
@@ -810,6 +812,7 @@ class Bot:
         if b.get("yes_bid") is None and b.get("yes_ask") is None:
             return q        # an empty book this instant: keep the list's prices
         from dataclasses import replace
+        self.kbook[q.ticker] = (now, b)
         return replace(q, yes_bid=b.get("yes_bid"), yes_ask=b.get("yes_ask"),
                        yes_bid_size=b.get("yes_bid_size"), yes_ask_size=b.get("yes_ask_size"))
 
@@ -1411,6 +1414,13 @@ class Bot:
                      "score_up": "" if sc["up"] is None else sc["up"],
                      "score_down": "" if sc["down"] is None else sc["down"],
                      "level": sc["level"], "soon": 1 if sc.get("soon") else 0}
+        when, kb = self.kbook.get(q.ticker) or (None, {})
+        if when == now:                           # Kalshi's line, read this same second
+            shown.update(up_bid_size=kb.get("yes_bid_size") or "", up_ask_size=kb.get("yes_ask_size") or "",
+                         up_bid_3c=kb.get("yes_bid_depth") or "", up_ask_3c=kb.get("yes_ask_depth") or "")
+        if self.pressure is not None:             # Coinbase's book, looked at in the background
+            self.pressure.want()
+            shown.update(self.pressure.read())
         try:
             if not os.path.exists(path):
                 for old in sorted(os.listdir(folder))[:-13] if os.path.isdir(folder) else []:

@@ -142,23 +142,30 @@ class KalshiClient:
         old = data.get("orderbook") or {}
 
         def top(dollars_key: str, cents_key: str):
+            """(best price, size there, size within 3c of it) for one side's bids."""
             levels = book.get(dollars_key)
             scale = Decimal("1")
             if levels is None:
                 levels, scale = old.get(cents_key) or [], Decimal("100")
-            best = None
+            seen = []
             for lvl in levels or []:
                 try:
                     p, n = Decimal(str(lvl[0])) / scale, Decimal(str(lvl[1]))
                 except Exception:
                     continue
-                if n > 0 and Decimal("0") < p < Decimal("1") and (best is None or p > best[0]):
-                    best = (p, n)
-            return best
+                if n > 0 and Decimal("0") < p < Decimal("1"):
+                    seen.append((p, n))
+            if not seen:
+                return None
+            best = max(seen)
+            near = sum((n for p, n in seen if p >= best[0] - Decimal("0.03")), Decimal(0))
+            return best[0], best[1], near
 
         yes, no = top("yes_dollars", "yes"), top("no_dollars", "no")
         return {"yes_bid": yes[0] if yes else None, "yes_bid_size": yes[1] if yes else None,
-                "yes_ask": Decimal("1") - no[0] if no else None, "yes_ask_size": no[1] if no else None}
+                "yes_ask": Decimal("1") - no[0] if no else None, "yes_ask_size": no[1] if no else None,
+                # how deep the line is: contracts waiting within 3c of the best price on each side
+                "yes_bid_depth": yes[2] if yes else None, "yes_ask_depth": no[2] if no else None}
 
     def series(self, series_ticker: str) -> dict:
         return self._request("GET", f"/series/{series_ticker}").get("series", {})

@@ -601,6 +601,9 @@ font-size:15px;font-weight:700;padding:1px 12px;border-radius:999px;white-space:
 .score sup{font-size:10px;margin-left:1px}.score.good{background:#163a2a;color:#7ee2a8}
 .score.ok{background:#3a3216;color:#ffd27a}.score.bad{background:#3d1d22;color:#ff9da4}
 .market .prices{margin-top:14px}
+.mrow{display:grid;grid-template-columns:1fr 1fr 104px;align-items:center;gap:6px;margin-top:12px}
+.mrow .odds{font-size:15px;line-height:1.7}.mrow .odds span{color:var(--dim);display:inline-block;width:54px}
+.mrow .gap{text-align:center;font-weight:700;line-height:1.3}.mrow .gap .now{font-size:22px}.mrow .gap .head{font-size:18px}
 .price b{display:block;font-size:24px}.price.fav{border-color:var(--blue)}
 .play{display:block;text-decoration:none;background:var(--card);border-radius:16px;padding:14px;margin:10px 0}
 .play .head{display:flex;justify-content:space-between;align-items:center;gap:8px}
@@ -819,20 +822,29 @@ def coin_word(series: str) -> str:
     return "Price"
 
 
-def jump_gauge(m: dict) -> str:
-    """Jumpiness 1-100 with a small colored bar (calm green, normal amber, jumpy red)."""
+def jump_meter(m: dict) -> str:
+    """Jumpiness 1-100 as a half-circle meter: green calm, amber normal, red jumpy."""
     if m.get("jump") in (None, ""):
-        return ""
+        return "<div></div>"
     try:
         j = max(1, min(100, int(m["jump"])))
     except (TypeError, ValueError):
-        return ""
-    color, word = (("var(--green)", "calm") if j < 30 else ("var(--red)", "jumpy") if j >= 70
-                   else ("var(--amber)", "normal"))
-    dollars = f' · moves about ${esc(m["jump_dollars"])} a minute' if m.get("jump_dollars") not in (None, "") else ""
-    return (f'<p class="hint" style="margin-top:8px">Jumpiness <b style="color:{color}">{j}</b>/100 · '
-            f'{word}{dollars}</p><div class="bar" style="height:6px;margin:4px 0 0">'
-            f'<span style="width:{j}%;background:{color}"></span></div>')
+        return "<div></div>"
+    import math
+    a = math.radians(180 - j * 1.8)
+    x, y = 60 + 40 * math.cos(a), 60 - 40 * math.sin(a)
+    return ('<svg width="104" height="64" viewBox="0 0 120 72" role="img" aria-label="Jumpiness '
+            f'{j} of 100"><path d="M14 60 A46 46 0 0 1 32.95 22.79" fill="none" stroke="var(--green)" stroke-width="10"/>'
+            '<path d="M32.95 22.79 A46 46 0 0 1 87.05 22.79" fill="none" stroke="var(--amber)" stroke-width="10"/>'
+            '<path d="M87.05 22.79 A46 46 0 0 1 106 60" fill="none" stroke="var(--red)" stroke-width="10"/>'
+            f'<line x1="60" y1="60" x2="{x:.1f}" y2="{y:.1f}" stroke="var(--text)" stroke-width="3" stroke-linecap="round"/>'
+            '<circle cx="60" cy="60" r="4" fill="var(--text)"/>'
+            f'<text x="60" y="71" text-anchor="middle" font-size="12" fill="var(--dim)">{j}</text></svg>')
+
+
+def gap_text(g: float) -> str:
+    """$38 ▲ = Bitcoin $38 above the target; $12 ▼ = $12 below."""
+    return f"${abs(g):,.0f} {'▲' if g >= 0 else '▼'}"
 
 
 def market_cards(d: dict) -> str:
@@ -864,9 +876,8 @@ def market_cards(d: dict) -> str:
         up = Decimal(m["yes_ask"]) if m.get("yes_ask") else None
         down = ONE - Decimal(m["yes_bid"]) if m.get("yes_bid") else None
         fav_up = up is not None and down is not None and up >= down
-        target = f' · target ${float(m["target"]):,.2f}' if m.get("target") else ""
-        stale = f' · prices {int(age)}s old' if age > 10 else ""
-        badge_up = badge_down = line = ""
+        badge_up = badge_down = ""
+        kalshi_pct = us_pct = None
         if m.get("score_best") in ("yes", "no"):
             pick_up = m["score_best"] == "yes"
             top = m.get("score_up") if pick_up else m.get("score_down")
@@ -876,33 +887,36 @@ def market_cards(d: dict) -> str:
                 badge = f'<span class="score {tone}">{top}<sup>{level}</sup></span>'
                 badge_up, badge_down = (badge, "") if pick_up else ("", badge)
                 chance = float(m.get("chance_up") or 0.5)
-                mine = chance if pick_up else 1 - chance
+                us_pct = (chance if pick_up else 1 - chance) * 100
                 price = up if pick_up else down
-                side = "Up" if pick_up else "Down"
-                kalshi = f"Kalshi says {float(price) * 100:.0f}%" if price is not None else ""
-                sure = lastminute.LEVEL_WORDS.get(level, "")
-                price_words = ("looks cheap" if top >= 6 else "fair" if top == 5 else "costs more than it's worth")
-                what = (f"{side} likely wins ({sure}). Price {price_words}: "
-                        f"we think {mine * 100:.0f}%, {kalshi}.")
-                line = f'<p class="hint" style="margin-top:8px">{esc(what)}</p>'
-        est = ""
-        parts = []
+                kalshi_pct = float(price) * 100 if price is not None else None
+        elif up is not None or down is not None:
+            kalshi_pct = float(up if fav_up or down is None else down) * 100
+        # Left: Kalshi vs us for the side with the badge. Middle: Bitcoin vs the target now, and
+        # (near the end) where the average is heading; white, or green/red during a fast move.
+        # Right: jumpiness meter.
+        odds = ""
+        if kalshi_pct is not None:
+            odds += f'<span>Kalshi</span>{kalshi_pct:.0f}%'
+        if us_pct is not None:
+            odds += f'<br><span>Us</span><b>{us_pct:.0f}%</b>'
+        color = {"up": "var(--green)", "down": "var(--red)"}.get(m.get("move"), "var(--text)")
+        gaps = ""
         if m.get("btc_gap") not in (None, ""):
-            now_gap = float(m["btc_gap"])
-            parts.append(f'{esc(coin_word(series))} <b style="color:var(--text)">${abs(now_gap):,.0f} '
-                         f'{"above" if now_gap >= 0 else "below"}</b> the target')
+            gaps += f'<span class="now">{gap_text(float(m["btc_gap"]))}</span>'
         if m.get("est_gap") not in (None, "") and mins * 60 <= 600:
-            gap = float(m["est_gap"])
-            parts.append(f'average heading ${abs(gap):,.0f} {"above" if gap >= 0 else "below"} '
-                         f'({int(m.get("est_locked") or 0)} of 60 s)')
-        if parts:
-            est = f'<p class="hint" style="margin-top:6px">{" · ".join(parts)}</p>'
+            gaps += f'<br><span class="head">{gap_text(float(m["est_gap"]))}</span>'
+        row = ""
+        if odds or gaps or m.get("jump") not in (None, ""):
+            row = (f'<div class="mrow"><div class="odds">{odds}</div>'
+                   f'<div class="gap" style="color:{color}">{gaps}</div>{jump_meter(m)}</div>')
+        target = f' · target ${float(m["target"]):,.0f}' if m.get("target") else ""
+        stale = f' · <span style="color:var(--amber)">prices {int(age)}s old</span>' if age > 10 else ""
         out.append(f'<div class="box market"><div class="top"><span><b style="color:var(--text)">'
-                   f'{esc(names.get(series, series))}</b> · closes {clock(t, zone)}</span>'
+                   f'{esc(names.get(series, series))}</b>{target}{stale}</span>'
                    f'<span>{countdown(mins * 60)} left</span></div>'
                    f'<div class="prices">{box(series, "Down", "▼", down, not fav_up, badge_down)}'
-                   f'{box(series, "Up", "▲", up, fav_up, badge_up)}</div>'
-                   f'{est}{line}{jump_gauge(m)}<p class="hint" style="margin-top:4px">Price to buy right now{target}{stale}</p></div>')
+                   f'{box(series, "Up", "▲", up, fav_up, badge_up)}</div>{row}</div>')
     return "".join(out)
 
 

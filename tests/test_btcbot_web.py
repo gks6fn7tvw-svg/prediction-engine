@@ -171,7 +171,7 @@ class TestStatus(WebCase):
         self.assertIn("$10.18", body)
         self.assertIn("5:07 pm", body)
         self.assertIn("1 open", body)
-        self.assertIn("target $59,229.55", body)          # live market card
+        self.assertIn("target $59,230", body)             # live market card
         self.assertIn("88¢", body)                         # buying Down costs 1 - Up's bid (0.12)
         self.assertIn('href="/play?name=main"', body)
 

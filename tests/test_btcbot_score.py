@@ -115,18 +115,36 @@ class TestBotScore(LiveCase):
         self.run_bot(11, 0.69, 0.70)
         self.assertEqual(self.market_row()["btc_gap"], "-10.00")
 
+    def test_fast_move_colors_the_numbers_for_a_few_seconds(self):
+        self.make([MAIN])
+        self.price = D("60040")
+        self.run_bot(3, 0.69, 0.70, 30)                  # 3:30 left
+        self.price = D("60045")
+        self.run_bot(3, 0.69, 0.70, 26)                  # +$5 in 4 s: normal
+        self.assertNotIn("move", self.market_row())
+        self.price = D("60085")
+        self.run_bot(3, 0.69, 0.70, 22)                  # +$45 in 8 s on a calm day ($3 a second): up!
+        self.assertEqual(self.market_row()["move"], "up")
+        self.run_bot(3, 0.69, 0.70, 19)                  # still colored a few seconds later
+        self.assertEqual(self.market_row()["move"], "up")
+        self.run_bot(3, 0.69, 0.70, 5)                   # quiet again
+        self.assertNotIn("move", self.market_row())
+        self.price = D("60030")
+        self.run_bot(3, 0.69, 0.70, 0)                   # -$55 in 5 s: down
+        self.assertEqual(self.market_row()["move"], "down")
+
     def test_jumpiness_on_the_card(self):
         self.make([MAIN])
         self.bot.jump_fn = lambda coin: (82, 46.4)
         self.run_bot(4, 0.69, 0.70)
         row = self.market_row()
         self.assertEqual((row["jump"], row["jump_dollars"]), (82, "46"))
-        from btcbot.web import jump_gauge
-        html = jump_gauge(row)
-        self.assertIn('Jumpiness <b style="color:var(--red)">82</b>/100 · jumpy · moves about $46 a minute', html)
-        self.assertIn("width:82%", html)
-        self.assertIn("calm", jump_gauge({"jump": 12}))
-        self.assertEqual(jump_gauge({}), "")
+        from btcbot.web import jump_meter
+        html = jump_meter(row)
+        self.assertIn('aria-label="Jumpiness 82 of 100"', html)
+        self.assertIn('x2="93.8" y2="38.6"', html)          # needle well into the red part
+        self.assertIn('>82</text>', html)
+        self.assertEqual(jump_meter({}), "<div></div>")
 
     def test_level_is_how_sure_the_pick_is(self):
         self.make([MAIN])
@@ -254,7 +272,7 @@ class TestScorePage(WebCase):
                                   {"best_score": 9, "best_won": won})
         _, body, _ = self.call(f"/?key={KEY}")
         self.assertIn('<span class="score good">9<sup>2</sup></span>▲ Up', body)     # badge on the picked side
-        self.assertIn("Up likely wins (about 8 in 10). Price looks cheap: we think 86%, Kalshi says 70%.", body)
+        self.assertIn('<div class="odds"><span>Kalshi</span>70%<br><span>Us</span><b>86%</b></div>', body)
         self.assertLess(body.index("▼ Down"), body.index("▲ Up"))                    # Down left, Up right
         self.assertIn("8-10: won 2 of 3", body)
         _, text, _ = self.call("/scores.csv", cookie=f"btcbot_key={KEY}")

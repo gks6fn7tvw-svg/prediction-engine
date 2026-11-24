@@ -256,6 +256,13 @@ close (`scores.csv`, "Score track record" on the Overview). On the first night o
 same math was about as accurate as Kalshi's own price in the last 5 minutes, and better
 near the end, on only 35 markets.
 
+**Price card layout** (read left to right under the Down/Up prices): Kalshi's chance and
+ours for the side with the badge · Bitcoin vs the target now ($38 ▲ = above, ▼ = below)
+and, near the end, where the average is heading (second number) · the jumpiness meter.
+The two dollar numbers are white, and turn green (up) or red (down) for a few seconds
+during a fast move: at least 2 typical moves (from the 30-minute volatility) within 10 s,
+and at least $10. That marks a breakout as it happens; it doesn't predict one.
+
 **Jumpiness 1-100** (price card, while the live score is on). The average size of the last
 5 one-minute moves (Coinbase candles), ranked against every 5-minute stretch of the last
 ~5 hours: 80 = jumpier than 80% of them. Refreshed every 20 s; green under 30, amber, red

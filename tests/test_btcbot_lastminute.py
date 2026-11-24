@@ -211,7 +211,7 @@ class TestWatchPages(WebCase):
         with open(os.path.join(folder, "market.json"), "w") as fh:
             json.dump({"updated": datetime.now(timezone.utc).isoformat(), "markets": [row]}, fh)
         _, body, _ = self.call(f"/?key={KEY}")
-        self.assertIn("average heading $35 below (20 of 60 s)", body)
+        self.assertIn('<span class="head">$35 ▼</span>', body)          # where the average is heading
         # With the current price: always shown, short, first line under the prices.
         close = datetime.now(timezone.utc) + timedelta(minutes=10)
         row.update(close_time=close.isoformat(), btc_now="60042.10", btc_gap="42.10")
@@ -219,9 +219,14 @@ class TestWatchPages(WebCase):
         with open(os.path.join(folder, "market.json"), "w") as fh:
             json.dump({"updated": datetime.now(timezone.utc).isoformat(), "markets": [row]}, fh)
         _, body, _ = self.call(f"/?key={KEY}")
-        self.assertIn('Bitcoin <b style="color:var(--text)">$42 above</b> the target</p>', body)
-        self.assertNotIn("average heading", body)                        # only in the last minutes
-        self.assertLess(body.index("$42 above"), body.index("Price to buy right now"))
+        self.assertIn('<div class="gap" style="color:var(--text)"><span class="now">$42 ▲</span></div>', body)
+        self.assertNotIn('<span class="head">', body)                  # heading only near the end
+        # a fast move right now colors both numbers
+        row.update(move="down")
+        with open(os.path.join(folder, "market.json"), "w") as fh:
+            json.dump({"updated": datetime.now(timezone.utc).isoformat(), "markets": [row]}, fh)
+        _, body, _ = self.call(f"/?key={KEY}")
+        self.assertIn('<div class="gap" style="color:var(--red)">', body)
 
 
 class TestCloseCallFilter(LiveCase):

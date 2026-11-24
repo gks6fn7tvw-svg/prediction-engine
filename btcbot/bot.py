@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import time
 import uuid
@@ -165,6 +166,8 @@ class Bot:
         # Jumpiness gauge for the card (1-100 vs the last few hours), refreshed every 20 seconds.
         self.jump_fn = jump_fn or (lambda coin: lastminute.candles_jumpiness(client.session, coin))
         self.jumps: dict = {}
+        self.recent = defaultdict(lambda: deque(maxlen=60))   # ticker -> (time, price) for the last seconds
+        self.moves: dict = {}                       # ticker -> ("up"/"down", when): a fast move right now
         self.sigmas: dict = {}
         self.scores: dict = {}
         self.btc_now: dict = {}                    # ticker -> latest coin price (for the card)
@@ -582,6 +585,9 @@ class Bot:
                 j = self._jump(coin, now)
                 if j is not None:
                     row.update(jump=j[0], jump_dollars=f"{j[1]:.0f}")
+            mv = self.moves.get(q.ticker)
+            if mv:
+                row.update(move=mv[0])
             est = self.estimates.get(q.ticker)
             if est is not None:
                 row.update(est_projected=str(est.projected.quantize(Decimal("0.01"))),
@@ -1513,6 +1519,11 @@ class Bot:
             del self.state.watch[key]
 
     # ---- live score (1-10 for each side) ---------------------------------------
+    def _jump_now(self, series: str):
+        """The last jumpiness worked out for this coin (no new check), for the record."""
+        hit = self.jumps.get(lastminute.coin_for(series) or "")
+        return hit[1][0] if hit and hit[1] else ""
+
     def _jump(self, coin: str, now: datetime):
         hit = self.jumps.get(coin)
         if hit is None or (now - hit[0]).total_seconds() >= 20:
@@ -1571,6 +1582,7 @@ class Bot:
             sigma = self._sigma(coin, now) if coin else None
             if sigma is None:
                 continue
+            self._breakout(q.ticker, now, price_now, sigma)
             p = lastminute.chance_up(mean, float(q.target), left, sigma)
             up_ask, down_ask = q.ask("yes"), q.ask("no")
             su = lastminute.score(p, float(up_ask) if up_ask is not None else None)
@@ -1587,8 +1599,39 @@ class Bot:
         for ticker in list(self.btc_now):
             if ticker not in quotes:
                 del self.btc_now[ticker]
+        for ticker in list(self.recent):
+            if ticker not in quotes:
+                del self.recent[ticker]
+                self.moves.pop(ticker, None)
         if self.s.watch.score:
             self._score_resolve(now)
+
+    BREAKOUT_SECONDS = 10     # compare with the price up to this many seconds ago
+    BREAKOUT_SD = 2.0         # ...a move this many "typical moves" big counts as a breakout
+    BREAKOUT_MIN = 10.0       # ...and at least this many dollars
+    BREAKOUT_HOLD = 5         # keep the color this many seconds after the move
+
+    def _breakout(self, ticker: str, now: datetime, price: float, sigma: float) -> None:
+        """Mark a fast move as it happens (it doesn't predict one).
+
+        Example on a normal day (Bitcoin moving about $5 a second): $32 or more in 10 seconds
+        is about 2 typical moves, so the numbers turn green (up) or red (down) for a few seconds.
+        """
+        hist = self.recent[ticker]
+        hist.append((now, price))
+        while hist and (now - hist[0][0]).total_seconds() > self.BREAKOUT_SECONDS:
+            hist.popleft()
+        t0, p0 = hist[0]
+        secs = (now - t0).total_seconds()
+        if secs >= 3:
+            move = price - p0
+            need = max(self.BREAKOUT_MIN, self.BREAKOUT_SD * sigma * math.sqrt(secs))
+            if abs(move) >= need:
+                self.moves[ticker] = ("up" if move > 0 else "down", now)
+                return
+        held = self.moves.get(ticker)
+        if held and (now - held[1]).total_seconds() > self.BREAKOUT_HOLD:
+            del self.moves[ticker]
 
     def _score_snapshot(self, q, now, left, p, up_ask, down_ask, su, sd, best, level=1) -> None:
         pending = self.state.score_pending.setdefault(q.ticker, {"close": q.close_time.isoformat(), "snaps": []})
@@ -1599,7 +1642,8 @@ class Bot:
                     "checkpoint": cp, "time": now.isoformat(timespec="seconds"), "seconds_left": int(left),
                     "chance_up": f"{p:.3f}", "up_cost": str(up_ask or ""), "down_cost": str(down_ask or ""),
                     "up_score": su or "", "down_score": sd or "", "best": rules.side_name(best),
-                    "best_score": (su if best == "yes" else sd) or "", "level": level})
+                    "best_score": (su if best == "yes" else sd) or "", "level": level,
+                    "jump": self._jump_now(q.series)})
 
     def _score_resolve(self, now: datetime) -> None:
         for ticker, pending in list(self.state.score_pending.items()):

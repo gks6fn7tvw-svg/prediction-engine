@@ -290,7 +290,7 @@ def score(chance: float, ask: float | None) -> int | None:
 
 
 SCORE_COLUMNS = ["time", "market", "seconds_left", "chance_up", "up_cost", "down_cost", "up_score",
-                 "down_score", "best", "best_score", "level", "result", "best_won"]
+                 "down_score", "best", "best_score", "level", "jump", "result", "best_won"]
 
 
 def confidence(chance: float) -> int:

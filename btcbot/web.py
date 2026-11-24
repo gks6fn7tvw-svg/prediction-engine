@@ -533,6 +533,7 @@ def form_to_raw(form: dict, current: dict) -> dict:
             "crowd_seconds": number(form, "lm_crowd_s", "Copy the crowd: seconds before the close"),
             "crowd_cents": number(form, "lm_crowd_p", "Copy the crowd: price"),
             "score": bool(field(form, "lm_score")),
+            "price_every_second": bool(field(form, "lm_every")),
         }
     plays = []
     for i in range(int(field(form, "play_count", "0") or 0)):
@@ -1464,6 +1465,11 @@ def watch_form(w: dict, inp) -> str:
         '<span>Watch the last minute (never sends orders)</span></div>'
         f'<div class="check"><input type="checkbox" name="lm_score" value="1"{" checked" if w.get("score", True) else ""}>'
         '<span>Show a live 1-10 score for Up and Down</span></div>'
+        f'<div class="check"><input type="checkbox" name="lm_every" value="1"{" checked" if w.get("price_every_second", True) else ""}>'
+        '<span>Check Bitcoin\'s price every second for the whole 15 minutes</span></div>'
+        '<p class="hint">The "Bitcoin $X above/below" line then moves first all the time, not just near the end. '
+        'It asks the exchanges about 3 times more often, which may cost a little on Google Cloud '
+        '(roughly under $1 a month). Untick to check every 5 seconds until the last stretch.</p>'
         '<p class="hint">Kalshi decides Up or Down by Bitcoin\'s average over the final 60 seconds. The bot keeps '
         'its own running average and writes down what two ideas would have done, then checks them after the '
         'close. Nothing here buys or sells.</p>'

@@ -111,6 +111,7 @@ goal:
 # Bitstamp) and writes down what two ideas WOULD have done, then checks them after the close.
 last_minute:
   enabled: true
+  price_every_second: true    # Bitcoin's 3-exchange price every second for the whole 15 minutes
   guard_seconds: 90           # guard: in the last 90 seconds...
   guard_margin_dollars: 20    # ...if the average heads $20+ to the wrong side of a bet, "would sell"
   follow_seconds: 60          # follow: in the last 60 seconds...

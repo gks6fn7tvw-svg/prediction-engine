@@ -256,6 +256,12 @@ close (`scores.csv`, "Score track record" on the Overview). On the first night o
 same math was about as accurate as Kalshi's own price in the last 5 minutes, and better
 near the end, on only 35 markets.
 
+**Every-second price, all 15 minutes** (`last_minute.price_every_second`, on by default;
+Settings → Last-minute watch). The bot checks the 3-exchange price every step and steps
+every second while a market runs, so the card's "Bitcoin $X above/below" line moves before
+other displays the whole time. The score uses the same price (no extra Coinbase call).
+About 3x more requests than checking every 5 s; untick to save Google Cloud data.
+
 **Each second counts once.** The last-minute average holds the latest price seen at each
 whole second (Kalshi averages one price per second; the bot checks every 1-5 s, unevenly),
 so a burst of checks doesn't count extra. The second-by-second file (`lastminute/*.csv`)

@@ -207,6 +207,11 @@ class TestWatchPages(WebCase):
         _, body, _ = self.call("/settings", cookie=f"btcbot_key={KEY}")
         self.assertIn('name="lm_guard_s" value="120"', body)
         self.assertEqual((w.crowd_seconds, w.crowd_price), (D("60"), D("0.55")))
+        self.assertFalse(w.price_all_market)                   # box left unticked in this form
+        self.call("/settings", data=dict(form, lm_every="1"))
+        self.assertTrue(load(self.path).watch.price_all_market)
+        _, body, _ = self.call("/settings", cookie=f"btcbot_key={KEY}")
+        self.assertIn('name="lm_every" value="1" checked', body)
 
     def test_overview_summary_and_downloads(self):
         from btcbot.settings import load, mode_folder

@@ -300,6 +300,7 @@ class Watch:
     crowd_seconds: Decimal = Decimal("90")     # crowd: in the final stretch...
     crowd_price: Decimal = Decimal("0.50")     # ...if your bet's price falls to this, the crowd has switched
     score: bool = True                         # live 1-10 score for each side (our chance vs Kalshi's price)
+    price_all_market: bool = True              # Bitcoin's every-second price for the whole 15 minutes
 
     @property
     def seconds(self) -> Decimal:
@@ -320,7 +321,8 @@ def _watch(raw: dict) -> Watch:
               follow_max_price=cents(raw.get("follow_max_cents", 85), "last_minute.follow_max_cents"),
               crowd_seconds=_dec(raw.get("crowd_seconds", 90), "last_minute.crowd_seconds", 5, 600),
               crowd_price=cents(raw.get("crowd_cents", 50), "last_minute.crowd_cents"),
-              score=bool(raw.get("score", True)))
+              score=bool(raw.get("score", True)),
+              price_all_market=bool(raw.get("price_every_second", True)))
     return w
 
 

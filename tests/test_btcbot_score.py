@@ -113,6 +113,29 @@ class TestBotScore(LiveCase):
         self.at(1, 0.69, 0.70, 30)                             # 1:30 left: inside the watch window
         self.assertEqual(self.market_row()["btc_gap"], "49.00")
 
+    def test_every_second_price_for_the_whole_market(self):
+        self.make([MAIN])
+        asked = []
+        self.bot.index_fn = lambda coin: (asked.append(coin), (D("60049"), 3))[1]
+        self.bot.spot_fn = lambda product: (_ for _ in ()).throw(AssertionError("not needed"))
+        self.bot.sigma_fn = lambda coin: 3.0
+        wait = self.at(12, 0.69, 0.70)                          # 12 minutes left
+        self.assertEqual(asked, ["BTC"])                        # asked once this step
+        self.assertEqual(self.market_row()["btc_gap"], "49.00")
+        self.assertEqual(wait, float(self.bot.s.fast_seconds))  # and again in about a second
+        self.assertIn("score_up", self.market_row())            # the score used the same price
+
+    def test_every_second_price_switched_off(self):
+        self.make([MAIN], last_minute={"price_every_second": False})
+        asked = []
+        self.bot.index_fn = lambda coin: (asked.append(coin), (D("60049"), 3))[1]
+        self.bot.spot_fn = lambda product: D("60040")
+        self.bot.sigma_fn = lambda coin: 3.0
+        wait = self.at(12, 0.69, 0.70)
+        self.assertEqual(asked, [])                             # only near the end, as before
+        self.assertEqual(self.market_row()["btc_gap"], "40.00")
+        self.assertGreater(wait, float(self.bot.s.fast_seconds))
+
     def test_level_is_how_sure_the_pick_is(self):
         self.make([MAIN])
         self.price = D("60003")                                          # a hair above: a toss-up

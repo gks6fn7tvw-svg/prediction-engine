@@ -93,6 +93,18 @@ class TestBotScore(LiveCase):
         self.assertTrue(all(r["best"] == "UP" and r["best_won"] == "yes" for r in rows))
         self.assertEqual(self.bot.state.score_pending, {})
 
+    def test_shares_the_distance_from_the_target_all_the_time(self):
+        self.make([MAIN])
+        self.price = D("60040")
+        self.run_bot(12, 0.69, 0.70)                     # far from the last minute
+        row = self.market_row()
+        self.assertEqual((row["btc_now"], row["btc_gap"]), ("60040.00", "40.00"))
+        self.bot.sigma_fn = lambda coin: None            # even without our chance
+        self.bot.sigmas.clear()
+        self.price = D("59990")
+        self.run_bot(11, 0.69, 0.70)
+        self.assertEqual(self.market_row()["btc_gap"], "-10.00")
+
     def test_level_is_how_sure_the_pick_is(self):
         self.make([MAIN])
         self.price = D("60003")                                          # a hair above: a toss-up

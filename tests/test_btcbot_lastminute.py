@@ -211,7 +211,17 @@ class TestWatchPages(WebCase):
         with open(os.path.join(folder, "market.json"), "w") as fh:
             json.dump({"updated": datetime.now(timezone.utc).isoformat(), "markets": [row]}, fh)
         _, body, _ = self.call(f"/?key={KEY}")
-        self.assertIn("average heading $35 below the target · 20 of 60 s counted", body)
+        self.assertIn("average heading $35 below (20 of 60 s)", body)
+        # With the current price: always shown, short, first line under the prices.
+        close = datetime.now(timezone.utc) + timedelta(minutes=10)
+        row.update(close_time=close.isoformat(), btc_now="60042.10", btc_gap="42.10")
+        del row["est_gap"]
+        with open(os.path.join(folder, "market.json"), "w") as fh:
+            json.dump({"updated": datetime.now(timezone.utc).isoformat(), "markets": [row]}, fh)
+        _, body, _ = self.call(f"/?key={KEY}")
+        self.assertIn('Bitcoin <b style="color:var(--text)">$42 above</b> the target</p>', body)
+        self.assertNotIn("average heading", body)                        # only in the last minutes
+        self.assertLess(body.index("$42 above"), body.index("Price to buy right now"))
 
 
 class TestCloseCallFilter(LiveCase):

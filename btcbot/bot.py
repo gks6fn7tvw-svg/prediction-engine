@@ -164,6 +164,7 @@ class Bot:
         self.sigma_fn = sigma_fn or (lambda coin: lastminute.candles_sigma(client.session, coin))
         self.sigmas: dict = {}
         self.scores: dict = {}
+        self.btc_now: dict = {}                    # ticker -> latest coin price (for the card)
         self.estimates: dict[str, lastminute.Estimate] = {}
         self.plays = {p.name: p for p in settings.plays}
         self.history = defaultdict(lambda: deque(maxlen=2000))
@@ -569,6 +570,9 @@ class Bot:
             if sc is not None:
                 row.update(chance_up=f"{sc['chance_up']:.3f}", score_up=sc["up"], score_down=sc["down"],
                            score_best=sc["best"], score_level=sc["level"])
+            if q.ticker in self.btc_now and q.target is not None:
+                row.update(btc_now=f"{self.btc_now[q.ticker]:.2f}",
+                           btc_gap=f"{self.btc_now[q.ticker] - float(q.target):.2f}")
             est = self.estimates.get(q.ticker)
             if est is not None:
                 row.update(est_projected=str(est.projected.quantize(Decimal("0.01"))),
@@ -1528,13 +1532,9 @@ class Bot:
             left = (q.close_time - now).total_seconds()
             if not 0 < left <= 900:
                 continue
-            coin = lastminute.coin_for(q.series)
-            sigma = self._sigma(coin, now) if coin else None
-            if sigma is None:
-                continue
             est, tr = self.estimates.get(q.ticker), self.trackers.get(q.ticker)
             if est is not None and tr is not None and tr.samples and (now - tr.samples[-1][0]).total_seconds() <= 5:
-                mean = float(est.projected)
+                mean, price_now = float(est.projected), float(est.price)
             else:
                 product = spot_product(q.series)
                 if product not in spot_cache:
@@ -1544,7 +1544,12 @@ class Bot:
                         spot_cache[product] = None
                 if spot_cache[product] is None:
                     continue
-                mean = float(spot_cache[product])
+                mean = price_now = float(spot_cache[product])
+            self.btc_now[q.ticker] = price_now          # shown on the card all the time
+            coin = lastminute.coin_for(q.series)
+            sigma = self._sigma(coin, now) if coin else None
+            if sigma is None:
+                continue
             p = lastminute.chance_up(mean, float(q.target), left, sigma)
             up_ask, down_ask = q.ask("yes"), q.ask("no")
             su = lastminute.score(p, float(up_ask) if up_ask is not None else None)
@@ -1558,6 +1563,9 @@ class Bot:
         for ticker in list(self.scores):
             if ticker not in quotes:
                 del self.scores[ticker]
+        for ticker in list(self.btc_now):
+            if ticker not in quotes:
+                del self.btc_now[ticker]
         if self.s.watch.score:
             self._score_resolve(now)
 

@@ -811,6 +811,14 @@ def closed_bet(r: dict, zone: ZoneInfo) -> str:
             f'<div class="amt">{money(profit)}</div></div>')
 
 
+def coin_word(series: str) -> str:
+    """KXBTC15M -> Bitcoin (for short lines on the price card)."""
+    for prefix, word in (("KXBTC", "Bitcoin"), ("KXETH", "Ethereum"), ("KXSOL", "Solana"), ("KXXRP", "XRP")):
+        if str(series).upper().startswith(prefix):
+            return word
+    return "Price"
+
+
 def market_cards(d: dict) -> str:
     age = d.get("market_age")
     if age is None or age > 300 or not d["market"]:
@@ -862,16 +870,23 @@ def market_cards(d: dict) -> str:
                         f"we think {mine * 100:.0f}%, {kalshi}.")
                 line = f'<p class="hint" style="margin-top:8px">{esc(what)}</p>'
         est = ""
+        parts = []
+        if m.get("btc_gap") not in (None, ""):
+            now_gap = float(m["btc_gap"])
+            parts.append(f'{esc(coin_word(series))} <b style="color:var(--text)">${abs(now_gap):,.0f} '
+                         f'{"above" if now_gap >= 0 else "below"}</b> the target')
         if m.get("est_gap") not in (None, "") and mins * 60 <= 600:
             gap = float(m["est_gap"])
-            est = (f'<p class="hint">Last minute: average heading ${abs(gap):,.0f} '
-                   f'{"above" if gap >= 0 else "below"} the target · {int(m.get("est_locked") or 0)} of 60 s counted</p>')
+            parts.append(f'average heading ${abs(gap):,.0f} {"above" if gap >= 0 else "below"} '
+                         f'({int(m.get("est_locked") or 0)} of 60 s)')
+        if parts:
+            est = f'<p class="hint" style="margin-top:6px">{" · ".join(parts)}</p>'
         out.append(f'<div class="box market"><div class="top"><span><b style="color:var(--text)">'
                    f'{esc(names.get(series, series))}</b> · closes {clock(t, zone)}</span>'
                    f'<span>{countdown(mins * 60)} left</span></div>'
                    f'<div class="prices">{box(series, "Down", "▼", down, not fav_up, badge_down)}'
                    f'{box(series, "Up", "▲", up, fav_up, badge_up)}</div>'
-                   f'{line}<p class="hint" style="margin-top:4px">Price to buy right now{target}{stale}</p>{est}</div>')
+                   f'{est}{line}<p class="hint" style="margin-top:4px">Price to buy right now{target}{stale}</p></div>')
     return "".join(out)
 
 

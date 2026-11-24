@@ -50,7 +50,9 @@ EXIT_WORDS = {"take_profit": "take profit", "stop_loss": "stop loss"}
 REPO_DIR = os.path.dirname(PACKAGE_DIR)
 COOKIE = "btcbot_key"
 MAX_BODY = 64_000
-FRESH_SECONDS = 2.5   # the bot's saved prices count as live when newer than this
+FRESH_SECONDS = 12    # the bot's saved prices count as live when newer than this. The bot reads Kalshi's
+                      # live order book at least every 5 s while a market runs; Kalshi's market list (the
+                      # fallback below) can be 30 s behind, so it must not replace the bot's fresher prices.
 CACHE_SECONDS = 1.0   # the website asks Kalshi at most this often per market
 ONE = Decimal("1")
 ON_PILL = '<span class="pill on-pill">ON</span>'

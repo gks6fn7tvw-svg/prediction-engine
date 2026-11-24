@@ -165,8 +165,6 @@ class Bot:
         self.sigmas: dict = {}
         self.scores: dict = {}
         self.btc_now: dict = {}                    # ticker -> latest coin price (for the card)
-        self.live_price: dict = {}                 # ticker -> (when, 3-exchange price checked every second)
-        self._index_cache: dict = {}               # coin -> (price, sources), one check per step
         self.estimates: dict[str, lastminute.Estimate] = {}
         self.plays = {p.name: p for p in settings.plays}
         self.history = defaultdict(lambda: deque(maxlen=2000))
@@ -525,7 +523,6 @@ class Bot:
     # ---- one pass ----------------------------------------------------------
     def step(self) -> float:
         now = self.clock.now()
-        self._index_cache = {}
         self._roll_day(now)
         self._apply_paper_reset()
         self._clear_notes_if_resumed()
@@ -543,7 +540,6 @@ class Bot:
             q = quotes.get(pos.ticker)
             if q is not None:
                 self._maybe_exit(pos, q)
-        self._live_prices(quotes, now)
         self._score(quotes, now)     # before entries: "our pick" plays and the score check use it
         reason = self._entry_block_reason()
         if reason is None:
@@ -574,18 +570,10 @@ class Bot:
             if sc is not None:
                 row.update(chance_up=f"{sc['chance_up']:.3f}", score_up=sc["up"], score_down=sc["down"],
                            score_best=sc["best"], score_level=sc["level"])
+            if q.ticker in self.btc_now and q.target is not None:
+                row.update(btc_now=f"{self.btc_now[q.ticker]:.2f}",
+                           btc_gap=f"{self.btc_now[q.ticker] - float(q.target):.2f}")
             est = self.estimates.get(q.ticker)
-            # Near the end, the same 3-exchange price the last-minute average uses (checked every second);
-            # earlier, the price the score used this step.
-            live = self.live_price.get(q.ticker)
-            if est is not None:
-                now_price = float(est.price)
-            elif live is not None and (now - live[0]).total_seconds() <= 10:
-                now_price = float(live[1])
-            else:
-                now_price = self.btc_now.get(q.ticker)
-            if now_price is not None and q.target is not None:
-                row.update(btc_now=f"{now_price:.2f}", btc_gap=f"{now_price - float(q.target):.2f}")
             if est is not None:
                 row.update(est_projected=str(est.projected.quantize(Decimal("0.01"))),
                            est_gap=str(est.gap.quantize(Decimal("0.01"))), est_locked=est.locked,
@@ -1313,10 +1301,8 @@ class Bot:
             play = self.plays.get(pos.play)
             if play is not None and play.has_exits and pos.ticker in quotes:
                 return self.s.fast_seconds
-        running = any(q.close_time and 0 < (q.close_time - now).total_seconds() <= 900 for q in quotes.values())
-        if running and self.s.watch.enabled and self.s.watch.price_all_market:
-            return self.s.fast_seconds          # the every-second price, all 15 minutes
-        if self.s.watch.score and running:
+        if self.s.watch.score and any(q.close_time and 0 < (q.close_time - now).total_seconds() <= 900
+                                      for q in quotes.values()):
             fast_enough = min(5.0, self.s.slow_seconds)     # keep the live score fresh
         else:
             fast_enough = self.s.slow_seconds
@@ -1334,6 +1320,7 @@ class Bot:
         w = self.s.watch
         if not w.enabled:
             return
+        prices: dict = {}
         for q in quotes.values():
             if q.close_time is None or q.target is None:
                 continue
@@ -1344,7 +1331,12 @@ class Bot:
             coin = lastminute.coin_for(q.series)
             if coin is None:
                 continue
-            price, sources = self._index(coin)
+            if coin not in prices:
+                try:
+                    prices[coin] = self.index_fn(coin)
+                except Exception:
+                    prices[coin] = (None, 0)
+            price, sources = prices[coin]
             tr = self.trackers.get(q.ticker)
             if tr is None:
                 tr = self.trackers[q.ticker] = lastminute.Tracker(q.close_time, q.target)
@@ -1391,19 +1383,9 @@ class Bot:
                 "seconds_left": int(est.seconds_left), "target": str(q.target), "price": str(est.price),
                 "sources": sources, "projected": str(est.projected.quantize(Decimal("0.01"))),
                 "gap": str(est.gap.quantize(Decimal("0.01"))),
-                "yes_bid": str(q.yes_bid or ""), "yes_ask": str(q.yes_ask or ""),
-                "yes_bid_size": str(q.yes_bid_size if q.yes_bid_size is not None else ""),
-                "yes_ask_size": str(q.yes_ask_size if q.yes_ask_size is not None else ""),
-                **self._score_columns(q.ticker)})
+                "yes_bid": str(q.yes_bid or ""), "yes_ask": str(q.yes_ask or "")})
         except OSError as e:
             self._say("lastminute-file", f"could not save last-minute data ({e})")
-
-    def _score_columns(self, ticker: str) -> dict:
-        sc = self.scores.get(ticker)
-        if not sc:
-            return {}
-        return {"chance_up": f"{sc['chance_up']:.4f}", "up_score": sc.get("up") or "",
-                "down_score": sc.get("down") or ""}
 
     def _watch_guard(self, q: rules.Quote, now: datetime, est) -> None:
         w = self.s.watch
@@ -1539,32 +1521,6 @@ class Bot:
         """A play that buys "our pick" or checks the score needs our chance even if the card is off."""
         return any(p.enabled and (p.buy == "pick" or p.conditions.min_score is not None) for p in self.s.plays)
 
-    def _index(self, coin: str) -> tuple:
-        """The 3-exchange price (median of Coinbase, Kraken, Bitstamp), asked once per step."""
-        if coin not in self._index_cache:
-            try:
-                self._index_cache[coin] = self.index_fn(coin)
-            except Exception:
-                self._index_cache[coin] = (None, 0)
-        return self._index_cache[coin]
-
-    def _live_prices(self, quotes: dict, now: datetime) -> None:
-        """Bitcoin's every-second price for the running market, all 15 minutes (if switched on)."""
-        w = self.s.watch
-        if not (w.enabled and w.price_all_market):
-            self.live_price.clear()
-            return
-        for q in quotes.values():
-            if q.close_time is None or not 0 < (q.close_time - now).total_seconds() <= 900:
-                continue
-            coin = lastminute.coin_for(q.series)
-            price = self._index(coin)[0] if coin else None
-            if price is not None:
-                self.live_price[q.ticker] = (now, price)
-        for ticker in list(self.live_price):
-            if ticker not in quotes:
-                del self.live_price[ticker]
-
     def _score(self, quotes: dict, now: datetime) -> None:
         """Our chance for each side vs Kalshi's price, as 1-10 (5 = fair), plus snapshots to check later."""
         if not (self.s.watch.score or self.needs_score):
@@ -1577,11 +1533,8 @@ class Bot:
             if not 0 < left <= 900:
                 continue
             est, tr = self.estimates.get(q.ticker), self.trackers.get(q.ticker)
-            live = self.live_price.get(q.ticker)
             if est is not None and tr is not None and tr.samples and (now - tr.samples[-1][0]).total_seconds() <= 5:
                 mean, price_now = float(est.projected), float(est.price)
-            elif live is not None and (now - live[0]).total_seconds() <= 5:
-                mean = price_now = float(live[1])        # the every-second 3-exchange price
             else:
                 product = spot_product(q.series)
                 if product not in spot_cache:

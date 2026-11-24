@@ -105,37 +105,6 @@ class TestBotScore(LiveCase):
         self.run_bot(11, 0.69, 0.70)
         self.assertEqual(self.market_row()["btc_gap"], "-10.00")
 
-    def test_near_the_end_the_line_uses_the_every_second_price(self):
-        self.make([MAIN])
-        self.bot.spot_fn = lambda product: D("60040")          # Coinbase alone
-        self.bot.index_fn = lambda coin: (D("60049"), 3)       # 3-exchange price the average uses
-        self.bot.sigma_fn = lambda coin: 3.0
-        self.at(1, 0.69, 0.70, 30)                             # 1:30 left: inside the watch window
-        self.assertEqual(self.market_row()["btc_gap"], "49.00")
-
-    def test_every_second_price_for_the_whole_market(self):
-        self.make([MAIN])
-        asked = []
-        self.bot.index_fn = lambda coin: (asked.append(coin), (D("60049"), 3))[1]
-        self.bot.spot_fn = lambda product: (_ for _ in ()).throw(AssertionError("not needed"))
-        self.bot.sigma_fn = lambda coin: 3.0
-        wait = self.at(12, 0.69, 0.70)                          # 12 minutes left
-        self.assertEqual(asked, ["BTC"])                        # asked once this step
-        self.assertEqual(self.market_row()["btc_gap"], "49.00")
-        self.assertEqual(wait, float(self.bot.s.fast_seconds))  # and again in about a second
-        self.assertIn("score_up", self.market_row())            # the score used the same price
-
-    def test_every_second_price_switched_off(self):
-        self.make([MAIN], last_minute={"price_every_second": False})
-        asked = []
-        self.bot.index_fn = lambda coin: (asked.append(coin), (D("60049"), 3))[1]
-        self.bot.spot_fn = lambda product: D("60040")
-        self.bot.sigma_fn = lambda coin: 3.0
-        wait = self.at(12, 0.69, 0.70)
-        self.assertEqual(asked, [])                             # only near the end, as before
-        self.assertEqual(self.market_row()["btc_gap"], "40.00")
-        self.assertGreater(wait, float(self.bot.s.fast_seconds))
-
     def test_level_is_how_sure_the_pick_is(self):
         self.make([MAIN])
         self.price = D("60003")                                          # a hair above: a toss-up
@@ -244,13 +213,6 @@ class TestDealExtras(TestBotScore):
         self.run_bot(4, 0.69, 0.70)
         self.run_bot(3, 0.69, 0.70)
         self.assertEqual(len(self.bot.state.open_positions()), 1)
-
-
-class TestPriceWords(unittest.TestCase):
-    def test_tiny_and_huge_prices_keep_a_decimal(self):
-        from btcbot.web import cents_text
-        self.assertEqual([cents_text(v) for v in (0.7, 0.001, 0.01, 0.999, 0.99, 0.505)],
-                         ["70¢", "0.1¢", "1¢", "99.9¢", "99¢", "50¢"])
 
 
 class TestScorePage(WebCase):

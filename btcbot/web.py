@@ -8,8 +8,6 @@ Anyone without the private key in the link gets nothing.
 from __future__ import annotations
 
 import copy
-import csv
-import io
 import gzip
 import hashlib
 import hmac
@@ -52,9 +50,7 @@ EXIT_WORDS = {"take_profit": "take profit", "stop_loss": "stop loss"}
 REPO_DIR = os.path.dirname(PACKAGE_DIR)
 COOKIE = "btcbot_key"
 MAX_BODY = 64_000
-FRESH_SECONDS = 12    # the bot's saved prices count as live when newer than this. The bot reads Kalshi's
-                      # live order book at least every 5 s while a market runs; Kalshi's market list (the
-                      # fallback below) can be 30 s behind, so it must not replace the bot's fresher prices.
+FRESH_SECONDS = 2.5   # the bot's saved prices count as live when newer than this
 CACHE_SECONDS = 1.0   # the website asks Kalshi at most this often per market
 ONE = Decimal("1")
 ON_PILL = '<span class="pill on-pill">ON</span>'
@@ -155,11 +151,7 @@ def cents(dollars) -> str:
 
 
 def cents_text(dollars) -> str:
-    """0.7 -> "70¢"; prices under 1¢ or over 99¢ keep a decimal (0.001 -> "0.1¢", not "0¢")."""
-    c = float(dollars) * 100
-    if (c < 1 or c > 99) and abs(c - round(c)) > 1e-9:
-        return f"{c:.1f}¢"
-    return f"{c:.0f}¢"
+    return f"{float(dollars) * 100:.0f}¢"
 
 
 def plain(value) -> str:
@@ -533,7 +525,6 @@ def form_to_raw(form: dict, current: dict) -> dict:
             "crowd_seconds": number(form, "lm_crowd_s", "Copy the crowd: seconds before the close"),
             "crowd_cents": number(form, "lm_crowd_p", "Copy the crowd: price"),
             "score": bool(field(form, "lm_score")),
-            "price_every_second": bool(field(form, "lm_every")),
         }
     plays = []
     for i in range(int(field(form, "play_count", "0") or 0)):
@@ -848,8 +839,7 @@ def market_cards(d: dict) -> str:
         return (f'<a href="#trade" onclick="pickSide(\'{"yes" if word == "Up" else "no"}\')" '
                 f'class="price{" pick" if badge else " fav" if fav else ""}" '
                 f'style="text-decoration:none;color:inherit;position:relative">{badge}{arrow} {word}'
-                f'<b{value}>{cents_text(p) if p is not None else "—"}</b>'
-                f'{"" if p is not None else "<span class=hint>nobody selling</span>"}</a>')
+                f'<b{value}>{cents_text(p) if p is not None else "—"}</b></a>')
 
     out = []
     for series, m in soonest.items():
@@ -885,7 +875,7 @@ def market_cards(d: dict) -> str:
             now_gap = float(m["btc_gap"])
             parts.append(f'{esc(coin_word(series))} <b style="color:var(--text)">${abs(now_gap):,.0f} '
                          f'{"above" if now_gap >= 0 else "below"}</b> the target')
-        if m.get("est_gap") not in (None, "") and int(m.get("est_locked") or 0) > 0:   # only once the last minute starts
+        if m.get("est_gap") not in (None, "") and mins * 60 <= 600:
             gap = float(m["est_gap"])
             parts.append(f'average heading ${abs(gap):,.0f} {"above" if gap >= 0 else "below"} '
                          f'({int(m.get("est_locked") or 0)} of 60 s)')
@@ -1465,11 +1455,6 @@ def watch_form(w: dict, inp) -> str:
         '<span>Watch the last minute (never sends orders)</span></div>'
         f'<div class="check"><input type="checkbox" name="lm_score" value="1"{" checked" if w.get("score", True) else ""}>'
         '<span>Show a live 1-10 score for Up and Down</span></div>'
-        f'<div class="check"><input type="checkbox" name="lm_every" value="1"{" checked" if w.get("price_every_second", True) else ""}>'
-        '<span>Check Bitcoin\'s price every second for the whole 15 minutes</span></div>'
-        '<p class="hint">The "Bitcoin $X above/below" line then moves first all the time, not just near the end. '
-        'It asks the exchanges about 3 times more often, which may cost a little on Google Cloud '
-        '(roughly under $1 a month). Untick to check every 5 seconds until the last stretch.</p>'
         '<p class="hint">Kalshi decides Up or Down by Bitcoin\'s average over the final 60 seconds. The bot keeps '
         'its own running average and writes down what two ideas would have done, then checks them after the '
         'close. Nothing here buys or sells.</p>'
@@ -1829,17 +1814,16 @@ class Handler(BaseHTTPRequestHandler):
                     want = max(1, min(14, int((query.get("days") or ["1"])[0])))
                 except ValueError:
                     want = 1
-                out = io.StringIO()
-                w = csv.DictWriter(out, fieldnames=lastminute.DATA_COLUMNS, extrasaction="ignore")
-                w.writeheader()
-                for day in days[-want:]:        # older days may have fewer columns: line them all up
+                empty = ",".join(lastminute.DATA_COLUMNS) + "\n"
+                text = ""
+                for i, day in enumerate(days[-want:]):
                     try:
-                        with open(os.path.join(day_dir, day), newline="", encoding="utf-8") as fh:
-                            for row in csv.DictReader(fh):
-                                w.writerow({k: row.get(k) or "" for k in lastminute.DATA_COLUMNS})
+                        with open(os.path.join(day_dir, day), encoding="utf-8") as fh:
+                            body = fh.read()
                     except OSError:
                         continue
-                return self._send(200, out.getvalue(), ctype="text/csv; charset=utf-8", compress=True)
+                    text += body if not text else body.split("\n", 1)[-1]   # one header only
+                return self._send(200, text or empty, ctype="text/csv; charset=utf-8", compress=True)
             try:
                 with open(path, encoding="utf-8") as fh:
                     text = fh.read()

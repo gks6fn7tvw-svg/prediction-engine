@@ -54,6 +54,17 @@ class TestMath(unittest.TestCase):
         zig = [60000 + (10 if (i // 5) % 2 else 0) for i in range(200)]               # up $10, down $10...
         self.assertAlmostEqual(lastminute.rsi_series(series(zig), now)[-1][1], 50, delta=5)
 
+    def test_rsi_guess_carries_the_last_push_a_little(self):
+        from datetime import datetime, timedelta, timezone
+        now = datetime(2026, 11, 23, 12, 0, tzinfo=timezone.utc)
+        rising = [(now - timedelta(seconds=199 - i), 60000 + i) for i in range(200)]
+        guess = lastminute.rsi_guess(rising, now)
+        self.assertEqual([a for a, _ in guess], [3, 6, 9])
+        self.assertTrue(all(r == 100.0 for _, r in guess))           # still only going up
+        flat = [(now - timedelta(seconds=199 - i), 60000) for i in range(200)]
+        self.assertTrue(all(r == 50.0 for _, r in lastminute.rsi_guess(flat, now)))
+        self.assertEqual(lastminute.rsi_guess(rising[-5:], now), [])  # not enough history
+
     def test_levels(self):
         self.assertEqual([lastminute.confidence(c) for c in (0.5, 0.69, 0.70, 0.89, 0.90, 0.99)], [1, 1, 2, 2, 3, 3])
         self.assertEqual(lastminute.LEVEL_WORDS[3], "about 19 in 20")
@@ -172,8 +183,29 @@ class TestBotScore(LiveCase):
         html = rsi_chart(row)
         self.assertIn("RSI, last 90 s", html)
         self.assertIn("<polyline", html)
-        self.assertIn('cx="298" cy="0"', html)            # now, at the very top
+        self.assertIn('cx="250" cy="2"', html)            # now: RSI 100, at the very top
+        # target $105 under the price: blue line 105 / 2.5 = 42 px under the dot, prices on the right
+        self.assertIn('<line x1="0" y1="44" x2="300" y2="44" stroke="var(--blue)"', html)
+        self.assertIn('fill="var(--text)">60,105</text>', html)
+        self.assertIn('fill="var(--blue)">60,000</text>', html)
+        self.assertIn('stroke="var(--red)" stroke-width="2"', html)     # the 10-second guess
+        self.assertEqual([a for a, _ in row["rsi_guess"]], [3, 6, 9])
         self.assertEqual(rsi_chart({"rsi_line": [[0, 50]]}), "")
+        # Down winning: target above the dot; a huge gap sticks to the edge
+        down = {"rsi_line": [[3, 40], [0, 40]], "rsi": 40, "btc_now": "59970", "target": "60000"}
+        self.assertIn('<line x1="0" y1="38" x2="300" y2="38"', rsi_chart(down))     # 50 - 30/2.5
+        far = dict(down, btc_now="59000")
+        self.assertIn('<line x1="0" y1="2" x2="300" y2="2"', rsi_chart(far))
+
+    def test_rsi_guess_can_be_switched_off(self):
+        self.make([MAIN], last_minute={"rsi_guess": False})
+        for k in range(36):
+            self.price = D("60000") + 3 * k
+            left = 300 - 5 * k
+            self.run_bot(left // 60, 0.69, 0.70, left % 60)
+        row = self.market_row()
+        self.assertIn("rsi_line", row)
+        self.assertNotIn("rsi_guess", row)
 
     def test_jumpiness_on_the_card(self):
         self.make([MAIN])

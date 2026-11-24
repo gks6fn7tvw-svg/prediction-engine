@@ -595,6 +595,10 @@ class Bot:
                 line = lastminute.rsi_series(list(hist), now)
                 if line:
                     row.update(rsi=int(round(line[-1][1])), rsi_line=[[a, int(round(r))] for a, r in line])
+                    if self.s.watch.rsi_guess:
+                        guess = lastminute.rsi_guess(list(hist), now)
+                        if guess:
+                            row.update(rsi_guess=[[a, int(round(r))] for a, r in guess])
             est = self.estimates.get(q.ticker)
             if est is not None:
                 row.update(est_projected=str(est.projected.quantize(Decimal("0.01"))),

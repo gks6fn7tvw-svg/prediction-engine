@@ -337,6 +337,26 @@ def rsi_series(samples, now, bar: int = RSI_BAR, n: int = RSI_N, span: int = RSI
     return out
 
 
+def rsi_guess(samples, now, ahead: int = 9, step: int = 3, carry: float = 0.3) -> list:
+    """A for-fun guess of the RSI line over the next few seconds: [(seconds ahead, rsi)].
+
+    It assumes the last 10 seconds' move carries on a little (30% of it over the next 10 s),
+    which is roughly what the timing data showed for moves of a few seconds.
+    Example: up $20 in the last 10 s -> it assumes about +$6 more by 10 s from now.
+    """
+    from datetime import timedelta
+    if not samples:
+        return []
+    p_now = samples[-1][1]
+    back = [p for t, p in samples if t <= now - timedelta(seconds=10)]
+    if not back:
+        return []
+    push = (p_now - back[-1]) * carry
+    future = [(now + timedelta(seconds=k), p_now + push * k / 10) for k in range(1, ahead + 1)]
+    line = rsi_series(list(samples) + future, now + timedelta(seconds=ahead), span=ahead, step=step)
+    return [(ahead - ago, r) for ago, r in line if ahead - ago > 0]
+
+
 def jumpiness_from_closes(closes: list, window: int = 5) -> tuple | None:
     """How jumpy the coin is right now, 1-100, and its typical $ move per minute lately.
 

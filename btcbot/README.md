@@ -282,7 +282,12 @@ measure who moves first. Sources that never answer are skipped after 5 tries; th
 says which worked. About 10 minutes per day of markets.
 
 **RSI line** (price card, under the row). RSI on 5-second candles (14 of them, about 70 s),
-drawn for the last 90 seconds with the 70 and 30 walls shaded. From the timing data
+drawn for the last 90 seconds with the 70 and 30 walls shaded. The target is a blue line
+across it, placed the real dollar gap away from the white dot (now) at a fixed zoom (one
+shaded band is about $60; it sticks to the edge if the gap is bigger), with the current
+price and the target in small print on the right edge. A red line runs about 10 seconds
+ahead as a for-fun guess (`last_minute.rsi_guess`, on by default): it assumes the last
+10 seconds' move carries on a little (30%). From the timing data
 (Nov 22-24, Coinbase second by second, last 5 minutes of 192 markets): when RSI touched 70
 (or 30) it broke through to 80 (20) about 55% of the time, usually fast (half within 3 s);
 the longer it sat near the wall the less likely it broke (about 40% after 5 s, 37% after

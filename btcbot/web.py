@@ -532,6 +532,7 @@ def form_to_raw(form: dict, current: dict) -> dict:
             "crowd_seconds": number(form, "lm_crowd_s", "Copy the crowd: seconds before the close"),
             "crowd_cents": number(form, "lm_crowd_p", "Copy the crowd: price"),
             "score": bool(field(form, "lm_score")),
+            "rsi_guess": bool(field(form, "lm_guess")),
         }
     plays = []
     for i in range(int(field(form, "play_count", "0") or 0)):
@@ -851,24 +852,61 @@ def jump_meter(m: dict) -> str:
             f'<text x="60" y="71" text-anchor="middle" font-size="12" fill="var(--dim)">{j}</text></svg>')
 
 
+RSI_DOLLARS_PER_PX = 2.5     # target line zoom: one shaded wall band (24 px) is about $60
+
+
 def rsi_chart(m: dict) -> str:
-    """Last 90 seconds of RSI as a small line, with the 70 and 30 walls shaded."""
+    """The RSI graph: last 90 seconds of RSI with the 70/30 walls, the target as a blue line,
+    small prices on the right edge, and (if on) a red 10-second guess.
+
+    The blue line sits the real dollar gap away from the white dot (now), at a fixed zoom:
+    Bitcoin $50 above the target = blue line 20 px under the dot. Example: RSI 70 at $100,000,
+    target $99,950 -> the dot on the 70 wall, the blue line just under it.
+    """
     line = m.get("rsi_line") or []
     if len(line) < 2:
         return ""
-    pts = " ".join(f"{(90 - a) / 90 * 296 + 2:.0f},{80 - r * 0.8:.0f}" for a, r in line)
-    x, y = pts.split(" ")[-1].split(",")
-    return ('<div style="margin-top:10px"><div style="display:flex;justify-content:space-between;font-size:12px;'
-            f'color:var(--dim)"><span>RSI, last 90 s</span><span>now <b style="color:var(--text)">{int(m.get("rsi", line[-1][1]))}'
-            '</b></span></div><svg viewBox="0 0 300 80" style="width:100%;height:80px" role="img" aria-label="RSI, last 90 seconds">'
-            '<rect x="0" y="0" width="300" height="24" fill="var(--red)" opacity="0.12"/>'
-            '<rect x="0" y="56" width="300" height="24" fill="var(--green)" opacity="0.12"/>'
-            '<line x1="0" y1="24" x2="300" y2="24" stroke="var(--red)" stroke-width="1" stroke-dasharray="4 3"/>'
-            '<line x1="0" y1="56" x2="300" y2="56" stroke="var(--green)" stroke-width="1" stroke-dasharray="4 3"/>'
-            '<text x="296" y="20" text-anchor="end" font-size="11" fill="var(--dim)">70</text>'
-            '<text x="296" y="74" text-anchor="end" font-size="11" fill="var(--dim)">30</text>'
+    y = lambda r: 82 - r * 0.8                      # RSI 100 at the top (2), 0 at the bottom (82)
+    x = lambda ago: (90 - ago) / 90 * 248 + 2       # 90 s ago at the left, now at 250
+    pts = " ".join(f"{x(a):.0f},{y(r):.0f}" for a, r in line)
+    tip_x, tip_y = x(line[-1][0]), y(line[-1][1])
+    parts = []
+    guess = m.get("rsi_guess") or []
+    if guess:
+        g = " ".join(f"{250 + a * 2.8:.0f},{y(r):.0f}" for a, r in guess)
+        parts.append(f'<polyline fill="none" stroke="var(--red)" stroke-width="2" stroke-linejoin="round" '
+                     f'points="{tip_x:.0f},{tip_y:.0f} {g}"/>')
+    labels = ""
+    try:
+        price, target = float(m["btc_now"]), float(m["target"])
+    except (KeyError, TypeError, ValueError):
+        price = target = None
+    if price is not None:
+        ty = min(82.0, max(2.0, tip_y + (price - target) / RSI_DOLLARS_PER_PX))
+        parts.insert(0, f'<line x1="0" y1="{ty:.0f}" x2="300" y2="{ty:.0f}" stroke="var(--blue)" stroke-width="1.5"/>')
+        py, tly = tip_y - 4, ty - 3                  # labels just above the dot and the line
+        if abs(py - tly) < 10:                       # too close: push the lower one down
+            if ty >= tip_y:
+                tly = py + 11
+            else:
+                py = tly + 11
+        labels = (f'<text x="298" y="{min(82, max(9, py)):.0f}" text-anchor="end" font-size="9" '
+                  f'fill="var(--text)">{price:,.0f}</text>'
+                  f'<text x="298" y="{min(82, max(9, tly)):.0f}" text-anchor="end" font-size="9" '
+                  f'fill="var(--blue)">{target:,.0f}</text>')
+    return ('<div style="margin-top:10px"><div style="font-size:12px;color:var(--dim)">RSI, last 90 s · now '
+            f'<b style="color:var(--text)">{int(m.get("rsi", line[-1][1]))}</b></div>'
+            '<svg viewBox="0 0 300 84" style="width:100%;height:84px" role="img" aria-label="RSI, last 90 seconds, with the target">'
+            '<rect x="0" y="2" width="300" height="24" fill="var(--red)" opacity="0.12"/>'
+            '<rect x="0" y="58" width="300" height="24" fill="var(--green)" opacity="0.12"/>'
+            '<line x1="0" y1="26" x2="300" y2="26" stroke="var(--red)" stroke-width="1" stroke-dasharray="4 3"/>'
+            '<line x1="0" y1="58" x2="300" y2="58" stroke="var(--green)" stroke-width="1" stroke-dasharray="4 3"/>'
+            '<text x="3" y="22" font-size="9" fill="var(--dim)">70</text>'
+            '<text x="3" y="72" font-size="9" fill="var(--dim)">30</text>'
+            + "".join(parts[:1] if price is not None else []) +
             f'<polyline fill="none" stroke="var(--text)" stroke-width="2" stroke-linejoin="round" points="{pts}"/>'
-            f'<circle cx="{x}" cy="{y}" r="4" fill="var(--text)"/></svg></div>')
+            + "".join(parts[1:] if price is not None else parts) +
+            f'<circle cx="{tip_x:.0f}" cy="{tip_y:.0f}" r="3.5" fill="var(--text)"/>{labels}</svg></div>')
 
 
 def gap_text(g: float) -> str:
@@ -1519,6 +1557,8 @@ def watch_form(w: dict, inp) -> str:
         '<span>Watch the last minute (never sends orders)</span></div>'
         f'<div class="check"><input type="checkbox" name="lm_score" value="1"{" checked" if w.get("score", True) else ""}>'
         '<span>Show a live 1-10 score for Up and Down</span></div>'
+        f'<div class="check"><input type="checkbox" name="lm_guess" value="1"{" checked" if w.get("rsi_guess", True) else ""}>'
+        '<span>Show a red 10-second guess on the RSI graph (for fun)</span></div>'
         '<p class="hint">Kalshi decides Up or Down by Bitcoin\'s average over the final 60 seconds. The bot keeps '
         'its own running average and writes down what two ideas would have done, then checks them after the '
         'close. Nothing here buys or sells.</p>'

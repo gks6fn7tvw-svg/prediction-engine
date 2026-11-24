@@ -322,13 +322,7 @@ class TestWatchPages(WebCase):
         with open(os.path.join(folder, "market.json"), "w") as fh:
             json.dump({"updated": datetime.now(timezone.utc).isoformat(), "markets": [row]}, fh)
         _, body, _ = self.call(f"/?key={KEY}")
-        # Kalshi's favorite here is Down (60c), so Bitcoin breaking down helps it: green
-        self.assertIn('<div class="brkrow"><span class="brk good">Breakout ▼</span></div>', body)
-        row.update(move="up")                                            # breaking up = against Down: red
-        with open(os.path.join(folder, "market.json"), "w") as fh:
-            json.dump({"updated": datetime.now(timezone.utc).isoformat(), "markets": [row]}, fh)
-        _, body, _ = self.call(f"/?key={KEY}")
-        self.assertIn('<div class="brkrow"><span class="brk bad">Breakout ▲</span></div>', body)
+        self.assertIn('<div class="brkrow"><span class="brk down">Breakout ▼</span></div>', body)
 
 
 class TestCloseCallFilter(LiveCase):

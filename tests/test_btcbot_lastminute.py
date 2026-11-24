@@ -139,37 +139,6 @@ class TestWatch(LiveCase):
             m = json.load(fh)["markets"][0]
         self.assertEqual(m["est_gap"], "-10.00")
 
-    def test_records_a_futures_price_next_to_ours(self):
-        self.make([MAIN])
-        self.price = D("59990")
-        self.bot.fut_source = "hyperliquid"
-        self.bot.futures_fn = lambda source: D("60001.5")
-        self.run_bot(0, 0.40, 0.42, seconds=30)
-        folder = os.path.join(self.ledger.folder, "lastminute")
-        with open(os.path.join(folder, os.listdir(folder)[0])) as fh:
-            row = list(csv.DictReader(fh))[-1]
-        self.assertEqual((row["fut_price"], row["fut_from"]), ("60001.5", "hyperliquid"))
-
-    def test_looks_for_a_futures_market_in_the_background(self):
-        import threading
-        self.make([MAIN])
-        done = threading.Event()
-
-        def check():
-            done.set()
-            return [{"source": "binance", "label": "Binance futures", "ok": False},
-                    {"source": "deribit", "label": "Deribit", "ok": True}]
-        self.bot.futures_check_fn = check
-        self.price = D("59990")
-        self.run_bot(0, 0.40, 0.42, seconds=30)
-        self.assertTrue(done.wait(2))
-        for _ in range(50):
-            if self.bot.fut_source:
-                break
-            import time
-            time.sleep(0.01)
-        self.assertEqual(self.bot.fut_source, "deribit")
-
     def test_switched_off(self):
         self.make([MAIN], last_minute={"enabled": False})
         self.price = D("60060")
@@ -293,7 +262,7 @@ class TestWatchPages(WebCase):
         rows = list(csv.DictReader(io.StringIO(text)))
         self.assertEqual(list(rows[0]), lastminute.DATA_COLUMNS)
         old = next(r for r in rows if r["market"] == "OLD")
-        self.assertEqual((old["yes_ask"], old["fut_price"]), ("0.42", ""))
+        self.assertEqual(old["yes_ask"], "0.42")
 
     def test_market_card_shows_the_estimate(self):
         import json

@@ -5,7 +5,6 @@ import json
 import logging
 import math
 import os
-import threading
 import time
 import uuid
 from collections import defaultdict, deque
@@ -168,12 +167,7 @@ class Bot:
         self.jump_fn = jump_fn or (lambda coin: lastminute.candles_jumpiness(client.session, coin))
         self.jumps: dict = {}
         self.recent = defaultdict(lambda: deque(maxlen=120))  # ticker -> (time, price) for the last minute or so
-        # A futures market's price, recorded next to ours each second near the end (to measure who moves first).
-        self.fut_source = None
-        self.fut_fails = 0
-        self.fut_checked = None
-        self.futures_fn = lambda source: lastminute.futures_mid(client.session, source)
-        self.futures_check_fn = lambda: lastminute.futures_check(client.session)
+
         self.moves: dict = {}                       # ticker -> ("up"/"down", when): a fast move right now
         self.sigmas: dict = {}
         self.scores: dict = {}
@@ -1359,7 +1353,6 @@ class Bot:
                 except Exception:
                     prices[coin] = (None, 0)
             price, sources = prices[coin]
-            fut = self._futures_price(now, coin, left)
             tr = self.trackers.get(q.ticker)
             if tr is None:
                 tr = self.trackers[q.ticker] = lastminute.Tracker(q.close_time, q.target)
@@ -1369,7 +1362,7 @@ class Bot:
             if est is None:
                 continue
             self.estimates[q.ticker] = est
-            self._watch_data(q, now, est, sources, fut)
+            self._watch_data(q, now, est, sources)
             self._watch_guard(q, now, est)
             self._watch_follow(q, now, est)
         for ticker, tr in list(self.trackers.items()):
@@ -1392,38 +1385,7 @@ class Bot:
             return est.projected
         return spot
 
-    def _futures_price(self, now: datetime, coin: str, left: float):
-        """The futures price this second (Bitcoin only, last stretch only), once a reachable market is known."""
-        if coin != "BTC":
-            return None
-        if self.fut_source is None:
-            if self.fut_checked is None or (now - self.fut_checked).total_seconds() >= 3600:
-                self.fut_checked = now
-                threading.Thread(target=self._pick_futures, daemon=True).start()   # never slows a step
-            return None
-        price = self.futures_fn(self.fut_source)
-        if price is None:
-            self.fut_fails += 1
-            if self.fut_fails >= 30:
-                log.warning("stopped recording %s futures prices (no answer 30 times); will look again", self.fut_source)
-                self.fut_source, self.fut_fails = None, 0
-            return None
-        self.fut_fails = 0
-        return price
-
-    def _pick_futures(self) -> None:
-        try:
-            results = self.futures_check_fn()
-        except Exception:
-            return
-        ok = [r for r in results if r.get("ok")]
-        if ok:
-            self.fut_source = ok[0]["source"]
-            log.info("recording Bitcoin futures prices from %s next to ours (for timing)", ok[0]["label"])
-        else:
-            log.info("no Bitcoin futures market answered from this server; will try again in an hour")
-
-    def _watch_data(self, q: rules.Quote, now: datetime, est, sources: int, fut=None) -> None:
+    def _watch_data(self, q: rules.Quote, now: datetime, est, sources: int) -> None:
         """Second-by-second record of the final stretch, for checking ideas later."""
         day = now.astimezone(ZoneInfo(self.s.day_timezone)).strftime("%Y-%m-%d")
         folder = os.path.join(self.ledger.folder, "lastminute")
@@ -1437,9 +1399,7 @@ class Bot:
                 "seconds_left": int(est.seconds_left), "target": str(q.target), "price": str(est.price),
                 "sources": sources, "projected": str(est.projected.quantize(Decimal("0.01"))),
                 "gap": str(est.gap.quantize(Decimal("0.01"))),
-                "yes_bid": str(q.yes_bid or ""), "yes_ask": str(q.yes_ask or ""),
-                "fut_price": str(fut) if fut is not None else "",
-                "fut_from": self.fut_source if fut is not None else ""})
+                "yes_bid": str(q.yes_bid or ""), "yes_ask": str(q.yes_ask or "")})
         except OSError as e:
             self._say("lastminute-file", f"could not save last-minute data ({e})")
 

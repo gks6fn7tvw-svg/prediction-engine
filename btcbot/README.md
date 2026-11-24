@@ -269,9 +269,9 @@ happens; it doesn't predict one.
 **Futures price feeds** (Settings → Check which ones work). Research finds the big
 Bitcoin futures markets usually move before US spot exchanges. The bot checks Binance
 futures, Bybit, OKX, Hyperliquid, Coinbase International, Deribit, BitMEX and Kraken
-Futures from the server (many block US servers), picks the first that answers (in the
-background, at most hourly), and records its price next to ours each second in the last
-stretch (`fut_price`, `fut_from` in the second-by-second file) so the lead can be measured.
+Futures from the server (many block US servers). Timing data from Nov 22-24 (192 markets)
+showed futures, Coinbase and Kalshi all move within the same second (Kraken lags 1-5 s on
+part of a move), so the bot doesn't record a futures price; the check is for reference.
 
 **Timing data** (Settings → Collect timing data, `btcbot/timing.py`). For the last 5
 minutes of every settled Bitcoin market in the last 1-7 days: every trade with its time from

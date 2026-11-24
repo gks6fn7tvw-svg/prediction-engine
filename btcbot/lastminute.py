@@ -235,9 +235,7 @@ def gap_words(est: Estimate) -> str:
 WATCH_COLUMNS = ["time", "kind", "play", "market", "side", "contracts", "seconds_left", "gap_dollars",
                  "price", "entry_price", "result", "would_profit", "held_profit", "difference"]
 DATA_COLUMNS = ["time", "market", "seconds_left", "target", "price", "sources", "projected", "gap",
-                "yes_bid", "yes_ask", "fut_price", "fut_from"]
-# fut_price: Bitcoin's price on a big futures market at the same second (if one is reachable),
-# to measure how many seconds it moves before our index and Kalshi.
+                "yes_bid", "yes_ask"]
 
 
 def append_csv(path: str, columns: list, row: dict) -> None:

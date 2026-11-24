@@ -1721,10 +1721,9 @@ def futures_section(app: App) -> str:
                 items.append(f'<div class="dim">✖ {esc(r["label"])} · {esc(r.get("note") or "no answer")}</div>')
         rows = '<div style="margin-top:8px;line-height:1.8">' + "".join(items) + "</div>"
     return ('<h2 id="futures">Futures price feeds</h2><div class="box">'
-            '<p class="hint">Big Bitcoin futures markets usually move a moment before Coinbase, Kraken and '
-            'Bitstamp. Many block US servers, so this checks which ones answer from this server. The bot '
-            'records the first one that works next to our price each second near the end, so we can measure '
-            'how many seconds ahead it is.</p>'
+            '<p class="hint">Checks which big Bitcoin futures markets answer from this server (many block US '
+            'servers). Timing data (Nov 22-24) showed they move in the same second as Coinbase and Kalshi, so '
+            'the bot doesn\'t record them; this check is just for reference.</p>'
             f'{rows}<form method="post" action="/futures"><button class="btn2">Check which ones work</button></form></div>')
 
 

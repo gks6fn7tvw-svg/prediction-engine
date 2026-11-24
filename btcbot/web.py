@@ -646,6 +646,8 @@ details{margin-top:12px}summary{cursor:pointer;color:#8fb0ff}
 .bar{height:12px;border-radius:99px;background:var(--card2);overflow:hidden;margin:10px 0 4px}
 .bar span{display:block;height:100%;background:linear-gradient(90deg,var(--blue),var(--green))}
 .empty{color:var(--dim);font-size:14px;padding:6px 0}.back{display:inline-block;color:#8fb0ff;text-decoration:none;margin-bottom:6px}
+.row2 button.go{background:#36d37f!important;color:#0b2a18;outline:3px solid #ffc83d;outline-offset:2px}
+.row2 button.dim{opacity:.35}
 """
 
 
@@ -673,10 +675,26 @@ LIVE_JS = """
           if (el && el.innerHTML !== j.parts[id]) el.innerHTML = j.parts[id];
         }
         remember(true);
+        lightBuy();
       })
       .catch(function(){ busy = false; if (++fails > 3) dot(false); });
   }
-  remember(false); dot(true);
+  // The buy button for our pick lights up (green, gold outline) when the card says buy now.
+  function lightBuy(){
+    var f = document.querySelector('form[action="/trade"]'); if (!f) return;
+    var s = f.querySelector('[name=series]');
+    var m = s && document.querySelector('.buysig[data-series="' + s.value + '"]');
+    var want = m ? m.dataset.buy : '';
+    f.querySelectorAll('button[name=side]').forEach(function(btn){
+      if (!btn.dataset.t) btn.dataset.t = btn.textContent;
+      var on = !!want && btn.value === want;
+      btn.classList.toggle('go', on);
+      btn.classList.toggle('dim', !!want && !on);
+      var text = on ? btn.dataset.t + ' now' : btn.dataset.t;
+      if (btn.textContent !== text) btn.textContent = text;
+    });
+  }
+  remember(false); dot(true); lightBuy();
   setInterval(tick, 1000);
   document.addEventListener('visibilitychange', tick);
 })();
@@ -974,6 +992,7 @@ def market_cards(d: dict) -> str:
             if mins * 60 <= lastminute.SOON_FROM:
                 soon = bool(m.get("score_soon"))
                 soon_up, soon_down = (soon, False) if pick_up else (False, soon)
+        buy = buy_signal(m, mins, up, down, age)
         if m.get("chance_up") not in (None, ""):
             chance = float(m["chance_up"])
             ours_up, ours_down = chance * 100, (1 - chance) * 100
@@ -997,8 +1016,27 @@ def market_cards(d: dict) -> str:
                    f'{esc(names.get(series, series))}</b>{target}{stale}</span>'
                    f'<span>{countdown(mins * 60)} left</span></div>'
                    f'<div class="prices">{box(series, "Down", "▼", down, not fav_up, badge_down, ours_down, soon_down)}'
-                   f'{box(series, "Up", "▲", up, fav_up, badge_up, ours_up, soon_up)}</div>{row}{rsi_chart(m)}</div>')
+                   f'{box(series, "Up", "▲", up, fav_up, badge_up, ours_up, soon_up)}</div>{row}{rsi_chart(m)}'
+                   f'<span class="buysig" data-series="{esc(series)}" data-buy="{buy}" hidden></span></div>')
     return "".join(out)
+
+
+def buy_signal(m: dict, mins: float, up, down, age: float) -> str:
+    """"yes"/"no" when the buy button for that side should light up, else "".
+
+    Only in the last 4 minutes, on our pick, with fresh prices: "³ soon" at 88c or less,
+    or a score of 7+.
+    """
+    best = m.get("score_best")
+    if best not in ("yes", "no") or not 0 < mins * 60 <= lastminute.SOON_FROM or age > 10:
+        return ""
+    top = m.get("score_up") if best == "yes" else m.get("score_down")
+    price = up if best == "yes" else down
+    if isinstance(top, int) and top >= lastminute.BUY_SCORE:
+        return best
+    if m.get("score_soon") and price is not None and price <= lastminute.BUY_SOON_MAX:
+        return best
+    return ""
 
 
 def play_names(d: dict) -> list:

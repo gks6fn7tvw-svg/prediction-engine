@@ -406,6 +406,31 @@ class TestScorePage(WebCase):
         self.assertEqual(body.count('style="visibility:hidden">³ soon'), 2)
         self.assertNotIn("³ soon", card(6))              # earlier than the last 4 minutes: no spot at all
 
+    def test_buy_button_signal(self):
+        from btcbot.settings import load, mode_folder
+        folder = mode_folder(load(self.path))
+        os.makedirs(folder, exist_ok=True)
+
+        def buy(minutes, **extra):
+            close = datetime.now(timezone.utc) + timedelta(minutes=minutes)
+            row = {"ticker": "KXBTC15M-X", "series": "KXBTC15M", "close_time": close.isoformat(),
+                   "yes_bid": "0.88", "yes_ask": "0.89", "target": "60000", "chance_up": "0.891",
+                   "score_up": 5, "score_down": 3, "score_best": "yes", "score_level": 2}
+            row.update(extra)
+            with open(os.path.join(folder, "market.json"), "w") as fh:
+                json.dump({"updated": datetime.now(timezone.utc).isoformat(), "markets": [row]}, fh)
+            body = self.call(f"/?key={KEY}")[1]
+            return body.split('class="buysig" data-series="KXBTC15M" data-buy="')[1].split('"')[0]
+        self.assertEqual(buy(3, score_soon=1), "")                       # ³ soon, but 89c: too dear
+        self.assertEqual(buy(3, score_soon=1, yes_ask="0.86"), "yes")    # ³ soon at 86c: buy Up
+        self.assertEqual(buy(3, score_up=7), "yes")                      # a 7+ lights it on its own
+        self.assertEqual(buy(3, score_best="no", score_down=8, yes_bid="0.20"), "no")
+        self.assertEqual(buy(3, yes_ask="0.86"), "")                     # cheap, but no ³ soon and under 7
+        self.assertEqual(buy(6, score_up=8), "")                         # only in the last 4 minutes
+        body = self.call(f"/?key={KEY}")[1]
+        self.assertIn("function lightBuy()", body)
+        self.assertIn(".row2 button.go{", body)
+
 
 if __name__ == "__main__":
     unittest.main()

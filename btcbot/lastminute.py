@@ -469,6 +469,12 @@ LEVEL_WORDS = {1: "about 6 in 10", 2: "about 8 in 10", 3: "about 19 in 20"}
 SOON_SECONDS = 20     # "³ soon": a ² that turns ³ this many seconds from now if Bitcoin just holds
 SOON_FROM = 240       # ...shown in the last 4 minutes only (where it was tested)
 
+# The buy button lights up (last 4 minutes, on our pick) when either:
+#   - "³ soon" shows and the price is 88c or less (best guess until a week of real data is in), or
+#   - the score is 7+ (the two-week test: our pick at 7+ late made money; a plain ³ under 7 didn't).
+BUY_SOON_MAX = Decimal("0.88")
+BUY_SCORE = 7
+
 
 def three_soon(mean: float, target: float, seconds_left: float, sigma: float, up: bool) -> bool:
     """True when the pick is a ² now and the clock alone makes it a ³ within 20 seconds.

@@ -122,20 +122,33 @@ class Tracker:
             self.samples.pop(0)
 
     def estimate(self, now: datetime) -> Estimate | None:
+        """Where the final 60-second average is heading.
+
+        Kalshi averages one price per second. We check every 1-5 seconds, unevenly, so each
+        second of the final minute counts once, at the latest price seen by then (a quick burst
+        of checks doesn't count extra). The seconds still to come are assumed to stay at the
+        current price. Example: 30 seconds counted averaging $96,951, now $96,980 ->
+        heading to about $96,965.
+        """
         if not self.samples:
             return None
         start = self.close - timedelta(seconds=WINDOW)
-        inside = [p for t, p in self.samples if start <= t <= self.close]
         elapsed = max(0.0, min(float(WINDOW), (now - start).total_seconds()))
         current = self.samples[-1][1]
-        if inside and elapsed > 0:
-            avg = sum(inside, Decimal("0")) / len(inside)
-            e = Decimal(str(elapsed))
-            projected = (avg * e + current * (WINDOW - e)) / WINDOW
+        counted = int(elapsed)                 # whole seconds of the final minute already passed
+        if counted > 0:
+            total, i, last = Decimal("0"), 0, None
+            for k in range(1, counted + 1):
+                t = start + timedelta(seconds=k)
+                while i < len(self.samples) and self.samples[i][0] <= t:
+                    last = self.samples[i][1]
+                    i += 1
+                total += last if last is not None else self.samples[0][1]
+            projected = (total + current * (WINDOW - counted)) / WINDOW
         else:
             projected = current
         left = (self.close - now).total_seconds()
-        return Estimate(projected, projected - self.target, int(elapsed), left, current)
+        return Estimate(projected, projected - self.target, counted, left, current)
 
 
 def seconds_words(s: float) -> str:
@@ -155,7 +168,9 @@ def gap_words(est: Estimate) -> str:
 WATCH_COLUMNS = ["time", "kind", "play", "market", "side", "contracts", "seconds_left", "gap_dollars",
                  "price", "entry_price", "result", "would_profit", "held_profit", "difference"]
 DATA_COLUMNS = ["time", "market", "seconds_left", "target", "price", "sources", "projected", "gap",
-                "yes_bid", "yes_ask"]
+                "yes_bid", "yes_ask", "yes_bid_size", "yes_ask_size", "chance_up", "up_score", "down_score"]
+# sizes = contracts offered at the best price (Up sellers = yes_ask_size, Down sellers = yes_bid_size);
+# with the score each second, this shows whether a 7+ deal was still there 1, 3 or 5 seconds later.
 
 
 def append_csv(path: str, columns: list, row: dict) -> None:

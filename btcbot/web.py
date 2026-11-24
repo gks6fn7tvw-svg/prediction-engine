@@ -8,6 +8,8 @@ Anyone without the private key in the link gets nothing.
 from __future__ import annotations
 
 import copy
+import csv
+import io
 import gzip
 import hashlib
 import hmac
@@ -1821,16 +1823,17 @@ class Handler(BaseHTTPRequestHandler):
                     want = max(1, min(14, int((query.get("days") or ["1"])[0])))
                 except ValueError:
                     want = 1
-                empty = ",".join(lastminute.DATA_COLUMNS) + "\n"
-                text = ""
-                for i, day in enumerate(days[-want:]):
+                out = io.StringIO()
+                w = csv.DictWriter(out, fieldnames=lastminute.DATA_COLUMNS, extrasaction="ignore")
+                w.writeheader()
+                for day in days[-want:]:        # older days may have fewer columns: line them all up
                     try:
-                        with open(os.path.join(day_dir, day), encoding="utf-8") as fh:
-                            body = fh.read()
+                        with open(os.path.join(day_dir, day), newline="", encoding="utf-8") as fh:
+                            for row in csv.DictReader(fh):
+                                w.writerow({k: row.get(k) or "" for k in lastminute.DATA_COLUMNS})
                     except OSError:
                         continue
-                    text += body if not text else body.split("\n", 1)[-1]   # one header only
-                return self._send(200, text or empty, ctype="text/csv; charset=utf-8", compress=True)
+                return self._send(200, out.getvalue(), ctype="text/csv; charset=utf-8", compress=True)
             try:
                 with open(path, encoding="utf-8") as fh:
                     text = fh.read()

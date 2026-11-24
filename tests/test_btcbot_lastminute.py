@@ -1,5 +1,6 @@
 """Last-minute watch: settlement estimate, and the guard/follow ideas it only logs."""
 import csv
+import io
 import os
 import unittest
 from datetime import datetime, timedelta, timezone
@@ -24,6 +25,28 @@ class TestEstimate(unittest.TestCase):
         self.assertAlmostEqual(float(est.projected), 96965.48, places=1)
         self.assertLess(est.gap, 0)
         self.assertEqual(est.favored(), "no")
+
+    def test_each_second_counts_once_however_often_we_checked(self):
+        close = datetime(2026, 11, 22, 3, 0, tzinfo=timezone.utc)
+        tr = Tracker(close, D("97000"))
+        tr.add(close - timedelta(seconds=60), D("97000"))
+        for k in range(50):                         # a burst of 50 checks within one second at $97,100
+            tr.add(close - timedelta(seconds=45) + timedelta(milliseconds=19 * k), D("97100"))
+        tr.add(close - timedelta(seconds=44), D("97000"))
+        tr.add(close - timedelta(seconds=30), D("97000"))
+        est = tr.estimate(close - timedelta(seconds=30))
+        # 30 seconds counted: 29 at $97,000 and one at $97,100 (not 50 of them)
+        self.assertEqual(est.locked, 30)
+        self.assertAlmostEqual(float(est.projected), (29 * 97000 + 97100 + 30 * 97000) / 60, places=2)
+
+    def test_slow_checks_hold_the_last_price(self):
+        close = datetime(2026, 11, 22, 3, 0, tzinfo=timezone.utc)
+        tr = Tracker(close, D("97000"))
+        tr.add(close - timedelta(seconds=62), D("96990"))    # seen just before the minute started
+        tr.add(close - timedelta(seconds=50), D("97010"))    # then nothing for 10 seconds
+        est = tr.estimate(close - timedelta(seconds=50))
+        # seconds 1-9 hold $96,990, second 10 is $97,010, the other 50 assumed at $97,010
+        self.assertAlmostEqual(float(est.projected), (9 * 96990 + 97010 + 50 * 97010) / 60, places=2)
 
     def test_before_the_last_minute_it_is_just_the_price(self):
         close = datetime(2026, 11, 22, 3, 0, tzinfo=timezone.utc)
@@ -128,6 +151,8 @@ class TestWatch(LiveCase):
         import json
         self.make([MAIN])
         self.price = D("59990")
+        self.bot.sigma_fn = lambda coin: 3.0
+        self.bot.spot_fn = lambda product: self.price
         self.run_bot(0, 0.40, 0.42, seconds=30)
         folder = os.path.join(self.ledger.folder, "lastminute")
         files = os.listdir(folder)
@@ -135,6 +160,10 @@ class TestWatch(LiveCase):
         with open(os.path.join(folder, files[0])) as fh:
             rows = list(csv.DictReader(fh))
         self.assertEqual(rows[-1]["gap"], "-10.00")
+        # sizes and our score each second, to check later whether a deal lasted long enough to buy
+        self.assertTrue(rows[-1]["chance_up"])
+        self.assertIn("up_score", rows[-1])
+        self.assertIn("yes_ask_size", rows[-1])
         with open(os.path.join(self.ledger.folder, "market.json")) as fh:
             m = json.load(fh)["markets"][0]
         self.assertEqual(m["est_gap"], "-10.00")
@@ -198,6 +227,16 @@ class TestWatchPages(WebCase):
         self.assertIn("guard,main", text)
         _, text, _ = self.call("/lastminute.csv", cookie=f"btcbot_key={KEY}")
         self.assertIn("-35.00", text)
+        # an older day saved with fewer columns lines up under the new header
+        day_dir = os.path.join(folder, "lastminute")
+        with open(os.path.join(day_dir, "2000-01-01.csv"), "w") as fh:
+            fh.write("time,market,seconds_left,target,price,sources,projected,gap,yes_bid,yes_ask\n"
+                     "t0,OLD,12,60000,59990,3,59990,-10.00,0.40,0.42\n")
+        _, text, _ = self.call("/lastminute.csv?days=5", cookie=f"btcbot_key={KEY}")
+        rows = list(csv.DictReader(io.StringIO(text)))
+        self.assertEqual(list(rows[0]), lastminute.DATA_COLUMNS)
+        old = next(r for r in rows if r["market"] == "OLD")
+        self.assertEqual((old["yes_ask"], old["yes_ask_size"]), ("0.42", ""))
 
     def test_market_card_shows_the_estimate(self):
         import json

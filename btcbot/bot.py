@@ -1385,9 +1385,19 @@ class Bot:
                 "seconds_left": int(est.seconds_left), "target": str(q.target), "price": str(est.price),
                 "sources": sources, "projected": str(est.projected.quantize(Decimal("0.01"))),
                 "gap": str(est.gap.quantize(Decimal("0.01"))),
-                "yes_bid": str(q.yes_bid or ""), "yes_ask": str(q.yes_ask or "")})
+                "yes_bid": str(q.yes_bid or ""), "yes_ask": str(q.yes_ask or ""),
+                "yes_bid_size": str(q.yes_bid_size if q.yes_bid_size is not None else ""),
+                "yes_ask_size": str(q.yes_ask_size if q.yes_ask_size is not None else ""),
+                **self._score_columns(q.ticker)})
         except OSError as e:
             self._say("lastminute-file", f"could not save last-minute data ({e})")
+
+    def _score_columns(self, ticker: str) -> dict:
+        sc = self.scores.get(ticker)
+        if not sc:
+            return {}
+        return {"chance_up": f"{sc['chance_up']:.4f}", "up_score": sc.get("up") or "",
+                "down_score": sc.get("down") or ""}
 
     def _watch_guard(self, q: rules.Quote, now: datetime, est) -> None:
         w = self.s.watch

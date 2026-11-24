@@ -256,6 +256,12 @@ close (`scores.csv`, "Score track record" on the Overview). On the first night o
 same math was about as accurate as Kalshi's own price in the last 5 minutes, and better
 near the end, on only 35 markets.
 
+**Each second counts once.** The last-minute average holds the latest price seen at each
+whole second (Kalshi averages one price per second; the bot checks every 1-5 s, unevenly),
+so a burst of checks doesn't count extra. The second-by-second file (`lastminute/*.csv`)
+also records how many contracts sit at the best prices (`yes_bid_size`, `yes_ask_size`) and
+our chance and scores each second, to test whether a 7+ deal lasted 1, 3 or 5 seconds.
+
 **Live prices.** Kalshi's market list only refreshes its prices about every 30 seconds
 (the bot's own records showed the price changing at most twice a minute while Kalshi's
 history showed more moves). For the market that's running, the bot now reads the live

@@ -256,6 +256,13 @@ close (`scores.csv`, "Score track record" on the Overview). On the first night o
 same math was about as accurate as Kalshi's own price in the last 5 minutes, and better
 near the end, on only 35 markets.
 
+**Jumpiness 1-100** (price card, while the live score is on). The average size of the last
+5 one-minute moves (Coinbase candles), ranked against every 5-minute stretch of the last
+~5 hours: 80 = jumpier than 80% of them. Refreshed every 20 s; green under 30, amber, red
+70+. Backtest (Nov 9-23, last 5 minutes, our pick at 80-95c, one per market): calm (<30)
+won about 84% and lost money both weeks; jumpy (70+) won about 91-95% and made money both
+weeks (leads were bigger, about $95 vs $63, and Kalshi seemed to charge less for them).
+
 **Live prices.** Kalshi's market list only refreshes its prices about every 30 seconds
 (the bot's own records showed the price changing at most twice a minute while Kalshi's
 history showed more moves). For the market that's running, the bot now reads the live

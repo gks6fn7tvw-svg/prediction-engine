@@ -819,6 +819,22 @@ def coin_word(series: str) -> str:
     return "Price"
 
 
+def jump_gauge(m: dict) -> str:
+    """Jumpiness 1-100 with a small colored bar (calm green, normal amber, jumpy red)."""
+    if m.get("jump") in (None, ""):
+        return ""
+    try:
+        j = max(1, min(100, int(m["jump"])))
+    except (TypeError, ValueError):
+        return ""
+    color, word = (("var(--green)", "calm") if j < 30 else ("var(--red)", "jumpy") if j >= 70
+                   else ("var(--amber)", "normal"))
+    dollars = f' · moves about ${esc(m["jump_dollars"])} a minute' if m.get("jump_dollars") not in (None, "") else ""
+    return (f'<p class="hint" style="margin-top:8px">Jumpiness <b style="color:{color}">{j}</b>/100 · '
+            f'{word}{dollars}</p><div class="bar" style="height:6px;margin:4px 0 0">'
+            f'<span style="width:{j}%;background:{color}"></span></div>')
+
+
 def market_cards(d: dict) -> str:
     age = d.get("market_age")
     if age is None or age > 300 or not d["market"]:
@@ -886,7 +902,7 @@ def market_cards(d: dict) -> str:
                    f'<span>{countdown(mins * 60)} left</span></div>'
                    f'<div class="prices">{box(series, "Down", "▼", down, not fav_up, badge_down)}'
                    f'{box(series, "Up", "▲", up, fav_up, badge_up)}</div>'
-                   f'{est}{line}<p class="hint" style="margin-top:4px">Price to buy right now{target}{stale}</p></div>')
+                   f'{est}{line}{jump_gauge(m)}<p class="hint" style="margin-top:4px">Price to buy right now{target}{stale}</p></div>')
     return "".join(out)
 
 

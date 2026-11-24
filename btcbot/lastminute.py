@@ -225,6 +225,37 @@ def candles_sigma(session, coin: str, minutes: int = 30, timeout: float = 4.0) -
     return per_minute / 60 ** 0.5 if per_minute > 0 else None
 
 
+def jumpiness_from_closes(closes: list, window: int = 5) -> tuple | None:
+    """How jumpy the coin is right now, 1-100, and its typical $ move per minute lately.
+
+    "Right now" = the average size of the last 5 one-minute moves. It's ranked against every
+    5-minute stretch in the candles given (about the last 5 hours): 80 = jumpier than 80% of
+    them, 10 = calmer than nearly all. Example: moves of $40, $55, $30, $60, $45 -> $46 a
+    minute, which might rank 85 on a quiet day.
+    """
+    moves = [abs(b - a) for a, b in zip(closes, closes[1:])]
+    if len(moves) < window + 20:
+        return None
+    avgs = [sum(moves[i - window:i]) / window for i in range(window, len(moves) + 1)]
+    now, past = avgs[-1], avgs[:-1]
+    rank = sum(1 for v in past if v < now) / len(past) * 100
+    return max(1, min(100, int(round(rank)))), now
+
+
+def candles_jumpiness(session, coin: str, timeout: float = 4.0) -> tuple | None:
+    """Jumpiness from Coinbase's 1-minute candles (it sends the last 300 minutes)."""
+    product = CANDLE_PATHS.get(coin)
+    if not product:
+        return None
+    try:
+        r = session.get(f"https://api.exchange.coinbase.com/products/{product}/candles",
+                        params={"granularity": 60}, timeout=timeout)
+        closes = [float(c[4]) for c in sorted(r.json(), key=lambda c: c[0])]
+    except Exception:
+        return None
+    return jumpiness_from_closes(closes)
+
+
 def _phi(z: float) -> float:
     import math
     return 0.5 * (1 + math.erf(z / math.sqrt(2)))

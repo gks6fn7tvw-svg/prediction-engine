@@ -31,6 +31,16 @@ class TestMath(unittest.TestCase):
             with self.assertRaises(SettingsError):
                 play(**bad)
 
+    def test_jumpiness_ranks_now_against_the_last_hours(self):
+        calm = [60000 + (i % 2) * 10 for i in range(200)]          # $10 moves for hours
+        self.assertIsNone(lastminute.jumpiness_from_closes(calm[:20]))      # too little history
+        wild = calm + [60060, 60000, 60070, 59990, 60080]           # then five $60-90 moves
+        score, dollars = lastminute.jumpiness_from_closes(wild)
+        self.assertEqual(score, 100)
+        self.assertGreater(dollars, 60)
+        quiet = wild + [60080] * 10                                 # then it goes still
+        self.assertEqual(lastminute.jumpiness_from_closes(quiet)[0], 1)
+
     def test_levels(self):
         self.assertEqual([lastminute.confidence(c) for c in (0.5, 0.69, 0.70, 0.89, 0.90, 0.99)], [1, 1, 2, 2, 3, 3])
         self.assertEqual(lastminute.LEVEL_WORDS[3], "about 19 in 20")
@@ -104,6 +114,19 @@ class TestBotScore(LiveCase):
         self.price = D("59990")
         self.run_bot(11, 0.69, 0.70)
         self.assertEqual(self.market_row()["btc_gap"], "-10.00")
+
+    def test_jumpiness_on_the_card(self):
+        self.make([MAIN])
+        self.bot.jump_fn = lambda coin: (82, 46.4)
+        self.run_bot(4, 0.69, 0.70)
+        row = self.market_row()
+        self.assertEqual((row["jump"], row["jump_dollars"]), (82, "46"))
+        from btcbot.web import jump_gauge
+        html = jump_gauge(row)
+        self.assertIn('Jumpiness <b style="color:var(--red)">82</b>/100 · jumpy · moves about $46 a minute', html)
+        self.assertIn("width:82%", html)
+        self.assertIn("calm", jump_gauge({"jump": 12}))
+        self.assertEqual(jump_gauge({}), "")
 
     def test_level_is_how_sure_the_pick_is(self):
         self.make([MAIN])

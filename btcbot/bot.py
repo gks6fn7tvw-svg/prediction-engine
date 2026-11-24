@@ -149,7 +149,7 @@ def run_together(real: "Bot", fake: "Bot", should_stop=None) -> None:
 
 class Bot:
     def __init__(self, settings: Settings, client: KalshiClient, broker, ledger: Ledger,
-                 state: State, clock=None, spot_fn=None, index_fn=None, sigma_fn=None):
+                 state: State, clock=None, spot_fn=None, index_fn=None, sigma_fn=None, jump_fn=None):
         self.s = settings
         self.client = client
         self.broker = broker
@@ -162,6 +162,9 @@ class Bot:
         self.trackers: dict[str, lastminute.Tracker] = {}
         # Live score: how jumpy the coin has been ($ per second), refreshed once a minute.
         self.sigma_fn = sigma_fn or (lambda coin: lastminute.candles_sigma(client.session, coin))
+        # Jumpiness gauge for the card (1-100 vs the last few hours), refreshed every 20 seconds.
+        self.jump_fn = jump_fn or (lambda coin: lastminute.candles_jumpiness(client.session, coin))
+        self.jumps: dict = {}
         self.sigmas: dict = {}
         self.scores: dict = {}
         self.btc_now: dict = {}                    # ticker -> latest coin price (for the card)
@@ -573,6 +576,12 @@ class Bot:
             if q.ticker in self.btc_now and q.target is not None:
                 row.update(btc_now=f"{self.btc_now[q.ticker]:.2f}",
                            btc_gap=f"{self.btc_now[q.ticker] - float(q.target):.2f}")
+            left = (q.close_time - now).total_seconds() if q.close_time else None
+            coin = lastminute.coin_for(q.series)
+            if self.s.watch.score and coin and left is not None and 0 < left <= 900:
+                j = self._jump(coin, now)
+                if j is not None:
+                    row.update(jump=j[0], jump_dollars=f"{j[1]:.0f}")
             est = self.estimates.get(q.ticker)
             if est is not None:
                 row.update(est_projected=str(est.projected.quantize(Decimal("0.01"))),
@@ -1504,6 +1513,18 @@ class Bot:
             del self.state.watch[key]
 
     # ---- live score (1-10 for each side) ---------------------------------------
+    def _jump(self, coin: str, now: datetime):
+        hit = self.jumps.get(coin)
+        if hit is None or (now - hit[0]).total_seconds() >= 20:
+            try:
+                value = self.jump_fn(coin)
+            except Exception:
+                value = None
+            if value is None and hit is not None and (now - hit[0]).total_seconds() < 180:
+                value = hit[1]          # keep a recent good one
+            self.jumps[coin] = hit = (now, value)
+        return hit[1]
+
     def _sigma(self, coin: str, now: datetime) -> float | None:
         hit = self.sigmas.get(coin)
         if hit is None or (now - hit[0]).total_seconds() >= 60:

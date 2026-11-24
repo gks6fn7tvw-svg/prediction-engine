@@ -169,6 +169,7 @@ class Bot:
         self.recent = defaultdict(lambda: deque(maxlen=120))  # ticker -> (time, price) for the last minute or so
 
         self.moves: dict = {}                       # ticker -> ("up"/"down", when): a fast move right now
+        self.rsi_prices = defaultdict(lambda: deque(maxlen=400))   # ticker -> (time, price), last ~3 minutes
         self.sigmas: dict = {}
         self.scores: dict = {}
         self.btc_now: dict = {}                    # ticker -> latest coin price (for the card)
@@ -589,6 +590,11 @@ class Bot:
             mv = self.moves.get(q.ticker)
             if mv:
                 row.update(move=mv[0], move_kind=mv[2])
+            hist = self.rsi_prices.get(q.ticker)
+            if hist:
+                line = lastminute.rsi_series(list(hist), now)
+                if line:
+                    row.update(rsi=int(round(line[-1][1])), rsi_line=[[a, int(round(r))] for a, r in line])
             est = self.estimates.get(q.ticker)
             if est is not None:
                 row.update(est_projected=str(est.projected.quantize(Decimal("0.01"))),
@@ -1584,6 +1590,10 @@ class Bot:
             if sigma is None:
                 continue
             self._breakout(q.ticker, now, price_now, sigma)
+            hist = self.rsi_prices[q.ticker]
+            hist.append((now, price_now))
+            while hist and (now - hist[0][0]).total_seconds() > 175:
+                hist.popleft()
             p = lastminute.chance_up(mean, float(q.target), left, sigma)
             up_ask, down_ask = q.ask("yes"), q.ask("no")
             su = lastminute.score(p, float(up_ask) if up_ask is not None else None)
@@ -1604,6 +1614,9 @@ class Bot:
             if ticker not in quotes:
                 del self.recent[ticker]
                 self.moves.pop(ticker, None)
+        for ticker in list(self.rsi_prices):
+            if ticker not in quotes:
+                del self.rsi_prices[ticker]
         if self.s.watch.score:
             self._score_resolve(now)
 

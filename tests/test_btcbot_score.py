@@ -41,6 +41,19 @@ class TestMath(unittest.TestCase):
         quiet = wild + [60080] * 10                                 # then it goes still
         self.assertEqual(lastminute.jumpiness_from_closes(quiet)[0], 1)
 
+    def test_rsi(self):
+        from datetime import datetime, timedelta, timezone
+        now = datetime(2026, 11, 23, 12, 0, tzinfo=timezone.utc)
+        def series(prices):                              # one price a second, ending now
+            return [(now - timedelta(seconds=len(prices) - 1 - i), p) for i, p in enumerate(prices)]
+        self.assertEqual(lastminute.rsi_series(series([60000] * 30), now), [])       # not enough history yet
+        up = lastminute.rsi_series(series([60000 + i for i in range(200)]), now)
+        self.assertEqual((up[0][0], up[-1]), (90, (0, 100.0)))                        # 90 s back to now
+        self.assertEqual(lastminute.rsi_series(series([60000 - i for i in range(200)]), now)[-1][1], 0.0)
+        self.assertEqual(lastminute.rsi_series(series([60000] * 200), now)[-1][1], 50.0)
+        zig = [60000 + (10 if (i // 5) % 2 else 0) for i in range(200)]               # up $10, down $10...
+        self.assertAlmostEqual(lastminute.rsi_series(series(zig), now)[-1][1], 50, delta=5)
+
     def test_levels(self):
         self.assertEqual([lastminute.confidence(c) for c in (0.5, 0.69, 0.70, 0.89, 0.90, 0.99)], [1, 1, 2, 2, 3, 3])
         self.assertEqual(lastminute.LEVEL_WORDS[3], "about 19 in 20")
@@ -144,6 +157,23 @@ class TestBotScore(LiveCase):
         self.run_bot(3, 0.69, 0.70, 29)
         row = self.market_row()
         self.assertEqual((row["move"], row["move_kind"]), ("up", "band"))
+
+    def test_rsi_line_on_the_card(self):
+        self.make([MAIN])
+        for k in range(36):                              # 3 minutes of a steady climb, a check every 5 s
+            self.price = D("60000") + 3 * k
+            left = 300 - 5 * k
+            self.run_bot(left // 60, 0.69, 0.70, left % 60)
+        row = self.market_row()
+        self.assertEqual(row["rsi"], 100)
+        self.assertEqual(row["rsi_line"][-1], [0, 100])
+        self.assertEqual(row["rsi_line"][0][0], 90)
+        from btcbot.web import rsi_chart
+        html = rsi_chart(row)
+        self.assertIn("RSI, last 90 s", html)
+        self.assertIn("<polyline", html)
+        self.assertIn('cx="298" cy="0"', html)            # now, at the very top
+        self.assertEqual(rsi_chart({"rsi_line": [[0, 50]]}), "")
 
     def test_jumpiness_on_the_card(self):
         self.make([MAIN])

@@ -851,6 +851,26 @@ def jump_meter(m: dict) -> str:
             f'<text x="60" y="71" text-anchor="middle" font-size="12" fill="var(--dim)">{j}</text></svg>')
 
 
+def rsi_chart(m: dict) -> str:
+    """Last 90 seconds of RSI as a small line, with the 70 and 30 walls shaded."""
+    line = m.get("rsi_line") or []
+    if len(line) < 2:
+        return ""
+    pts = " ".join(f"{(90 - a) / 90 * 296 + 2:.0f},{80 - r * 0.8:.0f}" for a, r in line)
+    x, y = pts.split(" ")[-1].split(",")
+    return ('<div style="margin-top:10px"><div style="display:flex;justify-content:space-between;font-size:12px;'
+            f'color:var(--dim)"><span>RSI, last 90 s</span><span>now <b style="color:var(--text)">{int(m.get("rsi", line[-1][1]))}'
+            '</b></span></div><svg viewBox="0 0 300 80" style="width:100%;height:80px" role="img" aria-label="RSI, last 90 seconds">'
+            '<rect x="0" y="0" width="300" height="24" fill="var(--red)" opacity="0.12"/>'
+            '<rect x="0" y="56" width="300" height="24" fill="var(--green)" opacity="0.12"/>'
+            '<line x1="0" y1="24" x2="300" y2="24" stroke="var(--red)" stroke-width="1" stroke-dasharray="4 3"/>'
+            '<line x1="0" y1="56" x2="300" y2="56" stroke="var(--green)" stroke-width="1" stroke-dasharray="4 3"/>'
+            '<text x="296" y="20" text-anchor="end" font-size="11" fill="var(--dim)">70</text>'
+            '<text x="296" y="74" text-anchor="end" font-size="11" fill="var(--dim)">30</text>'
+            f'<polyline fill="none" stroke="var(--text)" stroke-width="2" stroke-linejoin="round" points="{pts}"/>'
+            f'<circle cx="{x}" cy="{y}" r="4" fill="var(--text)"/></svg></div>')
+
+
 def gap_text(g: float) -> str:
     """$38 ▲ = Bitcoin $38 above the target; $12 ▼ = $12 below."""
     return f"${abs(g):,.0f} {'▲' if g >= 0 else '▼'}"
@@ -928,7 +948,7 @@ def market_cards(d: dict) -> str:
                    f'{esc(names.get(series, series))}</b>{target}{stale}</span>'
                    f'<span>{countdown(mins * 60)} left</span></div>'
                    f'<div class="prices">{box(series, "Down", "▼", down, not fav_up, badge_down)}'
-                   f'{box(series, "Up", "▲", up, fav_up, badge_up)}</div>{row}</div>')
+                   f'{box(series, "Up", "▲", up, fav_up, badge_up)}</div>{row}{rsi_chart(m)}</div>')
     return "".join(out)
 
 

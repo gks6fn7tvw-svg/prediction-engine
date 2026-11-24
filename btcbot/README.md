@@ -281,6 +281,14 @@ per second with the last traded price on each (and Kalshi's trade count that sec
 measure who moves first. Sources that never answer are skipped after 5 tries; the Done line
 says which worked. About 10 minutes per day of markets.
 
+**RSI line** (price card, under the row). RSI on 5-second candles (14 of them, about 70 s),
+drawn for the last 90 seconds with the 70 and 30 walls shaded. From the timing data
+(Nov 22-24, Coinbase second by second, last 5 minutes of 192 markets): when RSI touched 70
+(or 30) it broke through to 80 (20) about 55% of the time, usually fast (half within 3 s);
+the longer it sat near the wall the less likely it broke (about 40% after 5 s, 37% after
+10 s, 31% after 20 s); dipping under and coming back was about a coin flip (47%); and after
+reaching 80 (20) Bitcoin pulled back over the next 30-60 s more often than not (58-66%).
+
 **Jumpiness 1-100** (price card, while the live score is on). The average size of the last
 5 one-minute moves (Coinbase candles), ranked against every 5-minute stretch of the last
 ~5 hours: 80 = jumpier than 80% of them. Refreshed every 20 s; green under 30, amber, red

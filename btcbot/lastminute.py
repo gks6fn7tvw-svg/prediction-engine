@@ -305,6 +305,38 @@ def candles_sigma(session, coin: str, minutes: int = 30, timeout: float = 4.0) -
     return per_minute / 60 ** 0.5 if per_minute > 0 else None
 
 
+RSI_BAR, RSI_N, RSI_SPAN, RSI_STEP = 5, 14, 90, 3      # 5-second candles, 14 of them; show the last 90 s
+
+
+def rsi_series(samples, now, bar: int = RSI_BAR, n: int = RSI_N, span: int = RSI_SPAN, step: int = RSI_STEP) -> list:
+    """RSI (0-100) on `bar`-second candles, every `step` seconds over the last `span` seconds.
+
+    samples: [(time, price)] oldest first. Returns [(seconds ago, rsi)]. Each RSI compares the
+    ups and downs of the last 14 candles (about 70 seconds): all ups = 100, all downs = 0.
+    Above 70 = it has been pushing up hard ("too high"); below 30 = pushing down hard.
+    """
+    import bisect
+    from datetime import timedelta
+    times = [t for t, _ in samples]
+    prices = [p for _, p in samples]
+
+    def at(t):
+        i = bisect.bisect_right(times, t) - 1
+        return prices[i] if i >= 0 else None
+    out = []
+    for ago in range(span, -1, -step):
+        t = now - timedelta(seconds=ago)
+        pts = [at(t - timedelta(seconds=bar * j)) for j in range(n, -1, -1)]
+        if any(p is None for p in pts):
+            continue
+        diffs = [b - a for a, b in zip(pts, pts[1:])]
+        gain = sum(x for x in diffs if x > 0) / n
+        loss = sum(-x for x in diffs if x < 0) / n
+        rsi = 50.0 if gain == loss == 0 else 100.0 if loss == 0 else 100 - 100 / (1 + gain / loss)
+        out.append((ago, rsi))
+    return out
+
+
 def jumpiness_from_closes(closes: list, window: int = 5) -> tuple | None:
     """How jumpy the coin is right now, 1-100, and its typical $ move per minute lately.
 

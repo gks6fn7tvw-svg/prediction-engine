@@ -570,10 +570,12 @@ class Bot:
             if sc is not None:
                 row.update(chance_up=f"{sc['chance_up']:.3f}", score_up=sc["up"], score_down=sc["down"],
                            score_best=sc["best"], score_level=sc["level"])
-            if q.ticker in self.btc_now and q.target is not None:
-                row.update(btc_now=f"{self.btc_now[q.ticker]:.2f}",
-                           btc_gap=f"{self.btc_now[q.ticker] - float(q.target):.2f}")
             est = self.estimates.get(q.ticker)
+            # Near the end, the same 3-exchange price the last-minute average uses (checked every second);
+            # earlier, the price the score used this step.
+            now_price = float(est.price) if est is not None else self.btc_now.get(q.ticker)
+            if now_price is not None and q.target is not None:
+                row.update(btc_now=f"{now_price:.2f}", btc_gap=f"{now_price - float(q.target):.2f}")
             if est is not None:
                 row.update(est_projected=str(est.projected.quantize(Decimal("0.01"))),
                            est_gap=str(est.gap.quantize(Decimal("0.01"))), est_locked=est.locked,

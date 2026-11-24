@@ -105,6 +105,14 @@ class TestBotScore(LiveCase):
         self.run_bot(11, 0.69, 0.70)
         self.assertEqual(self.market_row()["btc_gap"], "-10.00")
 
+    def test_near_the_end_the_line_uses_the_every_second_price(self):
+        self.make([MAIN])
+        self.bot.spot_fn = lambda product: D("60040")          # Coinbase alone
+        self.bot.index_fn = lambda coin: (D("60049"), 3)       # 3-exchange price the average uses
+        self.bot.sigma_fn = lambda coin: 3.0
+        self.at(1, 0.69, 0.70, 30)                             # 1:30 left: inside the watch window
+        self.assertEqual(self.market_row()["btc_gap"], "49.00")
+
     def test_level_is_how_sure_the_pick_is(self):
         self.make([MAIN])
         self.price = D("60003")                                          # a hair above: a toss-up

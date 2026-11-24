@@ -287,7 +287,10 @@ across it, placed the real dollar gap away from the white dot (now) at a fixed z
 shaded band is about $60; it sticks to the edge if the gap is bigger), with the current
 price and the target in small print on the right edge. A red line runs about 10 seconds
 ahead as a for-fun guess (`last_minute.rsi_guess`, on by default): it assumes the last
-10 seconds' move carries on a little (30%). From the timing data
+10 seconds' move carries on a little (30%). In the last 4 minutes a yellow bar on the
+right edge shows where the final average will probably land (about 9 times in 10, the same
+math as our chance, `close_mid` ± 1.645 × `close_sd`), at the same dollar zoom as the
+target line: target outside the yellow = that side very likely holds; inside = it could flip. From the timing data
 (Nov 22-24, Coinbase second by second, last 5 minutes of 192 markets): when RSI touched 70
 (or 30) it broke through to 80 (20) about 55% of the time, usually fast (half within 3 s);
 the longer it sat near the wall the less likely it broke (about 40% after 5 s, 37% after

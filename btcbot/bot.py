@@ -578,6 +578,8 @@ class Bot:
             if sc is not None:
                 row.update(chance_up=f"{sc['chance_up']:.3f}", score_up=sc["up"], score_down=sc["down"],
                            score_best=sc["best"], score_level=sc["level"])
+                if "close_sd" in sc:
+                    row.update(close_mid=f"{sc['close_mid']:.2f}", close_sd=f"{sc['close_sd']:.2f}")
             if q.ticker in self.btc_now and q.target is not None:
                 row.update(btc_now=f"{self.btc_now[q.ticker]:.2f}",
                            btc_gap=f"{self.btc_now[q.ticker] - float(q.target):.2f}")
@@ -1606,6 +1608,8 @@ class Bot:
             chance_best = p if best == "yes" else 1 - p
             level = lastminute.confidence(chance_best)
             self.scores[q.ticker] = {"chance_up": p, "up": su, "down": sd, "best": best, "level": level}
+            if left <= lastminute.CLOSE_RANGE_SECONDS:     # where the final average will probably land
+                self.scores[q.ticker].update(close_mid=mean, close_sd=lastminute.close_sd(left, sigma))
             if self.s.watch.score:
                 self._score_snapshot(q, now, left, p, up_ask, down_ask, su, sd, best, level)
         for ticker in list(self.scores):

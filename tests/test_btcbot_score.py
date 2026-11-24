@@ -183,7 +183,10 @@ class TestBotScore(LiveCase):
         html = rsi_chart(row)
         self.assertIn("RSI, last 90 s", html)
         self.assertIn("<polyline", html)
-        self.assertIn('cx="250" cy="2"', html)            # now: RSI 100, at the very top
+        self.assertIn('cx="236" cy="2"', html)            # now: RSI 100, at the very top
+        # last 4 minutes: yellow range where it'll probably close; the target (60,000) is below it = safe
+        self.assertIn('<rect x="290" y="2" width="7" height="18"', html)
+        self.assertEqual((row["close_mid"], row["close_sd"]), ("60105.00", "27.82"))   # 3·√(125-60+20) with $3 proxy doubt
         # target $105 under the price: blue line 105 / 2.5 = 42 px under the dot, prices on the right
         self.assertIn('<line x1="0" y1="44" x2="300" y2="44" stroke="var(--blue)"', html)
         self.assertIn('fill="var(--text)">60,105</text>', html)
@@ -196,6 +199,14 @@ class TestBotScore(LiveCase):
         self.assertIn('<line x1="0" y1="38" x2="300" y2="38"', rsi_chart(down))     # 50 - 30/2.5
         far = dict(down, btc_now="59000")
         self.assertIn('<line x1="0" y1="2" x2="300" y2="2"', rsi_chart(far))
+
+    def test_no_yellow_range_before_the_last_4_minutes(self):
+        self.make([MAIN])
+        self.price = D("60040")
+        self.run_bot(6, 0.69, 0.70)
+        self.assertNotIn("close_sd", self.market_row())
+        self.run_bot(3, 0.69, 0.70, 59)
+        self.assertIn("close_sd", self.market_row())
 
     def test_rsi_guess_can_be_switched_off(self):
         self.make([MAIN], last_minute={"rsi_guess": False})

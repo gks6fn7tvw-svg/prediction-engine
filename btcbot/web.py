@@ -867,13 +867,13 @@ def rsi_chart(m: dict) -> str:
     if len(line) < 2:
         return ""
     y = lambda r: 82 - r * 0.8                      # RSI 100 at the top (2), 0 at the bottom (82)
-    x = lambda ago: (90 - ago) / 90 * 248 + 2       # 90 s ago at the left, now at 250
+    x = lambda ago: (90 - ago) / 90 * 234 + 2       # 90 s ago at the left, now at 236
     pts = " ".join(f"{x(a):.0f},{y(r):.0f}" for a, r in line)
     tip_x, tip_y = x(line[-1][0]), y(line[-1][1])
     parts = []
     guess = m.get("rsi_guess") or []
     if guess:
-        g = " ".join(f"{250 + a * 2.8:.0f},{y(r):.0f}" for a, r in guess)
+        g = " ".join(f"{236 + a * 2.8:.0f},{y(r):.0f}" for a, r in guess)
         parts.append(f'<polyline fill="none" stroke="var(--red)" stroke-width="2" stroke-linejoin="round" '
                      f'points="{tip_x:.0f},{tip_y:.0f} {g}"/>')
     labels = ""
@@ -890,10 +890,21 @@ def rsi_chart(m: dict) -> str:
                 tly = py + 11
             else:
                 py = tly + 11
-        labels = (f'<text x="298" y="{min(82, max(9, py)):.0f}" text-anchor="end" font-size="9" '
+        labels = (f'<text x="286" y="{min(82, max(9, py)):.0f}" text-anchor="end" font-size="9" '
                   f'fill="var(--text)">{price:,.0f}</text>'
-                  f'<text x="298" y="{min(82, max(9, tly)):.0f}" text-anchor="end" font-size="9" '
+                  f'<text x="286" y="{min(82, max(9, tly)):.0f}" text-anchor="end" font-size="9" '
                   f'fill="var(--blue)">{target:,.0f}</text>')
+        # Yellow: where the final average will probably land (about 9 times in 10), last 4 minutes only.
+        try:
+            mid, sd = float(m["close_mid"]), float(m["close_sd"])
+            hi, lo = mid + lastminute.CLOSE_RANGE_Z * sd, mid - lastminute.CLOSE_RANGE_Z * sd
+            yt = min(82.0, max(2.0, tip_y + (price - hi) / RSI_DOLLARS_PER_PX))
+            yb = min(82.0, max(2.0, tip_y + (price - lo) / RSI_DOLLARS_PER_PX))
+            if yb - yt >= 2:
+                labels += (f'<rect x="290" y="{yt:.0f}" width="7" height="{yb - yt:.0f}" rx="3.5" '
+                           f'fill="var(--amber)" opacity="0.6"/>')
+        except (KeyError, TypeError, ValueError):
+            pass
     return ('<div style="margin-top:10px"><div style="font-size:12px;color:var(--dim)">RSI, last 90 s · now '
             f'<b style="color:var(--text)">{int(m.get("rsi", line[-1][1]))}</b></div>'
             '<svg viewBox="0 0 300 84" style="width:100%;height:84px" role="img" aria-label="RSI, last 90 seconds, with the target">'

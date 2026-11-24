@@ -393,6 +393,21 @@ def _phi(z: float) -> float:
     return 0.5 * (1 + math.erf(z / math.sqrt(2)))
 
 
+def close_sd(seconds_left: float, sigma: float) -> float:
+    """How far ($, one typical amount) the final 60-second average may still land from `mean`."""
+    import math
+    t = max(float(seconds_left), 0.5)
+    if t > WINDOW:
+        sd = sigma * math.sqrt(t - WINDOW + WINDOW / 3)
+    else:
+        sd = sigma * (t / WINDOW) * math.sqrt(t / 3)
+    return math.sqrt(sd * sd + PROXY_ERROR ** 2)
+
+
+CLOSE_RANGE_SECONDS = 240     # the yellow "where it will probably close" range shows in the last 4 minutes
+CLOSE_RANGE_Z = 1.645         # ...covering about 9 times in 10
+
+
 def chance_up(mean: float, target: float, seconds_left: float, sigma: float) -> float:
     """Chance the final 60-second average ends at or above the target.
 

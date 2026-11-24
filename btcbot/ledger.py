@@ -58,6 +58,8 @@ class State:
     score_pending: dict = field(default_factory=dict)  # live score snapshots waiting for their market's result
     goal_start: str = ""                          # goal mode: money when it was switched on
     goal_note: str = ""                           # goal mode: why it stopped (reached / fell below)
+    auto_day: str = ""                            # auto-buy: the day auto_profit counts
+    auto_profit: str = "0"                        # auto-buy: profit of auto-buys closed that day (for the daily stop)
 
     def open_positions(self) -> list[Position]:
         return [Position(**p) for p in self.positions]

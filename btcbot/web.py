@@ -36,7 +36,7 @@ from .kalshi import KalshiClient, KalshiError
 from . import history as H
 from . import timing as T
 from . import lastminute
-from .bot import (ALLOCATION_FILE, MAKE_SUB_FILE, MANUAL, PAPER_RESET_FILE, POT_MOVE_FILE, SETUP_FILE,
+from .bot import (ALLOCATION_FILE, AUTO, AUTO_FILE, MAKE_SUB_FILE, MANUAL, PAPER_RESET_FILE, POT_MOVE_FILE, SETUP_FILE,
                   TRADE_FILE, TRANSFER_FILE, account_name, pot_name)
 from .rules import Quote, parse_time
 from .secure import SecureLink
@@ -822,7 +822,7 @@ def open_bet(pos: dict, play, d: dict, show_play: bool = False) -> str:
     else:
         right = '<span class="dim">open</span>'
     sell = ""
-    if pos["play"] == MANUAL and (mins is None or mins > 0) and d.get("can_trade"):
+    if pos["play"] in (MANUAL, AUTO) and (mins is None or mins > 0) and d.get("can_trade"):
         sell = (f'<form method="post" action="/trade" style="margin:6px 0 0">'
                 f'<input type="hidden" name="action" value="sell"><input type="hidden" name="side" value="{esc(pos["side"])}">'
                 f'<input type="hidden" name="ticker" value="{esc(pos["ticker"])}">'
@@ -1127,6 +1127,7 @@ def overview_page(app: App, secure: bool = False) -> str:
         opened = sum(1 for p in positions if p["play"] == name)
         desc = (describe_play(play, s) if play else
                 "Trades you made yourself on the website (Make a trade)." if name == MANUAL else
+                "Bought for you the moment the buy button lit up (the auto-buy switch)." if name == AUTO else
                 "Removed or renamed. Its past bets are kept here.")
         if play and s.mode == "live":
             desc += (" 🧪 <b>Pretend money only.</b>" if play.pretend
@@ -1312,9 +1313,42 @@ def trade_box(app: "App", d: dict, secure: bool) -> str:
         '<button name="side" value="yes">▲ Buy Up</button></div>'
         f'<p class="hint">Buys right away in the market closing next, at the price on screen (up to 2¢ more, or '
         f'your limit), with {money}. Your trades show up as the play "{MANUAL}"; each open one has a Sell now '
-        'button.</p></form></div>'
+        'button.</p></form>'
+        f'{auto_form(s, st, d.get("paused"))}</div>'
         '<script>function pickSide(v){}</script>')
     return "".join(out)
+
+
+def auto_settings(s) -> dict:
+    try:
+        with open(os.path.join(mode_folder(s), AUTO_FILE), encoding="utf-8") as fh:
+            cfg = json.load(fh)
+        return cfg if isinstance(cfg, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def auto_form(s, st, paused=False) -> str:
+    """The auto-buy switch: the bot buys the moment the buy button lights up."""
+    cfg = auto_settings(s)
+    on = bool(cfg.get("on"))
+    n, stop = int(cfg.get("contracts") or 1), float(cfg.get("stop") or 3)
+    today = datetime.now(ZoneInfo(s.day_timezone)).date().isoformat()
+    lost = -float(st.auto_profit) if st is not None and st.auto_day == today else 0.0
+    if on:
+        status = (f'<b style="color:var(--green)">On.</b> Buys {n} the moment a button lights up, once per market. '
+                  f'Lost ${max(lost, 0):.2f} of your ${stop:.2f} daily stop today.')
+        if paused:
+            status += ' <span style="color:var(--amber)">Waiting: the bot is paused. Tap Resume to let it buy.</span>'
+    else:
+        status = "Off." + (f' <span style="color:var(--amber)">{esc(cfg["note"])}</span>' if cfg.get("note") else "")
+    return ('<form method="post" action="/autobuy" style="margin-top:14px;border-top:1px solid var(--line);padding-top:4px">'
+            f'<label class="check"><input type="checkbox" name="on" value="1"{" checked" if on else ""} '
+            'onchange="this.form.submit()"> Auto-buy when it lights up</label>'
+            '<div class="row2"><div><label>Contracts each time</label>'
+            f'<input name="contracts" value="{n}" inputmode="numeric"></div>'
+            f'<div><label>Daily stop ($)</label><input name="stop" value="{stop:g}" inputmode="decimal"></div></div>'
+            f'<p class="hint">{status} To change the numbers, switch it off and on again.</p></form>')
 
 
 def all_positions(d: dict) -> list:
@@ -2155,6 +2189,34 @@ class Handler(BaseHTTPRequestHandler):
                 days = 2
             start_timing(self.app, days)
             return self._redirect("/settings#timing")
+        if url.path == "/autobuy":
+            s, _ = self.app.settings()
+            if s is None:
+                return self._redirect("/")
+            if s.mode == "live" and not self.secure:
+                self.app.trade_sent = "Not changed: auto-buy with real money only works on the 🔒 locked link."
+                return self._redirect("/#trade")
+            on = field(form, "on") == "1"
+            try:
+                n = int(float(field(form, "contracts", "1") or 1))
+                stop = number(form, "stop", "Daily stop")
+                if not 1 <= n <= 20:
+                    raise SettingsError("Contracts each time: use 1 to 20")
+                if not 0.5 <= stop <= 500:
+                    raise SettingsError("Daily stop: use $0.50 to $500")
+            except (SettingsError, ValueError) as e:
+                self.app.trade_sent = f"Auto-buy not changed: {e}"
+                return self._redirect("/#trade")
+            folder = mode_folder(s)
+            os.makedirs(folder, exist_ok=True)
+            path = os.path.join(folder, AUTO_FILE)
+            with open(path + ".tmp", "w", encoding="utf-8") as fh:
+                json.dump({"on": on, "contracts": n, "stop": stop, "note": "",
+                           "changed": datetime.now(timezone.utc).isoformat()}, fh)
+            os.replace(path + ".tmp", path)
+            self.app.trade_sent = (f"Auto-buy is ON: {n} contract{'s' if n != 1 else ''} each time it lights up, "
+                                   f"stops after losing ${stop:g} today." if on else "Auto-buy is off.")
+            return self._redirect("/#trade")
         if url.path == "/trade":
             s, _ = self.app.settings()
             if s is None:

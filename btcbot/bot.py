@@ -67,6 +67,9 @@ POT_MOVE_FILE = "POT_MOVE_REQUEST"      # the website asks to move the main acco
 MAKE_SUB_FILE = "MAKE_SUBACCOUNT_REQUEST"  # the website asks for a new subaccount inside the crypto pot
 TRADE_FILE = "TRADE_REQUEST"        # the website asks to buy or sell right now (a trade you make yourself)
 MANUAL = "manual"                   # the play name trades you make on the website are recorded under
+AUTO = "auto-buy"                   # the play name for buys the bot makes when the buy button lights up
+AUTO_FILE = "autobuy.json"          # the website's auto-buy switch: {"on", "contracts", "stop", "note"}
+AUTO_MAX_TRIES = 3                  # auto-buy: order tries per market (it buys at most once per market)
 TRADE_MAX_AGE = 15                  # seconds: an older trade request is dropped (prices have moved)
 WAKE_FILES = ("TRADE_REQUEST", "TRANSFER_REQUEST", "POT_MOVE_REQUEST", "ALLOCATION_REQUEST",
               "MAKE_SUBACCOUNT_REQUEST", "SETUP_REQUEST")
@@ -551,6 +554,7 @@ class Bot:
             if q is not None:
                 self._maybe_exit(pos, q)
         self._score(quotes, now)     # before entries: "our pick" plays and the score check use it
+        self._auto_buy(quotes, now)  # the website's auto-buy switch: buy the moment the button lights up
         reason = self._entry_block_reason()
         if reason is None:
             spots = self._spots(quotes, now)
@@ -669,7 +673,95 @@ class Bot:
         log.info("%s: %s", MANUAL, note)
         self.ledger.save_state(self.state)
 
-    def _trade(self, req: dict, quotes: dict, now: datetime) -> str:
+    # ---- auto-buy: the bot taps the lit buy button for you ----------------------
+    def auto_settings(self) -> dict:
+        """The website's auto-buy switch (off if the file is missing or unreadable)."""
+        try:
+            with open(os.path.join(self.ledger.folder, AUTO_FILE), encoding="utf-8") as fh:
+                cfg = json.load(fh)
+            return cfg if isinstance(cfg, dict) else {}
+        except (OSError, ValueError):
+            return {}
+
+    def _auto_off(self, cfg: dict, note: str) -> None:
+        cfg = dict(cfg, on=False, note=note)
+        path = os.path.join(self.ledger.folder, AUTO_FILE)
+        try:
+            with open(path + ".tmp", "w", encoding="utf-8") as fh:
+                json.dump(cfg, fh)
+            os.replace(path + ".tmp", path)
+        except OSError as e:
+            log.error("could not switch auto-buy off (%s)", e)
+        log.warning("auto-buy: %s", note)
+
+    def auto_lost_today(self, now: datetime) -> Decimal:
+        today = now.astimezone(ZoneInfo(self.s.day_timezone)).date().isoformat()
+        return -Decimal(self.state.auto_profit) if self.state.auto_day == today else Decimal("0")
+
+    def buy_signal(self, q: rules.Quote, now: datetime) -> str | None:
+        """"yes"/"no" when the buy button lights up for this market (same rule as the website's button).
+
+        Last 4 minutes, our pick, prices read from the live order book this same second:
+        "³ soon" at 88c or less, or a score of 7+.
+        """
+        sc = self.scores.get(q.ticker)
+        if not sc or q.close_time is None or not 0 < (q.close_time - now).total_seconds() <= lastminute.SOON_FROM:
+            return None
+        when, _ = self.kbook.get(q.ticker) or (None, None)
+        if when != now:
+            return None                  # only on live prices, never the list's 30-second-old ones
+        best = sc["best"]
+        top = sc["up"] if best == "yes" else sc["down"]
+        ask = q.ask(best)
+        if ask is None:
+            return None
+        if isinstance(top, int) and top >= lastminute.BUY_SCORE:
+            return best
+        if sc.get("soon") and ask <= lastminute.BUY_SOON_MAX:
+            return best
+        return None
+
+    def _auto_buy(self, quotes: dict, now: datetime) -> None:
+        cfg = self.auto_settings()
+        if not cfg.get("on"):
+            return
+        stop = Decimal(str(cfg.get("stop") or 0))
+        lost = self.auto_lost_today(now)
+        if stop > 0 and lost >= stop:
+            self._auto_off(cfg, f"Switched itself off: auto-buys lost ${lost:.2f} today (your stop is ${stop:.2f}).")
+            return
+        if self._entry_block_reason() is not None:
+            return
+        for series in self.s.markets:
+            open_now = [q for q in quotes.values() if q.series == series and q.close_time and q.close_time > now]
+            if not open_now:
+                continue
+            q = min(open_now, key=lambda x: x.close_time)
+            side = self.buy_signal(q, now)
+            if side is None:
+                continue
+            key = f"{AUTO}|{q.ticker}"
+            if key in self.state.entered or self.state.attempts.get(key, 0) >= AUTO_MAX_TRIES:
+                continue                 # once per market
+            if any(p.ticker == q.ticker and (p.subaccount or 0) == 0 and (self.broker.live or p.play in (MANUAL, AUTO))
+                   for p in self.state.open_positions()):
+                continue                 # you already hold this market
+            self.state.attempts[key] = self.state.attempts.get(key, 0) + 1
+            req = {"at": now.isoformat(), "side": side, "contracts": cfg.get("contracts", 1), "series": series,
+                   "max_price": str(min(q.ask(side) + Decimal("0.01"), Decimal("0.99")))}
+            try:
+                note = self._trade(req, quotes, now, play=AUTO)
+            except Exception as e:      # never let an auto-buy stop the bot
+                note = f"not done: {e}"
+                log.exception("auto-buy failed")
+            if note.startswith("BOUGHT"):
+                self.state.entered.append(key)
+                self.state.entered = self.state.entered[-500:]
+            self.state.trade_note = f"{self.clock_words(now)}: auto-buy {note}"
+            log.info("%s: %s", AUTO, note)
+            self.ledger.save_state(self.state)
+
+    def _trade(self, req: dict, quotes: dict, now: datetime, play: str = MANUAL) -> str:
         asked = rules.parse_time(req.get("at"))
         if asked is None or abs((now - asked).total_seconds()) > TRADE_MAX_AGE:
             return "not done: the bot got the request too late, and prices may have moved. Try again."
@@ -694,7 +786,7 @@ class Bot:
         q = min(open_now, key=lambda x: x.close_time)
         other = [p for p in self.state.open_positions()
                  if p.ticker == q.ticker and p.side != side and (p.subaccount or 0) == 0
-                 and (self.broker.live or p.play == MANUAL)]
+                 and (self.broker.live or p.play in (MANUAL, AUTO))]
         if other:
             held = "Up" if other[0].side == "yes" else "Down"
             return (f"not bought: you already hold {held} in {self.market_words(q)}. Buying {word} too would "
@@ -724,7 +816,7 @@ class Bot:
             fill = self._recover_buy(q, side, limit, mult, 0)
         if fill is None:
             return f"didn't fill: {what} at up to {cents_words(limit)}; {self._miss_reason(q, side, limit)}."
-        pos = Position(MANUAL, q.ticker, q.series, side, plain(fill.contracts), str(fill.price), str(fill.fee),
+        pos = Position(play, q.ticker, q.series, side, plain(fill.contracts), str(fill.price), str(fill.fee),
                        now.isoformat(), q.close_time.isoformat() if q.close_time else "", 0)
         self.state.set_positions(self.state.open_positions() + [pos])
         self.state.day_trades += 1
@@ -736,7 +828,8 @@ class Bot:
     def _manual_sell(self, req: dict, side: str, quotes: dict) -> str:
         ticker = req.get("ticker")
         word = "Up" if side == "yes" else "Down"
-        held = [p for p in self.state.open_positions() if p.play == MANUAL and p.ticker == ticker and p.side == side]
+        held = [p for p in self.state.open_positions()
+                if p.play in (MANUAL, AUTO) and p.ticker == ticker and p.side == side]
         if not held:
             return "not sold: that bet isn't open anymore."
         pos = held[0]
@@ -1303,6 +1396,11 @@ class Bot:
             "payout": f"{payout:.4f}", "profit": f"{profit:.4f}",
         })
         self.state.day_profit = str(Decimal(self.state.day_profit) + profit)
+        if pos.play == AUTO:             # for auto-buy's daily stop
+            today = now.astimezone(ZoneInfo(self.s.day_timezone)).date().isoformat()
+            if self.state.auto_day != today:
+                self.state.auto_day, self.state.auto_profit = today, "0"
+            self.state.auto_profit = str(Decimal(self.state.auto_profit) + profit)
         remaining = []
         for p in self.state.open_positions():
             if p == pos:

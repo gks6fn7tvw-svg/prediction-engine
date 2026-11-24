@@ -182,3 +182,110 @@ class TestSmallerUpdates(WebCase):
         self.assertLess(len(raw), len(gzip.decompress(raw)))
         _, body, headers = self.call(f"/?key={KEY}")            # pages with the private link: never compressed
         self.assertNotIn("Content-Encoding", headers)
+
+
+class TestAutoBuy(LiveCase):
+    """The auto-buy switch: the bot buys the moment the buy button lights up (once per market)."""
+
+    def switch(self, on=True, contracts=1, stop=3):
+        from btcbot.bot import AUTO_FILE
+        with open(os.path.join(self.ledger.folder, AUTO_FILE), "w") as fh:
+            json.dump({"on": on, "contracts": contracts, "stop": stop}, fh)
+
+    def go(self, minutes, bid, ask, price="60040", book=True):
+        self.bot.spot_fn = lambda product: D(price)
+        self.bot.index_fn = lambda coin: (D(price), 3)
+        self.bot.sigma_fn = lambda coin: 3.0                 # a calm day: about $3 a second
+        if book:                                             # live order-book prices, read this second
+            self.client.best_prices = lambda t: {"yes_bid": D(str(bid)), "yes_ask": D(str(ask)),
+                                                 "yes_bid_size": D(5), "yes_ask_size": D(5)}
+        self.at(minutes, bid, ask)
+
+    def test_buys_once_when_it_lights_up(self):
+        from btcbot.bot import AUTO
+        self.make([MAIN])                                    # main only buys 8-7 min left
+        self.switch(contracts=2)
+        self.go(3, 0.69, 0.70)                               # $40 ahead with 3 min left, Up only 70c: 7+
+        held = self.bot.state.open_positions()
+        self.assertEqual([(p.play, p.side, p.contracts, p.subaccount) for p in held], [(AUTO, "yes", "2", 0)])
+        self.assertIn("auto-buy BOUGHT 2 Up", self.bot.state.trade_note)
+        self.assertEqual(self.client.orders[0]["price"], D("0.71"))           # at most 1c over the price shown
+        self.go(2.9, 0.69, 0.70)
+        self.assertEqual(len(self.client.orders), 1)         # once per market
+
+    def test_off_or_missing_does_nothing(self):
+        self.make([MAIN])                                    # main only buys 8-7 min left
+        self.go(3, 0.69, 0.70)
+        self.switch(on=False)
+        self.go(2.9, 0.69, 0.70)
+        self.assertEqual(self.client.orders, [])
+
+    def test_never_on_old_list_prices(self):
+        self.make([MAIN])                                    # main only buys 8-7 min left
+        self.switch()
+        self.go(3, 0.69, 0.70, book=False)                   # no live book this second
+        self.assertEqual(self.client.orders, [])
+
+    def test_only_in_the_last_4_minutes(self):
+        self.make([MAIN])                                    # main only buys 8-7 min left
+        self.switch()
+        self.go(6, 0.60, 0.61)
+        self.assertEqual(self.client.orders, [])
+
+    def test_not_when_the_price_is_fair(self):
+        self.make([MAIN])                                    # main only buys 8-7 min left
+        self.switch()
+        self.go(3, 0.92, 0.93)                               # a ³, but Kalshi has caught up: score under 7
+        self.assertEqual(self.client.orders, [])
+
+    def test_not_when_you_already_hold_the_market(self):
+        self.make([MAIN])                                    # main only buys 8-7 min left
+        ask(self.ledger.folder, self.clock, 3.2, action="buy", side="yes", contracts=1, series="KXBTC15M")
+        self.go(3.2, 0.69, 0.70)                             # your own buy (and auto-buy waits)
+        self.switch()
+        self.go(3, 0.69, 0.70)
+        self.assertEqual(len(self.client.orders), 1)
+        self.assertEqual([p.play for p in self.bot.state.open_positions()], [MANUAL])
+
+    def test_daily_stop_switches_it_off(self):
+        from btcbot.bot import AUTO_FILE
+        self.make([MAIN])                                    # main only buys 8-7 min left
+        self.switch(stop=3)
+        self.bot.state.auto_day = self.clock.t.astimezone(__import__("zoneinfo").ZoneInfo(self.s.day_timezone)).date().isoformat()
+        self.bot.state.auto_profit = "-3.20"
+        self.go(3, 0.69, 0.70)
+        self.assertEqual(self.client.orders, [])
+        with open(os.path.join(self.ledger.folder, AUTO_FILE)) as fh:
+            cfg = json.load(fh)
+        self.assertFalse(cfg["on"])
+        self.assertIn("lost $3.20 today", cfg["note"])
+
+    def test_a_settled_loss_counts_toward_the_stop(self):
+        self.make([MAIN])                                    # main only buys 8-7 min left
+        self.switch()
+        self.go(3, 0.69, 0.70)
+        [pos] = self.bot.state.open_positions()
+        self.bot._close(pos, pos.d("contracts"), "settled", None, "no")
+        self.assertLess(D(self.bot.state.auto_profit), D("-0.70"))
+        self.assertLess(self.bot.auto_lost_today(self.clock.t) - D("0.70"), D("0.05"))
+
+
+class TestAutoBuySwitch(WebCase):
+    def test_switch_on_and_off(self):
+        from btcbot.bot import AUTO_FILE
+        from btcbot.settings import load, mode_folder
+        folder = mode_folder(load(self.path))
+        body = self.call(f"/?key={KEY}")[1]
+        self.assertIn("Auto-buy when it lights up", body)
+        self.call("/autobuy", data={"key": KEY, "on": "1", "contracts": "2", "stop": "5"})
+        with open(os.path.join(folder, AUTO_FILE)) as fh:
+            cfg = json.load(fh)
+        self.assertEqual((cfg["on"], cfg["contracts"], cfg["stop"]), (True, 2, 5.0))
+        body = self.call(f"/?key={KEY}")[1]
+        self.assertIn("Buys 2 the moment a button lights up", body)
+        self.call("/autobuy", data={"key": KEY, "contracts": "2", "stop": "5"})          # unticked: no "on"
+        with open(os.path.join(folder, AUTO_FILE)) as fh:
+            self.assertFalse(json.load(fh)["on"])
+        self.call("/autobuy", data={"key": KEY, "on": "1", "contracts": "99", "stop": "5"})
+        with open(os.path.join(folder, AUTO_FILE)) as fh:
+            self.assertFalse(json.load(fh)["on"])                       # 99 contracts refused, left off

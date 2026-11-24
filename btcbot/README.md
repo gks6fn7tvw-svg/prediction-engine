@@ -273,6 +273,14 @@ Futures from the server (many block US servers), picks the first that answers (i
 background, at most hourly), and records its price next to ours each second in the last
 stretch (`fut_price`, `fut_from` in the second-by-second file) so the lead can be measured.
 
+**Timing data** (Settings → Collect timing data, `btcbot/timing.py`). For the last 5
+minutes of every settled Bitcoin market in the last 1-7 days: every trade with its time from
+Kalshi (`/markets/trades`, falling back to `/historical/trades`), Deribit and OKX
+(futures), Kraken and Coinbase (index exchanges). Writes `timing.csv`, one row per market
+per second with the last traded price on each (and Kalshi's trade count that second), to
+measure who moves first. Sources that never answer are skipped after 5 tries; the Done line
+says which worked. About 10 minutes per day of markets.
+
 **Jumpiness 1-100** (price card, while the live score is on). The average size of the last
 5 one-minute moves (Coinbase candles), ranked against every 5-minute stretch of the last
 ~5 hours: 80 = jumpier than 80% of them. Refreshed every 20 s; green under 30, amber, red

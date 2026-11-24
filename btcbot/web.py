@@ -34,6 +34,7 @@ from . import keystore
 from . import ledger as L
 from .kalshi import KalshiClient, KalshiError
 from . import history as H
+from . import timing as T
 from . import lastminute
 from .bot import (ALLOCATION_FILE, MAKE_SUB_FILE, MANUAL, PAPER_RESET_FILE, POT_MOVE_FILE, SETUP_FILE,
                   TRADE_FILE, TRANSFER_FILE, account_name, pot_name)
@@ -311,6 +312,8 @@ class App:
         self.history_collect = H.collect      # replaced in tests
         self.futures_job: dict = {}           # which futures price feeds answer from this server
         self.futures_check = lastminute.futures_check
+        self.timing_job: dict = {}            # second-by-second timing download (one at a time)
+        self.timing_collect = T.collect
         self.fetcher = self._fetch_from_kalshi
         self._client = None
         self._lock = threading.Lock()
@@ -1375,6 +1378,7 @@ def settings_page(app: App, raw: dict | None = None, message: str | None = None,
     out.append(real_money_section(app, raw, secure))
     out.append(history_section(app))
     out.append(futures_section(app))
+    out.append(timing_section(app))
     # The hidden first button makes Enter in a box save, instead of pressing the first Copy button.
     out.append('<form method="post" action="/settings">'
                '<button name="action" value="save" tabindex="-1" aria-hidden="true" '
@@ -1631,6 +1635,51 @@ def history_section(app: App) -> str:
             f'{link}</div>')
 
 
+def start_timing(app: App, days: int) -> str:
+    """Download second-by-second trades for the last 5 minutes of each market (in the background)."""
+    if app.timing_job.get("state") == "running":
+        return "Already collecting; wait for it to finish."
+    s, _ = app.settings()
+    if s is None:
+        return "Fix the settings first."
+    folder = mode_folder(s)
+    os.makedirs(folder, exist_ok=True)
+    path = os.path.join(folder, "timing.csv")
+    app.timing_job = job = {"state": "running", "msg": "Starting...", "days": days}
+
+    def run():
+        try:
+            client = KalshiClient(s.api_base, timeout=15)
+            summary = app.timing_collect(client, client.session, days, path,
+                                         progress=lambda m: job.update(msg=m))
+            job.update(state="done", msg=summary)
+        except Exception as e:     # shown on the page; never crashes the website
+            job.update(state="error", msg=f"stopped: {e}")
+    threading.Thread(target=run, daemon=True).start()
+    return f"Collecting the last {days} days."
+
+
+def timing_section(app: App) -> str:
+    job = app.timing_job
+    status = ""
+    if job:
+        word = {"running": "Working", "done": "Done", "error": "Problem"}.get(job.get("state"), "")
+        status = f'<p class="{"bad" if job.get("state") == "error" else "hint"}"><b>{word}:</b> {esc(job.get("msg", ""))}</p>'
+    link = ('<p><a class="btn btn2" href="/timing.csv">Download the timing data (timing.csv)</a></p>'
+            if job.get("state") == "done" else "")
+    options = "".join(f'<option value="{d}"{" selected" if d == 2 else ""}>{d} day{"s" if d > 1 else ""}</option>'
+                      for d in (1, 2, 3, 5, 7))
+    return ('<h2 id="timing">Timing data</h2><div class="box">'
+            '<p class="hint">Who moves first? For the last 5 minutes of every Bitcoin market, this downloads '
+            'every trade with its exact second from Kalshi, two futures markets (Deribit, OKX) and two '
+            'exchanges in Kalshi\'s index (Kraken, Coinbase). About 10 minutes per day of markets. '
+            'Free public data; the summary says which sources worked.</p>'
+            f'{status}<form method="post" action="/timing"><div style="display:flex;gap:8px;align-items:end">'
+            f'<div style="flex:1"><label>Days back</label><select name="days">{options}</select></div>'
+            '<button class="btn2" style="flex:1">Collect timing data</button></div></form>'
+            f'{link}</div>')
+
+
 def start_futures_check(app: App) -> None:
     if app.futures_job.get("state") == "running":
         return
@@ -1870,6 +1919,14 @@ class Handler(BaseHTTPRequestHandler):
             done = (query.get("done") or [""])[0]
             return self._send(200, settings_page(self.app, message=DONE_MESSAGES.get(done), secure=self.secure),
                               set_cookie=from_link)
+        if url.path == "/timing.csv":
+            s, _ = self.app.settings()
+            try:
+                with open(os.path.join(mode_folder(s), "timing.csv"), encoding="utf-8") as fh:
+                    text = fh.read()
+            except (OSError, TypeError):
+                text = ",".join(T.COLUMNS) + "\n"
+            return self._send(200, text, ctype="text/csv; charset=utf-8", compress=True)
         if url.path == "/history.csv":
             s, _ = self.app.settings()
             try:
@@ -1970,6 +2027,13 @@ class Handler(BaseHTTPRequestHandler):
         if url.path == "/futures":
             start_futures_check(self.app)
             return self._redirect("/settings#futures")
+        if url.path == "/timing":
+            try:
+                days = max(1, min(7, int(float(field(form, "days", "2") or 2))))
+            except ValueError:
+                days = 2
+            start_timing(self.app, days)
+            return self._redirect("/settings#timing")
         if url.path == "/trade":
             s, _ = self.app.settings()
             if s is None:

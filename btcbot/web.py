@@ -151,7 +151,11 @@ def cents(dollars) -> str:
 
 
 def cents_text(dollars) -> str:
-    return f"{float(dollars) * 100:.0f}¢"
+    """0.7 -> "70¢"; prices under 1¢ or over 99¢ keep a decimal (0.001 -> "0.1¢", not "0¢")."""
+    c = float(dollars) * 100
+    if (c < 1 or c > 99) and abs(c - round(c)) > 1e-9:
+        return f"{c:.1f}¢"
+    return f"{c:.0f}¢"
 
 
 def plain(value) -> str:
@@ -839,7 +843,8 @@ def market_cards(d: dict) -> str:
         return (f'<a href="#trade" onclick="pickSide(\'{"yes" if word == "Up" else "no"}\')" '
                 f'class="price{" pick" if badge else " fav" if fav else ""}" '
                 f'style="text-decoration:none;color:inherit;position:relative">{badge}{arrow} {word}'
-                f'<b{value}>{cents_text(p) if p is not None else "—"}</b></a>')
+                f'<b{value}>{cents_text(p) if p is not None else "—"}</b>'
+                f'{"" if p is not None else "<span class=hint>nobody selling</span>"}</a>')
 
     out = []
     for series, m in soonest.items():
@@ -875,7 +880,7 @@ def market_cards(d: dict) -> str:
             now_gap = float(m["btc_gap"])
             parts.append(f'{esc(coin_word(series))} <b style="color:var(--text)">${abs(now_gap):,.0f} '
                          f'{"above" if now_gap >= 0 else "below"}</b> the target')
-        if m.get("est_gap") not in (None, "") and mins * 60 <= 600:
+        if m.get("est_gap") not in (None, "") and int(m.get("est_locked") or 0) > 0:   # only once the last minute starts
             gap = float(m["est_gap"])
             parts.append(f'average heading ${abs(gap):,.0f} {"above" if gap >= 0 else "below"} '
                          f'({int(m.get("est_locked") or 0)} of 60 s)')

@@ -215,6 +215,13 @@ class TestDealExtras(TestBotScore):
         self.assertEqual(len(self.bot.state.open_positions()), 1)
 
 
+class TestPriceWords(unittest.TestCase):
+    def test_tiny_and_huge_prices_keep_a_decimal(self):
+        from btcbot.web import cents_text
+        self.assertEqual([cents_text(v) for v in (0.7, 0.001, 0.01, 0.999, 0.99, 0.505)],
+                         ["70¢", "0.1¢", "1¢", "99.9¢", "99¢", "50¢"])
+
+
 class TestScorePage(WebCase):
     def test_card_and_track_record(self):
         from btcbot.settings import load, mode_folder

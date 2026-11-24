@@ -220,7 +220,12 @@ class TestWatchPages(WebCase):
             json.dump({"updated": datetime.now(timezone.utc).isoformat(), "markets": [row]}, fh)
         _, body, _ = self.call(f"/?key={KEY}")
         self.assertIn('Bitcoin <b style="color:var(--text)">$42 above</b> the target</p>', body)
-        self.assertNotIn("average heading", body)                        # only in the last minutes
+        self.assertNotIn("average heading", body)                        # only in the last minute
+        row.update(est_gap="-30.00", est_locked=0)                       # watching, but the minute hasn't started
+        with open(os.path.join(folder, "market.json"), "w") as fh:
+            json.dump({"updated": datetime.now(timezone.utc).isoformat(), "markets": [row]}, fh)
+        _, body, _ = self.call(f"/?key={KEY}")
+        self.assertNotIn("average heading", body)
         self.assertLess(body.index("$42 above"), body.index("Price to buy right now"))
 
 

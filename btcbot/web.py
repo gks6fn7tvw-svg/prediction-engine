@@ -604,6 +604,8 @@ font-size:15px;font-weight:700;padding:1px 12px;border-radius:999px;white-space:
 .mrow{display:grid;grid-template-columns:1fr 1fr 104px;align-items:center;gap:6px;margin-top:12px}
 .mrow .odds{font-size:15px;line-height:1.7}.mrow .odds span{color:var(--dim);display:inline-block;width:54px}
 .mrow .gap{text-align:center;font-weight:700;line-height:1.3}.mrow .gap .now{font-size:22px}.mrow .gap .head{font-size:18px}
+.brkrow{height:22px;margin-top:4px}.brk{display:inline-block;font-size:12px;font-weight:700;padding:2px 9px;border-radius:99px}
+.brk.up{background:#163a2a;color:#7ee2a8}.brk.down{background:#3d1d22;color:#ff9da4}
 .price b{display:block;font-size:24px}.price.fav{border-color:var(--blue)}
 .play{display:block;text-decoration:none;background:var(--card);border-radius:16px;padding:14px;margin:10px 0}
 .play .head{display:flex;justify-content:space-between;align-items:center;gap:8px}
@@ -900,16 +902,19 @@ def market_cards(d: dict) -> str:
             odds += f'<span>Kalshi</span>{kalshi_pct:.0f}%'
         if us_pct is not None:
             odds += f'<br><span>Us</span><b>{us_pct:.0f}%</b>'
-        color = {"up": "var(--green)", "down": "var(--red)"}.get(m.get("move"), "var(--text)")
         gaps = ""
         if m.get("btc_gap") not in (None, ""):
             gaps += f'<span class="now">{gap_text(float(m["btc_gap"]))}</span>'
         if m.get("est_gap") not in (None, "") and mins * 60 <= 600:
             gaps += f'<br><span class="head">{gap_text(float(m["est_gap"]))}</span>'
+        if gaps:     # a fixed spot under the numbers, so the card doesn't jump when a breakout shows
+            pill = {"up": '<span class="brk up">Breakout ▲</span>',
+                    "down": '<span class="brk down">Breakout ▼</span>'}.get(m.get("move"), "")
+            gaps += f'<div class="brkrow">{pill}</div>'
         row = ""
         if odds or gaps or m.get("jump") not in (None, ""):
             row = (f'<div class="mrow"><div class="odds">{odds}</div>'
-                   f'<div class="gap" style="color:{color}">{gaps}</div>{jump_meter(m)}</div>')
+                   f'<div class="gap">{gaps}</div>{jump_meter(m)}</div>')
         target = f' · target ${float(m["target"]):,.0f}' if m.get("target") else ""
         stale = f' · <span style="color:var(--amber)">prices {int(age)}s old</span>' if age > 10 else ""
         out.append(f'<div class="box market"><div class="top"><span><b style="color:var(--text)">'

@@ -259,9 +259,12 @@ near the end, on only 35 markets.
 **Price card layout** (read left to right under the Down/Up prices): Kalshi's chance and
 ours for the side with the badge · Bitcoin vs the target now ($38 ▲ = above, ▼ = below)
 and, near the end, where the average is heading (second number) · the jumpiness meter.
-The two dollar numbers are white, and turn green (up) or red (down) for a few seconds
-during a fast move: at least 2 typical moves (from the 30-minute volatility) within 10 s,
-and at least $10. That marks a breakout as it happens; it doesn't predict one.
+The dollar numbers stay white; a green "Breakout ▲" or red "Breakout ▼" tag shows under
+them for about 5 seconds when Bitcoin breaks out, either way: a fast move (at least 2
+typical moves from the 30-minute volatility within 10 s, and at least $10), or pushing out
+of a band it was stuck in for the last minute (band no wider than about 1.5 typical moves;
+breaking past it by at least $3 or a quarter of its width). It marks a breakout as it
+happens; it doesn't predict one.
 
 **Jumpiness 1-100** (price card, while the live score is on). The average size of the last
 5 one-minute moves (Coinbase candles), ranked against every 5-minute stretch of the last

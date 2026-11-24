@@ -219,14 +219,14 @@ class TestWatchPages(WebCase):
         with open(os.path.join(folder, "market.json"), "w") as fh:
             json.dump({"updated": datetime.now(timezone.utc).isoformat(), "markets": [row]}, fh)
         _, body, _ = self.call(f"/?key={KEY}")
-        self.assertIn('<div class="gap" style="color:var(--text)"><span class="now">$42 ▲</span></div>', body)
+        self.assertIn('<div class="gap"><span class="now">$42 ▲</span><div class="brkrow"></div></div>', body)
         self.assertNotIn('<span class="head">', body)                  # heading only near the end
-        # a fast move right now colors both numbers
+        # a breakout right now shows a red or green tag under the numbers (they stay white)
         row.update(move="down")
         with open(os.path.join(folder, "market.json"), "w") as fh:
             json.dump({"updated": datetime.now(timezone.utc).isoformat(), "markets": [row]}, fh)
         _, body, _ = self.call(f"/?key={KEY}")
-        self.assertIn('<div class="gap" style="color:var(--red)">', body)
+        self.assertIn('<div class="brkrow"><span class="brk down">Breakout ▼</span></div>', body)
 
 
 class TestCloseCallFilter(LiveCase):

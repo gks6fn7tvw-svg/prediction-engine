@@ -166,7 +166,7 @@ class Bot:
         # Jumpiness gauge for the card (1-100 vs the last few hours), refreshed every 20 seconds.
         self.jump_fn = jump_fn or (lambda coin: lastminute.candles_jumpiness(client.session, coin))
         self.jumps: dict = {}
-        self.recent = defaultdict(lambda: deque(maxlen=60))   # ticker -> (time, price) for the last seconds
+        self.recent = defaultdict(lambda: deque(maxlen=120))  # ticker -> (time, price) for the last minute or so
         self.moves: dict = {}                       # ticker -> ("up"/"down", when): a fast move right now
         self.sigmas: dict = {}
         self.scores: dict = {}
@@ -587,7 +587,7 @@ class Bot:
                     row.update(jump=j[0], jump_dollars=f"{j[1]:.0f}")
             mv = self.moves.get(q.ticker)
             if mv:
-                row.update(move=mv[0])
+                row.update(move=mv[0], move_kind=mv[2])
             est = self.estimates.get(q.ticker)
             if est is not None:
                 row.update(est_projected=str(est.projected.quantize(Decimal("0.01"))),
@@ -1606,29 +1606,45 @@ class Bot:
         if self.s.watch.score:
             self._score_resolve(now)
 
-    BREAKOUT_SECONDS = 10     # compare with the price up to this many seconds ago
+    BREAKOUT_SECONDS = 10     # fast move: compare with the price up to this many seconds ago
     BREAKOUT_SD = 2.0         # ...a move this many "typical moves" big counts as a breakout
     BREAKOUT_MIN = 10.0       # ...and at least this many dollars
     BREAKOUT_HOLD = 5         # keep the color this many seconds after the move
+    BAND_SECONDS = 60         # band breakout: the range Bitcoin was stuck in over the last minute
 
     def _breakout(self, ticker: str, now: datetime, price: float, sigma: float) -> None:
-        """Mark a fast move as it happens (it doesn't predict one).
+        """Mark a breakout as it happens (it doesn't predict one). Two kinds, same colors:
 
-        Example on a normal day (Bitcoin moving about $5 a second): $32 or more in 10 seconds
-        is about 2 typical moves, so the numbers turn green (up) or red (down) for a few seconds.
+        - Fast move: about $32+ in 10 seconds on a normal day (Bitcoin moving about $5 a second).
+        - Out of the band: Bitcoin was stuck in a narrow range for the last minute (say $40-50
+          above the target) and now pushes past it (to $53+), up or down.
         """
         hist = self.recent[ticker]
         hist.append((now, price))
-        while hist and (now - hist[0][0]).total_seconds() > self.BREAKOUT_SECONDS:
+        while hist and (now - hist[0][0]).total_seconds() > self.BAND_SECONDS + 15:
             hist.popleft()
-        t0, p0 = hist[0]
+        kind = None
+        fast = [(t, p) for t, p in hist if (now - t).total_seconds() <= self.BREAKOUT_SECONDS]
+        t0, p0 = fast[0]
         secs = (now - t0).total_seconds()
         if secs >= 3:
             move = price - p0
-            need = max(self.BREAKOUT_MIN, self.BREAKOUT_SD * sigma * math.sqrt(secs))
-            if abs(move) >= need:
-                self.moves[ticker] = ("up" if move > 0 else "down", now)
-                return
+            if abs(move) >= max(self.BREAKOUT_MIN, self.BREAKOUT_SD * sigma * math.sqrt(secs)):
+                kind = ("up" if move > 0 else "down", "fast")
+        band = [(t, p) for t, p in hist if self.BREAKOUT_SECONDS < (now - t).total_seconds() <= self.BAND_SECONDS]
+        if kind is None and len(band) >= 4 and (now - band[0][0]).total_seconds() >= 40:
+            hi, lo = max(p for _, p in band), min(p for _, p in band)
+            width = hi - lo
+            span = (now - band[0][0]).total_seconds() - self.BREAKOUT_SECONDS
+            if width <= 1.5 * sigma * math.sqrt(span):          # it really was stuck in a band
+                margin = max(3.0, 0.25 * width)
+                if price >= hi + margin:
+                    kind = ("up", "band")
+                elif price <= lo - margin:
+                    kind = ("down", "band")
+        if kind:
+            self.moves[ticker] = (kind[0], now, kind[1])
+            return
         held = self.moves.get(ticker)
         if held and (now - held[1]).total_seconds() > self.BREAKOUT_HOLD:
             del self.moves[ticker]

@@ -133,6 +133,18 @@ class TestBotScore(LiveCase):
         self.run_bot(3, 0.69, 0.70, 0)                   # -$55 in 5 s: down
         self.assertEqual(self.market_row()["move"], "down")
 
+    def test_breaking_out_of_a_band(self):
+        self.make([MAIN])
+        self.bot.sigma_fn = lambda coin: 3.0
+        for k in range(60):                              # a minute stuck between $40 and $50 above
+            self.price = D("60040") + (k % 3) * 5
+            self.run_bot(4, 0.69, 0.70, 30 - k if k < 30 else 0) if k < 30 else self.run_bot(3, 0.69, 0.70, 89 - k)
+        self.assertNotIn("move", self.market_row())
+        self.price = D("60056")                          # pushes through the top of the band, slowly
+        self.run_bot(3, 0.69, 0.70, 29)
+        row = self.market_row()
+        self.assertEqual((row["move"], row["move_kind"]), ("up", "band"))
+
     def test_jumpiness_on_the_card(self):
         self.make([MAIN])
         self.bot.jump_fn = lambda coin: (82, 46.4)

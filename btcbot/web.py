@@ -609,8 +609,8 @@ font-size:15px;font-weight:700;padding:1px 12px;border-radius:999px;white-space:
 .score sup{font-size:10px;margin-left:1px}.score.good{background:#163a2a;color:#7ee2a8}
 .score.ok{background:#3a3216;color:#ffd27a}.score.bad{background:#3d1d22;color:#ff9da4}
 .market .prices{margin-top:14px}
-.mrow{display:grid;grid-template-columns:1fr 1fr 104px;align-items:center;gap:6px;margin-top:12px}
-.mrow .odds{font-size:15px;line-height:1.7}.mrow .odds span{color:var(--dim);display:inline-block;width:54px}
+.mrow{display:grid;grid-template-columns:1fr 104px;align-items:center;gap:6px;margin-top:12px}
+.price .ours{font-size:13px;color:var(--dim);margin-top:2px}.price .ours span{color:var(--text);font-weight:700}
 .mrow .gap{text-align:center;font-weight:700;line-height:1.3}.mrow .gap .now{font-size:22px}.mrow .gap .head{font-size:18px}
 .brkrow{height:22px;margin-top:4px}.brk{display:inline-block;font-size:12px;font-weight:700;padding:2px 9px;border-radius:99px}
 .brk.up{background:#163a2a;color:#7ee2a8}.brk.down{background:#3d1d22;color:#ff9da4}
@@ -929,12 +929,13 @@ def market_cards(d: dict) -> str:
             soonest[m["series"]] = m
     names = dict(MARKETS)
 
-    def box(series, word, arrow, p, fav, badge=""):
+    def box(series, word, arrow, p, fav, badge="", ours=None):
         value = f' data-k="{esc(series)}-{word}" data-v="{p}"' if p is not None else ""
+        mine = f'<div class="ours">ours <span>{ours:.0f}¢</span></div>' if ours is not None else ""
         return (f'<a href="#trade" onclick="pickSide(\'{"yes" if word == "Up" else "no"}\')" '
                 f'class="price{" pick" if badge else " fav" if fav else ""}" '
                 f'style="text-decoration:none;color:inherit;position:relative">{badge}{arrow} {word}'
-                f'<b{value}>{cents_text(p) if p is not None else "—"}</b></a>')
+                f'<b{value}>{cents_text(p) if p is not None else "—"}</b>{mine}</a>')
 
     out = []
     for series, m in soonest.items():
@@ -944,7 +945,7 @@ def market_cards(d: dict) -> str:
         down = ONE - Decimal(m["yes_bid"]) if m.get("yes_bid") else None
         fav_up = up is not None and down is not None and up >= down
         badge_up = badge_down = ""
-        kalshi_pct = us_pct = None
+        ours_up = ours_down = None       # our chance for each side, shown as a price under Kalshi's
         if m.get("score_best") in ("yes", "no"):
             pick_up = m["score_best"] == "yes"
             top = m.get("score_up") if pick_up else m.get("score_down")
@@ -953,20 +954,11 @@ def market_cards(d: dict) -> str:
                 tone = "good" if top >= 7 else "ok" if top >= 5 else "bad"
                 badge = f'<span class="score {tone}">{top}<sup>{level}</sup></span>'
                 badge_up, badge_down = (badge, "") if pick_up else ("", badge)
-                chance = float(m.get("chance_up") or 0.5)
-                us_pct = (chance if pick_up else 1 - chance) * 100
-                price = up if pick_up else down
-                kalshi_pct = float(price) * 100 if price is not None else None
-        elif up is not None or down is not None:
-            kalshi_pct = float(up if fav_up or down is None else down) * 100
-        # Left: Kalshi vs us for the side with the badge. Middle: Bitcoin vs the target now, and
-        # (near the end) where the average is heading; white, or green/red during a fast move.
+        if m.get("chance_up") not in (None, ""):
+            chance = float(m["chance_up"])
+            ours_up, ours_down = chance * 100, (1 - chance) * 100
+        # Middle: Bitcoin vs the target now, and (near the end) where the average is heading.
         # Right: jumpiness meter.
-        odds = ""
-        if kalshi_pct is not None:
-            odds += f'<span>Kalshi</span>{kalshi_pct:.0f}%'
-        if us_pct is not None:
-            odds += f'<br><span>Us</span><b>{us_pct:.0f}%</b>'
         gaps = ""
         if m.get("btc_gap") not in (None, ""):
             gaps += f'<span class="now">{gap_text(float(m["btc_gap"]))}</span>'
@@ -977,16 +969,15 @@ def market_cards(d: dict) -> str:
                     "down": '<span class="brk down">Breakout ▼</span>'}.get(m.get("move"), "")
             gaps += f'<div class="brkrow">{pill}</div>'
         row = ""
-        if odds or gaps or m.get("jump") not in (None, ""):
-            row = (f'<div class="mrow"><div class="odds">{odds}</div>'
-                   f'<div class="gap">{gaps}</div>{jump_meter(m)}</div>')
+        if gaps or m.get("jump") not in (None, ""):
+            row = f'<div class="mrow"><div class="gap">{gaps}</div>{jump_meter(m)}</div>'
         target = f' · target ${float(m["target"]):,.0f}' if m.get("target") else ""
         stale = f' · <span style="color:var(--amber)">prices {int(age)}s old</span>' if age > 10 else ""
         out.append(f'<div class="box market"><div class="top"><span><b style="color:var(--text)">'
                    f'{esc(names.get(series, series))}</b>{target}{stale}</span>'
                    f'<span>{countdown(mins * 60)} left</span></div>'
-                   f'<div class="prices">{box(series, "Down", "▼", down, not fav_up, badge_down)}'
-                   f'{box(series, "Up", "▲", up, fav_up, badge_up)}</div>{row}{rsi_chart(m)}</div>')
+                   f'<div class="prices">{box(series, "Down", "▼", down, not fav_up, badge_down, ours_down)}'
+                   f'{box(series, "Up", "▲", up, fav_up, badge_up, ours_up)}</div>{row}{rsi_chart(m)}</div>')
     return "".join(out)
 
 

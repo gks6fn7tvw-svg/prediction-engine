@@ -346,7 +346,9 @@ class TestScorePage(WebCase):
                                   {"best_score": 9, "best_won": won})
         _, body, _ = self.call(f"/?key={KEY}")
         self.assertIn('<span class="score good">9<sup>2</sup></span>▲ Up', body)     # badge on the picked side
-        self.assertIn('<div class="odds"><span>Kalshi</span>70%<br><span>Us</span><b>86%</b></div>', body)
+        # our price under Kalshi's in each box
+        self.assertIn('70¢</b><div class="ours">ours <span>86¢</span></div>', body)
+        self.assertIn('31¢</b><div class="ours">ours <span>14¢</span></div>', body)
         self.assertLess(body.index("▼ Down"), body.index("▲ Up"))                    # Down left, Up right
         self.assertIn("8-10: won 2 of 3", body)
         _, text, _ = self.call("/scores.csv", cookie=f"btcbot_key={KEY}")

@@ -124,8 +124,9 @@ class TestTimingPage(WebCase):
         self.assertIn("KXBTC15M-1", text)
         # the link carries the key, so it works even if the phone doesn't send the login cookie
         self.assertIn(f'href="/timing.csv?key={KEY}"', body)
-        status, text, _ = self.call(f"/timing.csv?key={KEY}")
+        status, text, headers = self.call(f"/timing.csv?key={KEY}")
         self.assertEqual(status, 200)
+        self.assertEqual(headers.get("Content-Disposition"), 'attachment; filename="timing.csv"')
         self.assertIn("KXBTC15M-1", text)
         # still offered after the website restarts (the job is forgotten, the file isn't)
         self.app.timing_job = {}

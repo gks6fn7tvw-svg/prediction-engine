@@ -1861,6 +1861,9 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Content-Encoding", "gzip")
             self.send_header("Vary", "Accept-Encoding")
         self.send_header("Content-Length", str(len(data)))
+        if ctype.startswith("text/csv"):     # a file to save (phones then show a Download button)
+            name = urlparse(self.path).path.rsplit("/", 1)[-1] or "data.csv"
+            self.send_header("Content-Disposition", f'attachment; filename="{name}"')
         self.send_header("Cache-Control", "no-store")
         self.send_header("X-Frame-Options", "DENY")
         if set_cookie:

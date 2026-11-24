@@ -69,6 +69,16 @@ class TestMath(unittest.TestCase):
         self.assertEqual([lastminute.confidence(c) for c in (0.5, 0.69, 0.70, 0.89, 0.90, 0.99)], [1, 1, 2, 2, 3, 3])
         self.assertEqual(lastminute.LEVEL_WORDS[3], "about 19 in 20")
 
+    def test_three_soon(self):
+        soon = lastminute.three_soon
+        # 3:20 left, calm ($3 a second): $47 ahead is 89% now and 91% in 20 s if Bitcoin holds
+        self.assertTrue(soon(60047, 60000, 200, 3, True))
+        self.assertTrue(soon(59953, 60000, 200, 3, False))      # same for Down
+        self.assertFalse(soon(60047, 60000, 200, 3, False))     # not for the losing side
+        self.assertFalse(soon(60040, 60000, 200, 3, True))      # $40: still a ² in 20 s
+        self.assertFalse(soon(60060, 60000, 200, 3, True))      # $60: already a ³
+        self.assertFalse(soon(60047, 60000, 300, 3, True))      # only in the last 4 minutes
+
     def test_chance(self):
         self.assertAlmostEqual(chance_up(60000, 60000, 300, 5), 0.5, places=3)
         calm, jumpy = chance_up(60040, 60000, 300, 3), chance_up(60040, 60000, 300, 10)
@@ -113,6 +123,16 @@ class TestBotScore(LiveCase):
         self.run_bot(2, 0.69, 0.70)                           # same lead, less time: even surer
         self.assertGreaterEqual(self.market_row()["score_up"], early)
         self.assertLessEqual(self.market_row()["score_down"], 2)
+
+    def test_three_soon_on_the_card(self):
+        self.make([MAIN])
+        self.price = D("60047")
+        self.run_bot(3, 0.88, 0.89, 20)                      # 3:20 left, a ² about to turn ³
+        row = self.market_row()
+        self.assertEqual((row["score_level"], row["score_soon"]), (2, 1))
+        self.price = D("60040")
+        self.run_bot(3, 0.85, 0.86, 19)
+        self.assertNotIn("score_soon", self.market_row())
 
     def test_snapshots_get_their_results(self):
         self.make([MAIN])
@@ -364,6 +384,27 @@ class TestScorePage(WebCase):
         self.assertIn("8-10: won 2 of 3", body)
         _, text, _ = self.call("/scores.csv", cookie=f"btcbot_key={KEY}")
         self.assertIn("best_won", text)
+
+    def test_three_soon_tag(self):
+        from btcbot.settings import load, mode_folder
+        folder = mode_folder(load(self.path))
+        os.makedirs(folder, exist_ok=True)
+
+        def card(minutes, **extra):
+            close = datetime.now(timezone.utc) + timedelta(minutes=minutes)
+            row = {"ticker": "KXBTC15M-X", "series": "KXBTC15M", "close_time": close.isoformat(),
+                   "yes_bid": "0.88", "yes_ask": "0.89", "target": "60000", "chance_up": "0.891",
+                   "score_up": 5, "score_down": 3, "score_best": "yes", "score_level": 2, **extra}
+            with open(os.path.join(folder, "market.json"), "w") as fh:
+                json.dump({"updated": datetime.now(timezone.utc).isoformat(), "markets": [row]}, fh)
+            return self.call(f"/?key={KEY}")[1]
+        body = card(3, score_soon=1)
+        self.assertIn('ours <span>89¢</span></div><span class="soon">³ soon</span></a>', body)   # on the pick
+        self.assertIn('<span class="soon" style="visibility:hidden">³ soon</span>', body)       # spot kept on Down
+        body = card(3)                                   # not soon: both spots kept, nothing shows
+        self.assertNotIn('<span class="soon">', body)
+        self.assertEqual(body.count('style="visibility:hidden">³ soon'), 2)
+        self.assertNotIn("³ soon", card(6))              # earlier than the last 4 minutes: no spot at all
 
 
 if __name__ == "__main__":

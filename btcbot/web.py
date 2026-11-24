@@ -611,6 +611,8 @@ font-size:15px;font-weight:700;padding:1px 12px;border-radius:999px;white-space:
 .market .prices{margin-top:14px}
 .mrow{display:grid;grid-template-columns:1fr 104px;align-items:center;gap:6px;margin-top:12px}
 .price .ours{font-size:13px;color:var(--dim);margin-top:2px}.price .ours span{color:var(--text);font-weight:700}
+.price .soon{display:inline-block;margin-top:6px;font-size:12px;font-weight:700;padding:2px 9px;border-radius:99px;
+background:#3a3216;color:#ffd27a}
 .mrow .gap{text-align:center;font-weight:700;line-height:1.3}.mrow .gap .now{font-size:22px}.mrow .gap .head{font-size:18px}
 .brkrow{height:22px;margin-top:4px}.brk{display:inline-block;font-size:12px;font-weight:700;padding:2px 9px;border-radius:99px}
 .brk.up{background:#163a2a;color:#7ee2a8}.brk.down{background:#3d1d22;color:#ff9da4}
@@ -940,13 +942,16 @@ def market_cards(d: dict) -> str:
             soonest[m["series"]] = m
     names = dict(MARKETS)
 
-    def box(series, word, arrow, p, fav, badge="", ours=None):
+    def box(series, word, arrow, p, fav, badge="", ours=None, soon=None):
         value = f' data-k="{esc(series)}-{word}" data-v="{p}"' if p is not None else ""
         mine = f'<div class="ours">ours <span>{ours:.0f}¢</span></div>' if ours is not None else ""
+        # "³ soon" tag; in the last 4 minutes its spot is kept even when empty, so the card never jumps
+        tag = ('<span class="soon">³ soon</span>' if soon else
+               '<span class="soon" style="visibility:hidden">³ soon</span>' if soon is not None else "")
         return (f'<a href="#trade" onclick="pickSide(\'{"yes" if word == "Up" else "no"}\')" '
                 f'class="price{" pick" if badge else " fav" if fav else ""}" '
                 f'style="text-decoration:none;color:inherit;position:relative">{badge}{arrow} {word}'
-                f'<b{value}>{cents_text(p) if p is not None else "—"}</b>{mine}</a>')
+                f'<b{value}>{cents_text(p) if p is not None else "—"}</b>{mine}{tag}</a>')
 
     out = []
     for series, m in soonest.items():
@@ -957,6 +962,7 @@ def market_cards(d: dict) -> str:
         fav_up = up is not None and down is not None and up >= down
         badge_up = badge_down = ""
         ours_up = ours_down = None       # our chance for each side, shown as a price under Kalshi's
+        soon_up = soon_down = None       # None = no "³ soon" spot; False = empty spot; True = shown
         if m.get("score_best") in ("yes", "no"):
             pick_up = m["score_best"] == "yes"
             top = m.get("score_up") if pick_up else m.get("score_down")
@@ -965,6 +971,9 @@ def market_cards(d: dict) -> str:
                 tone = "good" if top >= 7 else "ok" if top >= 5 else "bad"
                 badge = f'<span class="score {tone}">{top}<sup>{level}</sup></span>'
                 badge_up, badge_down = (badge, "") if pick_up else ("", badge)
+            if mins * 60 <= lastminute.SOON_FROM:
+                soon = bool(m.get("score_soon"))
+                soon_up, soon_down = (soon, False) if pick_up else (False, soon)
         if m.get("chance_up") not in (None, ""):
             chance = float(m["chance_up"])
             ours_up, ours_down = chance * 100, (1 - chance) * 100
@@ -987,8 +996,8 @@ def market_cards(d: dict) -> str:
         out.append(f'<div class="box market"><div class="top"><span><b style="color:var(--text)">'
                    f'{esc(names.get(series, series))}</b>{target}{stale}</span>'
                    f'<span>{countdown(mins * 60)} left</span></div>'
-                   f'<div class="prices">{box(series, "Down", "▼", down, not fav_up, badge_down, ours_down)}'
-                   f'{box(series, "Up", "▲", up, fav_up, badge_up, ours_up)}</div>{row}{rsi_chart(m)}</div>')
+                   f'<div class="prices">{box(series, "Down", "▼", down, not fav_up, badge_down, ours_down, soon_down)}'
+                   f'{box(series, "Up", "▲", up, fav_up, badge_up, ours_up, soon_up)}</div>{row}{rsi_chart(m)}</div>')
     return "".join(out)
 
 

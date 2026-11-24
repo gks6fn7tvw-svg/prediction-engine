@@ -578,6 +578,8 @@ class Bot:
             if sc is not None:
                 row.update(chance_up=f"{sc['chance_up']:.3f}", score_up=sc["up"], score_down=sc["down"],
                            score_best=sc["best"], score_level=sc["level"])
+                if sc.get("soon"):
+                    row.update(score_soon=1)
                 if "close_sd" in sc:
                     row.update(close_mid=f"{sc['close_mid']:.2f}", close_sd=f"{sc['close_sd']:.2f}")
             if q.ticker in self.btc_now and q.target is not None:
@@ -1402,6 +1404,13 @@ class Bot:
         day = now.astimezone(ZoneInfo(self.s.day_timezone)).strftime("%Y-%m-%d")
         folder = os.path.join(self.ledger.folder, "lastminute")
         path = os.path.join(folder, f"{day}.csv")
+        sc = self.scores.get(q.ticker) or {}      # worked out earlier in this same step
+        shown = {}
+        if "chance_up" in sc:
+            shown = {"sigma": f"{sc['sigma']:.3f}", "chance_up": f"{sc['chance_up']:.4f}",
+                     "score_up": "" if sc["up"] is None else sc["up"],
+                     "score_down": "" if sc["down"] is None else sc["down"],
+                     "level": sc["level"], "soon": 1 if sc.get("soon") else 0}
         try:
             if not os.path.exists(path):
                 for old in sorted(os.listdir(folder))[:-13] if os.path.isdir(folder) else []:
@@ -1411,7 +1420,7 @@ class Bot:
                 "seconds_left": int(est.seconds_left), "target": str(q.target), "price": str(est.price),
                 "sources": sources, "projected": str(est.projected.quantize(Decimal("0.01"))),
                 "gap": str(est.gap.quantize(Decimal("0.01"))),
-                "yes_bid": str(q.yes_bid or ""), "yes_ask": str(q.yes_ask or "")})
+                "yes_bid": str(q.yes_bid or ""), "yes_ask": str(q.yes_ask or ""), **shown})
         except OSError as e:
             self._say("lastminute-file", f"could not save last-minute data ({e})")
 
@@ -1607,7 +1616,9 @@ class Bot:
             best = "yes" if p >= 0.5 else "no"      # the side we think will win (its score says if it's a deal)
             chance_best = p if best == "yes" else 1 - p
             level = lastminute.confidence(chance_best)
-            self.scores[q.ticker] = {"chance_up": p, "up": su, "down": sd, "best": best, "level": level}
+            soon = lastminute.three_soon(mean, float(q.target), left, sigma, best == "yes")
+            self.scores[q.ticker] = {"chance_up": p, "up": su, "down": sd, "best": best, "level": level,
+                                     "soon": soon, "sigma": sigma}
             if left <= lastminute.CLOSE_RANGE_SECONDS:     # where the final average will probably land
                 self.scores[q.ticker].update(close_mid=mean, close_sd=lastminute.close_sd(left, sigma))
             if self.s.watch.score:

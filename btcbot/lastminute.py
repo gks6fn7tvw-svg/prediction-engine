@@ -235,7 +235,9 @@ def gap_words(est: Estimate) -> str:
 WATCH_COLUMNS = ["time", "kind", "play", "market", "side", "contracts", "seconds_left", "gap_dollars",
                  "price", "entry_price", "result", "would_profit", "held_profit", "difference"]
 DATA_COLUMNS = ["time", "market", "seconds_left", "target", "price", "sources", "projected", "gap",
-                "yes_bid", "yes_ask"]
+                "yes_bid", "yes_ask",
+                # what the card showed that second, so backtests can replay it exactly
+                "sigma", "chance_up", "score_up", "score_down", "level", "soon"]
 
 
 def append_csv(path: str, columns: list, row: dict) -> None:
@@ -458,6 +460,25 @@ def confidence(chance: float) -> int:
 
 
 LEVEL_WORDS = {1: "about 6 in 10", 2: "about 8 in 10", 3: "about 19 in 20"}
+
+SOON_SECONDS = 20     # "³ soon": a ² that turns ³ this many seconds from now if Bitcoin just holds
+SOON_FROM = 240       # ...shown in the last 4 minutes only (where it was tested)
+
+
+def three_soon(mean: float, target: float, seconds_left: float, sigma: float, up: bool) -> bool:
+    """True when the pick is a ² now and the clock alone makes it a ³ within 20 seconds.
+
+    Tested on Nov 22-23 2026, every second: the first "³ soon" in a market hit ³ and won
+    about 94 times in 100 (usually about 9 seconds later). It's a heads-up, not a deal:
+    Kalshi's price climbs with the clock too, so buying on it alone didn't reliably pay.
+    """
+    if seconds_left > SOON_FROM:
+        return False
+    now = chance_up(mean, target, seconds_left, sigma)
+    later = chance_up(mean, target, seconds_left - SOON_SECONDS, sigma)
+    if not up:
+        now, later = 1 - now, 1 - later
+    return confidence(now) == 2 and confidence(later) == 3
 
 
 CHECKPOINTS = (600, 300, 240, 180, 120, 60, 30)   # seconds left when a score is written down

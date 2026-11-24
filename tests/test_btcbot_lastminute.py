@@ -127,7 +127,9 @@ class TestWatch(LiveCase):
     def test_records_the_final_stretch_and_shares_the_estimate(self):
         import json
         self.make([MAIN])
+        self.bot.sigma_fn = lambda coin: 3.0                 # a calm day: about $3 a second
         self.price = D("59990")
+        self.run_bot(0, 0.40, 0.42, seconds=31)
         self.run_bot(0, 0.40, 0.42, seconds=30)
         folder = os.path.join(self.ledger.folder, "lastminute")
         files = os.listdir(folder)
@@ -135,6 +137,10 @@ class TestWatch(LiveCase):
         with open(os.path.join(folder, files[0])) as fh:
             rows = list(csv.DictReader(fh))
         self.assertEqual(rows[-1]["gap"], "-10.00")
+        # what the card showed that second, for exact replays later
+        self.assertEqual((rows[-1]["sigma"], rows[-1]["level"], rows[-1]["soon"]), ("3.000", "3", "0"))   # Down, $10 under with 30 s left: a ³
+        self.assertLess(float(rows[-1]["chance_up"]), 0.5)
+        self.assertNotEqual(rows[-1]["score_up"], "")
         with open(os.path.join(self.ledger.folder, "market.json")) as fh:
             m = json.load(fh)["markets"][0]
         self.assertEqual(m["est_gap"], "-10.00")

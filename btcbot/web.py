@@ -1617,8 +1617,8 @@ def history_section(app: App) -> str:
     if job:
         word = {"running": "Working", "done": "Done", "error": "Problem"}.get(job.get("state"), "")
         status = f'<p class="{"bad" if job.get("state") == "error" else "hint"}"><b>{word}:</b> {esc(job.get("msg", ""))}</p>'
-    link = ('<p><a class="btn btn2" href="/history.csv">Download the history (history.csv)</a></p>'
-            if job.get("state") == "done" else "")
+    link = (f'<p><a class="btn btn2" href="/history.csv?key={esc(app.key)}">Download the history (history.csv)</a></p>'
+            if job.get("state") == "done" or _saved(app, "history.csv") else "")
     return ('<h2 id="history">Backtest data</h2><div class="box">'
             '<p class="hint">Downloads past markets so ideas can be tested on hundreds of them instead of '
             'waiting days: Kalshi\'s minute-by-minute prices, each result and its official settlement number, '
@@ -1659,14 +1659,24 @@ def start_timing(app: App, days: int) -> str:
     return f"Collecting the last {days} days."
 
 
+def _saved(app: App, name: str) -> bool:
+    """A finished download file is on the server (still offered after the website restarts)."""
+    s, _ = app.settings()
+    try:
+        return s is not None and os.path.getsize(os.path.join(mode_folder(s), name)) > 200
+    except OSError:
+        return False
+
+
 def timing_section(app: App) -> str:
     job = app.timing_job
     status = ""
     if job:
         word = {"running": "Working", "done": "Done", "error": "Problem"}.get(job.get("state"), "")
         status = f'<p class="{"bad" if job.get("state") == "error" else "hint"}"><b>{word}:</b> {esc(job.get("msg", ""))}</p>'
-    link = ('<p><a class="btn btn2" href="/timing.csv">Download the timing data (timing.csv)</a></p>'
-            if job.get("state") == "done" else "")
+    # The key rides along in the link: phones sometimes download files without the login cookie.
+    link = (f'<p><a class="btn btn2" href="/timing.csv?key={esc(app.key)}">Download the timing data (timing.csv)</a></p>'
+            if job.get("state") == "done" or _saved(app, "timing.csv") else "")
     options = "".join(f'<option value="{d}"{" selected" if d == 2 else ""}>{d} day{"s" if d > 1 else ""}</option>'
                       for d in (1, 2, 3, 5, 7))
     return ('<h2 id="timing">Timing data</h2><div class="box">'

@@ -108,7 +108,7 @@ class TestTimingPage(WebCase):
         def fake(client, session, days, path, progress=None):
             progress("Market 1 of 2")
             with open(path, "w") as fh:
-                fh.write(",".join(T.COLUMNS) + "\nKXBTC15M-1\n")
+                fh.write(",".join(T.COLUMNS) + "\n" + "KXBTC15M-1,2026-11-23T11:45:00Z,60000,yes,5,0.6,0,,,,\n" * 5)
             return f"{days} days: Deribit ✓ 2"
         self.app.timing_collect = fake
         _, body, _ = self.call("/settings", cookie=f"btcbot_key={KEY}")
@@ -122,6 +122,15 @@ class TestTimingPage(WebCase):
         self.assertIn("Done:</b> 3 days: Deribit ✓ 2", body)
         _, text, _ = self.call("/timing.csv", cookie=f"btcbot_key={KEY}")
         self.assertIn("KXBTC15M-1", text)
+        # the link carries the key, so it works even if the phone doesn't send the login cookie
+        self.assertIn(f'href="/timing.csv?key={KEY}"', body)
+        status, text, _ = self.call(f"/timing.csv?key={KEY}")
+        self.assertEqual(status, 200)
+        self.assertIn("KXBTC15M-1", text)
+        # still offered after the website restarts (the job is forgotten, the file isn't)
+        self.app.timing_job = {}
+        _, body, _ = self.call("/settings", cookie=f"btcbot_key={KEY}")
+        self.assertIn("Download the timing data", body)
 
 
 if __name__ == "__main__":

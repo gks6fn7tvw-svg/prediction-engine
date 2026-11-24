@@ -139,12 +139,79 @@ class TestWatch(LiveCase):
             m = json.load(fh)["markets"][0]
         self.assertEqual(m["est_gap"], "-10.00")
 
+    def test_records_a_futures_price_next_to_ours(self):
+        self.make([MAIN])
+        self.price = D("59990")
+        self.bot.fut_source = "hyperliquid"
+        self.bot.futures_fn = lambda source: D("60001.5")
+        self.run_bot(0, 0.40, 0.42, seconds=30)
+        folder = os.path.join(self.ledger.folder, "lastminute")
+        with open(os.path.join(folder, os.listdir(folder)[0])) as fh:
+            row = list(csv.DictReader(fh))[-1]
+        self.assertEqual((row["fut_price"], row["fut_from"]), ("60001.5", "hyperliquid"))
+
+    def test_looks_for_a_futures_market_in_the_background(self):
+        import threading
+        self.make([MAIN])
+        done = threading.Event()
+
+        def check():
+            done.set()
+            return [{"source": "binance", "label": "Binance futures", "ok": False},
+                    {"source": "deribit", "label": "Deribit", "ok": True}]
+        self.bot.futures_check_fn = check
+        self.price = D("59990")
+        self.run_bot(0, 0.40, 0.42, seconds=30)
+        self.assertTrue(done.wait(2))
+        for _ in range(50):
+            if self.bot.fut_source:
+                break
+            import time
+            time.sleep(0.01)
+        self.assertEqual(self.bot.fut_source, "deribit")
+
     def test_switched_off(self):
         self.make([MAIN], last_minute={"enabled": False})
         self.price = D("60060")
         self.run_bot(0, 0.78, 0.80, seconds=40)
         self.assertEqual(self.bot.state.watch, {})
         self.assertFalse(os.path.exists(os.path.join(self.ledger.folder, "lastminute")))
+
+
+class FakeFutures:
+    """Hyperliquid and Deribit answer; Binance blocks this server; the rest time out."""
+    class R:
+        def __init__(self, code, j=None):
+            self.status_code, self._j = code, j
+
+        def json(self):
+            return self._j
+
+    def post(self, url, json=None, timeout=None):
+        return self.R(200, {"BTC": "60123.5", "ETH": "3000"})
+
+    def get(self, url, params=None, timeout=None):
+        if "binance" in url:
+            return self.R(451, {"msg": "restricted location"})
+        if "deribit" in url:
+            return self.R(200, {"result": {"best_bid_price": 60120.0, "best_ask_price": 60121.0}})
+        raise TimeoutError("timed out")
+
+
+class TestFutures(unittest.TestCase):
+    def test_check_says_which_answer(self):
+        results = {r["source"]: r for r in lastminute.futures_check(FakeFutures(), timeout=0.1)}
+        self.assertEqual([r["source"] for r in lastminute.futures_check(FakeFutures())][:2], ["binance", "bybit"])
+        self.assertTrue(results["hyperliquid"]["ok"])
+        self.assertEqual(results["hyperliquid"]["price"], D("60123.5"))
+        self.assertEqual(results["deribit"]["price"], D("60120.5"))
+        self.assertFalse(results["binance"]["ok"])
+        self.assertIn("blocked from here", results["binance"]["note"])
+        self.assertFalse(results["okx"]["ok"])
+
+    def test_mid_never_raises(self):
+        self.assertIsNone(lastminute.futures_mid(FakeFutures(), "bybit"))
+        self.assertEqual(lastminute.futures_mid(FakeFutures(), "hyperliquid"), D("60123.5"))
 
 
 class TestSummary(unittest.TestCase):
@@ -179,6 +246,24 @@ class TestWatchPages(WebCase):
         self.assertIn('name="lm_guard_s" value="120"', body)
         self.assertEqual((w.crowd_seconds, w.crowd_price), (D("60"), D("0.55")))
 
+    def test_futures_check_button(self):
+        import time
+        from decimal import Decimal as Dd
+        self.app.futures_check = lambda session: [
+            {"source": "binance", "label": "Binance futures", "ok": False, "price": None, "ms": 80,
+             "note": "answered 451 (blocked from here)"},
+            {"source": "hyperliquid", "label": "Hyperliquid", "ok": True, "price": Dd("60123.5"), "ms": 120, "note": ""}]
+        _, body, _ = self.call("/settings", cookie=f"btcbot_key={KEY}")
+        self.assertIn("Futures price feeds", body)
+        self.call("/futures", data={"key": KEY})
+        for _ in range(50):
+            if self.app.futures_job.get("state") == "done":
+                break
+            time.sleep(0.02)
+        _, body, _ = self.call("/settings", cookie=f"btcbot_key={KEY}")
+        self.assertIn("✅ <b>Hyperliquid</b> · $60,124 · 120 ms", body)
+        self.assertIn("✖ Binance futures · answered 451 (blocked from here)", body)
+
     def test_overview_summary_and_downloads(self):
         from btcbot.settings import load, mode_folder
         folder = mode_folder(load(self.path))
@@ -198,6 +283,17 @@ class TestWatchPages(WebCase):
         self.assertIn("guard,main", text)
         _, text, _ = self.call("/lastminute.csv", cookie=f"btcbot_key={KEY}")
         self.assertIn("-35.00", text)
+        # an older day saved with fewer columns lines up under the new header
+        day_dir = os.path.join(folder, "lastminute")
+        with open(os.path.join(day_dir, "2000-01-01.csv"), "w") as fh:
+            fh.write("time,market,seconds_left,target,price,sources,projected,gap,yes_bid,yes_ask\n"
+                     "t0,OLD,12,60000,59990,3,59990,-10.00,0.40,0.42\n")
+        _, text, _ = self.call("/lastminute.csv?days=5", cookie=f"btcbot_key={KEY}")
+        import io
+        rows = list(csv.DictReader(io.StringIO(text)))
+        self.assertEqual(list(rows[0]), lastminute.DATA_COLUMNS)
+        old = next(r for r in rows if r["market"] == "OLD")
+        self.assertEqual((old["yes_ask"], old["fut_price"]), ("0.42", ""))
 
     def test_market_card_shows_the_estimate(self):
         import json
@@ -226,7 +322,13 @@ class TestWatchPages(WebCase):
         with open(os.path.join(folder, "market.json"), "w") as fh:
             json.dump({"updated": datetime.now(timezone.utc).isoformat(), "markets": [row]}, fh)
         _, body, _ = self.call(f"/?key={KEY}")
-        self.assertIn('<div class="brkrow"><span class="brk down">Breakout ▼</span></div>', body)
+        # Kalshi's favorite here is Down (60c), so Bitcoin breaking down helps it: green
+        self.assertIn('<div class="brkrow"><span class="brk good">Breakout ▼</span></div>', body)
+        row.update(move="up")                                            # breaking up = against Down: red
+        with open(os.path.join(folder, "market.json"), "w") as fh:
+            json.dump({"updated": datetime.now(timezone.utc).isoformat(), "markets": [row]}, fh)
+        _, body, _ = self.call(f"/?key={KEY}")
+        self.assertIn('<div class="brkrow"><span class="brk bad">Breakout ▲</span></div>', body)
 
 
 class TestCloseCallFilter(LiveCase):

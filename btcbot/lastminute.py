@@ -96,6 +96,86 @@ def index_proxy(session, coin: str) -> tuple[Decimal | None, int]:
     return Decimal(str(statistics.median(mids))), len(mids)
 
 
+# Bitcoin futures markets, biggest first. Research finds the big futures markets usually move
+# before US exchanges like Coinbase; many of them block US servers, so the bot checks which answer.
+FUTURES = [("binance", "Binance futures"), ("bybit", "Bybit"), ("okx", "OKX"), ("hyperliquid", "Hyperliquid"),
+           ("coinbase_intl", "Coinbase International"), ("deribit", "Deribit"), ("bitmex", "BitMEX"),
+           ("kraken_futures", "Kraken Futures")]
+
+
+def _answered(r) -> None:
+    code = getattr(r, "status_code", 200)
+    if code != 200:
+        raise RuntimeError(f"answered {code}" + (" (blocked from here)" if code in (403, 451) else ""))
+
+
+def _futures_fetch(session, source: str, timeout: float) -> Decimal:
+    """Middle of the best bid and ask for Bitcoin's perpetual future on one market (raises if it fails)."""
+    if source == "hyperliquid":
+        r = session.post("https://api.hyperliquid.xyz/info", json={"type": "allMids"}, timeout=timeout)
+        _answered(r)
+        return Decimal(str(r.json()["BTC"]))
+    urls = {
+        "binance": ("https://fapi.binance.com/fapi/v1/ticker/bookTicker", {"symbol": "BTCUSDT"}),
+        "bybit": ("https://api.bybit.com/v5/market/tickers", {"category": "linear", "symbol": "BTCUSDT"}),
+        "okx": ("https://www.okx.com/api/v5/market/ticker", {"instId": "BTC-USDT-SWAP"}),
+        "coinbase_intl": ("https://api.international.coinbase.com/api/v1/instruments/BTC-PERP/quote", None),
+        "deribit": ("https://www.deribit.com/api/v2/public/ticker", {"instrument_name": "BTC-PERPETUAL"}),
+        "bitmex": ("https://www.bitmex.com/api/v1/instrument", {"symbol": "XBTUSD", "columns": "bidPrice,askPrice"}),
+        "kraken_futures": ("https://futures.kraken.com/derivatives/api/v3/tickers/PF_XBTUSD", None),
+    }
+    url, params = urls[source]
+    r = session.get(url, params=params, timeout=timeout)
+    _answered(r)
+    j = r.json()
+    if source == "binance":
+        bid, ask = j["bidPrice"], j["askPrice"]
+    elif source == "bybit":
+        t = j["result"]["list"][0]
+        bid, ask = t["bid1Price"], t["ask1Price"]
+    elif source == "okx":
+        t = j["data"][0]
+        bid, ask = t["bidPx"], t["askPx"]
+    elif source == "coinbase_intl":
+        bid, ask = j["best_bid_price"], j["best_ask_price"]
+    elif source == "deribit":
+        bid, ask = j["result"]["best_bid_price"], j["result"]["best_ask_price"]
+    elif source == "bitmex":
+        bid, ask = j[0]["bidPrice"], j[0]["askPrice"]
+    else:
+        t = j.get("ticker") or next(x for x in j.get("tickers", []) if x.get("symbol") == "PF_XBTUSD")
+        bid, ask = t["bid"], t["ask"]
+    mid = _mid(bid, ask)
+    if mid is None:
+        raise RuntimeError("no price")
+    return mid
+
+
+def futures_mid(session, source: str, timeout: float = 1.5) -> Decimal | None:
+    try:
+        return _futures_fetch(session, source, timeout)
+    except Exception:
+        return None
+
+
+def futures_check(session, timeout: float = 4.0) -> list[dict]:
+    """Try every futures market once: which ones answer from this server, their price and speed."""
+    import time as _t
+
+    def one(item):
+        source, label = item
+        start = _t.monotonic()
+        try:
+            price = _futures_fetch(session, source, timeout)
+            return {"source": source, "label": label, "ok": True, "price": price,
+                    "ms": int((_t.monotonic() - start) * 1000), "note": ""}
+        except Exception as e:
+            return {"source": source, "label": label, "ok": False, "price": None,
+                    "ms": int((_t.monotonic() - start) * 1000), "note": str(e)[:80] or type(e).__name__}
+    with concurrent.futures.ThreadPoolExecutor(max_workers=len(FUTURES)) as ex:
+        return list(ex.map(one, FUTURES))
+
+
 @dataclass
 class Estimate:
     projected: Decimal       # expected final average if the price stays where it is now
@@ -155,7 +235,9 @@ def gap_words(est: Estimate) -> str:
 WATCH_COLUMNS = ["time", "kind", "play", "market", "side", "contracts", "seconds_left", "gap_dollars",
                  "price", "entry_price", "result", "would_profit", "held_profit", "difference"]
 DATA_COLUMNS = ["time", "market", "seconds_left", "target", "price", "sources", "projected", "gap",
-                "yes_bid", "yes_ask"]
+                "yes_bid", "yes_ask", "fut_price", "fut_from"]
+# fut_price: Bitcoin's price on a big futures market at the same second (if one is reachable),
+# to measure how many seconds it moves before our index and Kalshi.
 
 
 def append_csv(path: str, columns: list, row: dict) -> None:

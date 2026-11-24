@@ -8,6 +8,8 @@ Anyone without the private key in the link gets nothing.
 from __future__ import annotations
 
 import copy
+import csv
+import io
 import gzip
 import hashlib
 import hmac
@@ -307,6 +309,8 @@ class App:
         self.key_tester = test_key
         self.history_job: dict = {}           # backtest data download (one at a time)
         self.history_collect = H.collect      # replaced in tests
+        self.futures_job: dict = {}           # which futures price feeds answer from this server
+        self.futures_check = lastminute.futures_check
         self.fetcher = self._fetch_from_kalshi
         self._client = None
         self._lock = threading.Lock()
@@ -605,7 +609,7 @@ font-size:15px;font-weight:700;padding:1px 12px;border-radius:999px;white-space:
 .mrow .odds{font-size:15px;line-height:1.7}.mrow .odds span{color:var(--dim);display:inline-block;width:54px}
 .mrow .gap{text-align:center;font-weight:700;line-height:1.3}.mrow .gap .now{font-size:22px}.mrow .gap .head{font-size:18px}
 .brkrow{height:22px;margin-top:4px}.brk{display:inline-block;font-size:12px;font-weight:700;padding:2px 9px;border-radius:99px}
-.brk.up{background:#163a2a;color:#7ee2a8}.brk.down{background:#3d1d22;color:#ff9da4}
+.brk.good{background:#163a2a;color:#7ee2a8}.brk.bad{background:#3d1d22;color:#ff9da4}
 .price b{display:block;font-size:24px}.price.fav{border-color:var(--blue)}
 .play{display:block;text-decoration:none;background:var(--card);border-radius:16px;padding:14px;margin:10px 0}
 .play .head{display:flex;justify-content:space-between;align-items:center;gap:8px}
@@ -880,6 +884,7 @@ def market_cards(d: dict) -> str:
         fav_up = up is not None and down is not None and up >= down
         badge_up = badge_down = ""
         kalshi_pct = us_pct = None
+        winner = "yes" if fav_up else "no"      # probable winner: the badge side, else Kalshi's favorite
         if m.get("score_best") in ("yes", "no"):
             pick_up = m["score_best"] == "yes"
             top = m.get("score_up") if pick_up else m.get("score_down")
@@ -888,6 +893,7 @@ def market_cards(d: dict) -> str:
                 tone = "good" if top >= 7 else "ok" if top >= 5 else "bad"
                 badge = f'<span class="score {tone}">{top}<sup>{level}</sup></span>'
                 badge_up, badge_down = (badge, "") if pick_up else ("", badge)
+                winner = m["score_best"]
                 chance = float(m.get("chance_up") or 0.5)
                 us_pct = (chance if pick_up else 1 - chance) * 100
                 price = up if pick_up else down
@@ -908,8 +914,13 @@ def market_cards(d: dict) -> str:
         if m.get("est_gap") not in (None, "") and mins * 60 <= 600:
             gaps += f'<br><span class="head">{gap_text(float(m["est_gap"]))}</span>'
         if gaps:     # a fixed spot under the numbers, so the card doesn't jump when a breakout shows
-            pill = {"up": '<span class="brk up">Breakout ▲</span>',
-                    "down": '<span class="brk down">Breakout ▼</span>'}.get(m.get("move"), "")
+            # The arrow says which way Bitcoin broke; green = that helps the probable winner, red = against it.
+            move = m.get("move")
+            pill = ""
+            if move in ("up", "down"):
+                helps = (move == "up") == (winner == "yes")
+                pill = (f'<span class="brk {"good" if helps else "bad"}">Breakout '
+                        f'{"▲" if move == "up" else "▼"}</span>')
             gaps += f'<div class="brkrow">{pill}</div>'
         row = ""
         if odds or gaps or m.get("jump") not in (None, ""):
@@ -1370,6 +1381,7 @@ def settings_page(app: App, raw: dict | None = None, message: str | None = None,
         app.flash = ""
     out.append(real_money_section(app, raw, secure))
     out.append(history_section(app))
+    out.append(futures_section(app))
     # The hidden first button makes Enter in a box save, instead of pressing the first Copy button.
     out.append('<form method="post" action="/settings">'
                '<button name="action" value="save" tabindex="-1" aria-hidden="true" '
@@ -1626,6 +1638,44 @@ def history_section(app: App) -> str:
             f'{link}</div>')
 
 
+def start_futures_check(app: App) -> None:
+    if app.futures_job.get("state") == "running":
+        return
+    app.futures_job = job = {"state": "running"}
+
+    def run():
+        import requests
+        try:
+            job.update(state="done", results=app.futures_check(requests.Session()),
+                       at=datetime.now(timezone.utc).isoformat())
+        except Exception as e:
+            job.update(state="error", msg=str(e))
+    threading.Thread(target=run, daemon=True).start()
+
+
+def futures_section(app: App) -> str:
+    job = app.futures_job
+    rows = ""
+    if job.get("state") == "running":
+        rows = '<p class="hint"><b>Checking…</b> refresh in a few seconds.</p>'
+    elif job.get("state") == "error":
+        rows = f'<p class="bad">Problem: {esc(job.get("msg", ""))}</p>'
+    elif job.get("results"):
+        items = []
+        for r in job["results"]:
+            if r.get("ok"):
+                items.append(f'<div>✅ <b>{esc(r["label"])}</b> · ${float(r["price"]):,.0f} · {r["ms"]} ms</div>')
+            else:
+                items.append(f'<div class="dim">✖ {esc(r["label"])} · {esc(r.get("note") or "no answer")}</div>')
+        rows = '<div style="margin-top:8px;line-height:1.8">' + "".join(items) + "</div>"
+    return ('<h2 id="futures">Futures price feeds</h2><div class="box">'
+            '<p class="hint">Big Bitcoin futures markets usually move a moment before Coinbase, Kraken and '
+            'Bitstamp. Many block US servers, so this checks which ones answer from this server. The bot '
+            'records the first one that works next to our price each second near the end, so we can measure '
+            'how many seconds ahead it is.</p>'
+            f'{rows}<form method="post" action="/futures"><button class="btn2">Check which ones work</button></form></div>')
+
+
 def real_money_section(app: App, raw: dict, secure: bool) -> str:
     mode = raw.get("mode", "paper")
     link = app.secure_link
@@ -1849,16 +1899,17 @@ class Handler(BaseHTTPRequestHandler):
                     want = max(1, min(14, int((query.get("days") or ["1"])[0])))
                 except ValueError:
                     want = 1
-                empty = ",".join(lastminute.DATA_COLUMNS) + "\n"
-                text = ""
-                for i, day in enumerate(days[-want:]):
+                out = io.StringIO()
+                w = csv.DictWriter(out, fieldnames=lastminute.DATA_COLUMNS, extrasaction="ignore")
+                w.writeheader()
+                for day in days[-want:]:        # older days may have fewer columns: line them all up
                     try:
-                        with open(os.path.join(day_dir, day), encoding="utf-8") as fh:
-                            body = fh.read()
+                        with open(os.path.join(day_dir, day), newline="", encoding="utf-8") as fh:
+                            for row in csv.DictReader(fh):
+                                w.writerow({k: row.get(k) or "" for k in lastminute.DATA_COLUMNS})
                     except OSError:
                         continue
-                    text += body if not text else body.split("\n", 1)[-1]   # one header only
-                return self._send(200, text or empty, ctype="text/csv; charset=utf-8", compress=True)
+                return self._send(200, out.getvalue(), ctype="text/csv; charset=utf-8", compress=True)
             try:
                 with open(path, encoding="utf-8") as fh:
                     text = fh.read()
@@ -1923,6 +1974,9 @@ class Handler(BaseHTTPRequestHandler):
             pick = field(form, "series")
             start_history(self.app, days, [m for m, _ in MARKETS] if pick == "all" else [pick] if pick else None)
             return self._redirect("/settings#history")
+        if url.path == "/futures":
+            start_futures_check(self.app)
+            return self._redirect("/settings#futures")
         if url.path == "/trade":
             s, _ = self.app.settings()
             if s is None:

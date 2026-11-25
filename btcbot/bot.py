@@ -70,6 +70,7 @@ MANUAL = "manual"                   # the play name trades you make on the websi
 AUTO = "auto-buy"                   # the play name for buys the bot makes when the buy button lights up
 AUTO_FILE = "autobuy.json"          # the website's auto-buy switch: {"on", "contracts", "stop", "note"}
 AUTO_MAX_TRIES = 3                  # auto-buy: order tries per market (it buys at most once per market)
+AUTO_MIN_PRICE = Decimal("0.50")    # auto-buy skips cheaper sides (coin flips: score 7+ there won only 57%)
 TRADE_MAX_AGE = 15                  # seconds: an older trade request is dropped (prices have moved)
 WAKE_FILES = ("TRADE_REQUEST", "TRANSFER_REQUEST", "POT_MOVE_REQUEST", "ALLOCATION_REQUEST",
               "MAKE_SUBACCOUNT_REQUEST", "SETUP_REQUEST")
@@ -757,11 +758,8 @@ class Bot:
             key = f"{AUTO}|{q.ticker}"
             if key in self.state.entered or self.state.attempts.get(key, 0) >= AUTO_MAX_TRIES:
                 continue                 # once per market
-            other = "no" if side == "yes" else "yes"
-            if f"{key}|side:{other}" in self.state.entered:
-                continue                 # it already went for the other side here: never switch sides
-            if f"{key}|side:{side}" not in self.state.entered:
-                self.state.entered.append(f"{key}|side:{side}")
+            if q.ask(side) < AUTO_MIN_PRICE:
+                continue                 # under 50c is a coin flip: too swingy to buy automatically
             if any(p.ticker == q.ticker and (p.subaccount or 0) == 0 and (self.broker.live or p.play in (MANUAL, AUTO))
                    for p in self.state.open_positions()):
                 continue                 # you already hold this market

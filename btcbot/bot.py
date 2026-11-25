@@ -497,22 +497,36 @@ class Bot:
         t = q.close_time.astimezone(ZoneInfo(self.s.day_timezone))
         return f"{coin} {t.strftime('%I:%M %p').lstrip('0').lower()}"
 
-    def _miss_reason(self, q: rules.Quote, side: str, limit: Decimal) -> str:
+    def _miss_reason(self, q: rules.Quote, side: str, limit: Decimal,
+                     chase: str = 'raise "Extra cents" to chase moves') -> str:
         """Why an order that fills-now-or-cancels didn't fill, from the prices right after it."""
         if self.broker.live:
-            try:
-                after = rules.Quote.from_market(self.client.market(q.ticker), q.series)
-            except Exception:
-                return "Kalshi couldn't be asked why"
+            ask = size = None
+            book = getattr(self.client, "best_prices", None)
+            if book is not None and self.book_ok:      # the live book (the market list lags ~30 s)
+                try:
+                    b = book(q.ticker)
+                    if side == "yes":
+                        ask, size = b.get("yes_ask"), b.get("yes_ask_size")
+                    elif b.get("yes_bid") is not None:
+                        ask, size = ONE - b["yes_bid"], b.get("yes_bid_size")
+                    book = "ok"
+                except Exception:
+                    book = None
+            if book != "ok":
+                try:
+                    after = rules.Quote.from_market(self.client.market(q.ticker), q.series)
+                except Exception:
+                    return "Kalshi couldn't be asked why"
+                ask, size = after.ask(side), after.ask_size(side)
             when = "right after"
         else:
-            after, when = q, "at that moment"
-        ask, size = after.ask(side), after.ask_size(side)
+            ask, size, when = q.ask(side), q.ask_size(side), "at that moment"
         if ask is None or size == 0:
             return f"nobody was selling {rules.side_name(side)} {when}"
         if ask > limit:
             return (f"the price had moved to {cents_words(ask)} {when} (it offered up to {cents_words(limit)}; "
-                    f"raise \"Extra cents\" to chase moves)")
+                    f"{chase})")
         if not self.broker.live:
             return "not enough pretend money"
         return (f"the price looks fine now ({cents_words(ask)}), so the sellers at that price were taken a "
@@ -743,6 +757,11 @@ class Bot:
             key = f"{AUTO}|{q.ticker}"
             if key in self.state.entered or self.state.attempts.get(key, 0) >= AUTO_MAX_TRIES:
                 continue                 # once per market
+            other = "no" if side == "yes" else "yes"
+            if f"{key}|side:{other}" in self.state.entered:
+                continue                 # it already went for the other side here: never switch sides
+            if f"{key}|side:{side}" not in self.state.entered:
+                self.state.entered.append(f"{key}|side:{side}")
             if any(p.ticker == q.ticker and (p.subaccount or 0) == 0 and (self.broker.live or p.play in (MANUAL, AUTO))
                    for p in self.state.open_positions()):
                 continue                 # you already hold this market
@@ -815,7 +834,10 @@ class Bot:
         if fill is None and self.broker.live:
             fill = self._recover_buy(q, side, limit, mult, 0)
         if fill is None:
-            return f"didn't fill: {what} at up to {cents_words(limit)}; {self._miss_reason(q, side, limit)}."
+            chase = ("auto-buy pays at most 1¢ over on purpose, so it skips a price that runs away; "
+                     "it tries again next second while the button stays lit" if play == AUTO else
+                     "type a higher \"Most I'll pay\" to chase a fast move")
+            return f"didn't fill: {what} at up to {cents_words(limit)}; {self._miss_reason(q, side, limit, chase)}."
         pos = Position(play, q.ticker, q.series, side, plain(fill.contracts), str(fill.price), str(fill.fee),
                        now.isoformat(), q.close_time.isoformat() if q.close_time else "", 0)
         self.state.set_positions(self.state.open_positions() + [pos])

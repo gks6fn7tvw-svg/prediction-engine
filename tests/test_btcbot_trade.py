@@ -213,6 +213,17 @@ class TestAutoBuy(LiveCase):
         self.go(2.9, 0.69, 0.70)
         self.assertEqual(len(self.client.orders), 1)         # once per market
 
+    def test_never_switches_sides_in_a_market(self):
+        from btcbot.bot import AUTO
+        self.make([MAIN])                                    # main only buys 8-7 min left
+        self.switch()
+        self.bot.state.entered.append(f"{AUTO}|{TICKER}|side:yes")   # it went for Up here and missed
+        self.go(3, 0.30, 0.31, price="59960")               # now Down looks cheap: still no
+        self.assertEqual(self.client.orders, [])
+        self.bot.state.entered.remove(f"{AUTO}|{TICKER}|side:yes")
+        self.go(2.9, 0.30, 0.31, price="59960")
+        self.assertEqual([p.side for p in self.bot.state.open_positions()], ["no"])
+
     def test_off_or_missing_does_nothing(self):
         self.make([MAIN])                                    # main only buys 8-7 min left
         self.go(3, 0.69, 0.70)

@@ -654,6 +654,17 @@ details{margin-top:12px}summary{cursor:pointer;color:#8fb0ff}
 LIVE_JS = """
 (function(){
   var b = document.body, sig = b.dataset.sig, url = b.dataset.live, fails = 0, busy = false, old = {};
+  // Never reload the page under your finger: a tap that lands during a reload is lost
+  // (pretend plays often buy the same second the buy button lights up, which changes the page).
+  var touched = 0, leaving = false;
+  ['touchstart', 'mousedown', 'keydown', 'focusin'].forEach(function(ev){
+    document.addEventListener(ev, function(){ touched = Date.now(); }, true);
+  });
+  document.addEventListener('submit', function(){ leaving = true; }, true);
+  function userBusy(){
+    var a = document.activeElement, t = a ? a.tagName : '';
+    return Date.now() - touched < 4000 || t === 'INPUT' || t === 'SELECT' || t === 'TEXTAREA';
+  }
   function dot(ok){ var d = document.getElementById('live-dot'); if (d) d.className = ok ? 'dot on' : 'dot'; }
   function remember(flash){
     document.querySelectorAll('[data-k]').forEach(function(e){
@@ -663,13 +674,13 @@ LIVE_JS = """
     });
   }
   function tick(){
-    if (document.hidden || busy) return;
+    if (document.hidden || busy || leaving) return;
     busy = true;
     fetch(url, {cache: 'no-store', credentials: 'same-origin'})
       .then(function(r){ if (!r.ok) throw r.status; return r.json(); })
       .then(function(j){
         busy = false; fails = 0; dot(true);
-        if (j.sig !== sig) { location.reload(); return; }
+        if (j.sig !== sig && !userBusy()) { location.reload(); return; }   // else: on a later, quiet tick
         for (var id in j.parts) {
           var el = document.getElementById(id);
           if (el && el.innerHTML !== j.parts[id]) el.innerHTML = j.parts[id];

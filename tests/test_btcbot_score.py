@@ -429,6 +429,9 @@ class TestScorePage(WebCase):
         self.assertEqual(buy(6, score_up=8), "")                         # only in the last 4 minutes
         body = self.call(f"/?key={KEY}")[1]
         self.assertIn("function lightBuy()", body)
+        # a page change never reloads the page while you're tapping (a tap during a reload is lost)
+        self.assertIn("j.sig !== sig && !userBusy()", body)
+        self.assertIn("document.addEventListener('submit', function(){ leaving = true; }, true);", body)
         self.assertIn(".row2 button.go{", body)
 
 

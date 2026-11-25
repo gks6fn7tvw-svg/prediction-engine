@@ -717,7 +717,7 @@ class Bot:
         """"yes"/"no" when the buy button lights up for this market (same rule as the website's button).
 
         Last 4 minutes, our pick, prices read from the live order book this same second:
-        "³ soon" at 88c or less, or a score of 7+.
+        "³ soon" at 88c or less, or a ³ with a score of 7+.
         """
         sc = self.scores.get(q.ticker)
         if not sc or q.close_time is None or not 0 < (q.close_time - now).total_seconds() <= lastminute.SOON_FROM:
@@ -730,7 +730,7 @@ class Bot:
         ask = q.ask(best)
         if ask is None:
             return None
-        if isinstance(top, int) and top >= lastminute.BUY_SCORE:
+        if sc["level"] == 3 and isinstance(top, int) and top >= lastminute.BUY_SCORE:
             return best
         if sc.get("soon") and ask <= lastminute.BUY_SOON_MAX:
             return best

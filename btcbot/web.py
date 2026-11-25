@@ -1036,14 +1036,14 @@ def buy_signal(m: dict, mins: float, up, down, age: float) -> str:
     """"yes"/"no" when the buy button for that side should light up, else "".
 
     Only in the last 4 minutes, on our pick, with fresh prices: "³ soon" at 88c or less,
-    or a score of 7+.
+    or a ³ with a score of 7+.
     """
     best = m.get("score_best")
     if best not in ("yes", "no") or not 0 < mins * 60 <= lastminute.SOON_FROM or age > 10:
         return ""
     top = m.get("score_up") if best == "yes" else m.get("score_down")
     price = up if best == "yes" else down
-    if isinstance(top, int) and top >= lastminute.BUY_SCORE:
+    if int(m.get("score_level") or 1) == 3 and isinstance(top, int) and top >= lastminute.BUY_SCORE:
         return best
     if m.get("score_soon") and price is not None and price <= lastminute.BUY_SOON_MAX:
         return best

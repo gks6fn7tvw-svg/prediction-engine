@@ -192,7 +192,7 @@ class TestAutoBuy(LiveCase):
         with open(os.path.join(self.ledger.folder, AUTO_FILE), "w") as fh:
             json.dump({"on": on, "contracts": contracts, "stop": stop}, fh)
 
-    def go(self, minutes, bid, ask, price="60040", book=True):
+    def go(self, minutes, bid, ask, price="60060", book=True):
         self.bot.spot_fn = lambda product: D(price)
         self.bot.index_fn = lambda coin: (D(price), 3)
         self.bot.sigma_fn = lambda coin: 3.0                 # a calm day: about $3 a second
@@ -205,7 +205,7 @@ class TestAutoBuy(LiveCase):
         from btcbot.bot import AUTO
         self.make([MAIN])                                    # main only buys 8-7 min left
         self.switch(contracts=2)
-        self.go(3, 0.69, 0.70)                               # $40 ahead with 3 min left, Up only 70c: 7+
+        self.go(3, 0.69, 0.70)                               # $60 ahead with 3 min left: a ³, Up only 70c
         held = self.bot.state.open_positions()
         self.assertEqual([(p.play, p.side, p.contracts, p.subaccount) for p in held], [(AUTO, "yes", "2", 0)])
         self.assertIn("auto-buy BOUGHT 2 Up", self.bot.state.trade_note)
@@ -218,13 +218,21 @@ class TestAutoBuy(LiveCase):
         self.make([MAIN])                                    # main only buys 8-7 min left
         self.switch()
         self.bot.state.attempts[f"{AUTO}|{TICKER}"] = 1      # it went for Up here and missed
-        self.go(3, 0.30, 0.31, price="59960")               # now Down is our pick and cheap: buys it
+        self.go(3, 0.30, 0.31, price="59940")               # now Down is a ³ and cheap: buys it
         self.assertEqual([p.side for p in self.bot.state.open_positions()], ["no"])
 
     def test_skips_coin_flip_prices(self):
         self.make([MAIN])
         self.switch()
-        self.go(3, 0.53, 0.54, price="59995")               # Down is our pick at 47c: under 50c, skip
+        self.go(3, 0.53, 0.54, price="59940")               # Down is a ³ but only 47c: under 50c, skip
+        self.assertEqual(self.client.orders, [])
+
+    def test_not_a_7_that_isnt_a_3(self):
+        self.make([MAIN])
+        self.switch()
+        self.go(3, 0.69, 0.70, price="60040")               # $40 ahead: a ² at 70c scores 7+, but not a ³
+        self.assertEqual(self.bot.scores[TICKER]["level"], 2)
+        self.assertGreaterEqual(self.bot.scores[TICKER]["up"], 7)
         self.assertEqual(self.client.orders, [])
 
     def test_off_or_missing_does_nothing(self):

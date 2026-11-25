@@ -423,10 +423,11 @@ class TestScorePage(WebCase):
             return body.split('class="buysig" data-series="KXBTC15M" data-buy="')[1].split('"')[0]
         self.assertEqual(buy(3, score_soon=1), "")                       # ³ soon, but 89c: too dear
         self.assertEqual(buy(3, score_soon=1, yes_ask="0.86"), "yes")    # ³ soon at 86c: buy Up
-        self.assertEqual(buy(3, score_up=7), "yes")                      # a 7+ lights it on its own
-        self.assertEqual(buy(3, score_best="no", score_down=8, yes_bid="0.20"), "no")
+        self.assertEqual(buy(3, score_up=7, score_level=3), "yes")       # a ³ at 7+: Kalshi still behind
+        self.assertEqual(buy(3, score_up=8), "")                         # a 7+ that isn't a ³: no
+        self.assertEqual(buy(3, score_best="no", score_down=8, score_level=3, yes_bid="0.20"), "no")
         self.assertEqual(buy(3, yes_ask="0.86"), "")                     # cheap, but no ³ soon and under 7
-        self.assertEqual(buy(6, score_up=8), "")                         # only in the last 4 minutes
+        self.assertEqual(buy(6, score_up=8, score_level=3), "")          # only in the last 4 minutes
         body = self.call(f"/?key={KEY}")[1]
         self.assertIn("function lightBuy()", body)
         # a page change never reloads the page while you're tapping (a tap during a reload is lost)

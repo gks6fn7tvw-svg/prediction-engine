@@ -469,9 +469,10 @@ LEVEL_WORDS = {1: "about 6 in 10", 2: "about 8 in 10", 3: "about 19 in 20"}
 SOON_SECONDS = 20     # "³ soon": a ² that turns ³ this many seconds from now if Bitcoin just holds
 SOON_FROM = 240       # ...shown in the last 4 minutes only (where it was tested)
 
-# The buy button lights up (last 4 minutes, on our pick) when either:
+# The buy button lights up, and auto-buy buys (last 4 minutes, on our pick), only for a ³ or a ³ soon:
 #   - "³ soon" shows and the price is 88c or less (best guess until a week of real data is in), or
-#   - the score is 7+ (the two-week test: our pick at 7+ late made money; a plain ³ under 7 didn't).
+#   - it's a ³ and the score is 7+ (Kalshi still behind; a ³ under 7 about broke even).
+# A 7+ that isn't a ³ no longer counts: those were coin flips in jumpy markets and lost in real use.
 BUY_SOON_MAX = Decimal("0.88")
 BUY_SCORE = 7
 

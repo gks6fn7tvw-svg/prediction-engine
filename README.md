@@ -1,8 +1,13 @@
 # prediction-engine
 
 Research code for testing whether a weather model can out-forecast Kalshi's
-daily high-temperature markets. Nothing here trades, places orders, or uses a
-Kalshi account. No forecasting or trading edge has been shown yet.
+daily high-temperature markets. The weather code (`recorder/`, `paper/`,
+`verify/`) never trades, places orders, or uses a Kalshi account. No
+forecasting or trading edge has been shown yet.
+
+`btcbot/` is separate: a bot for Kalshi's 15-minute crypto Up/Down markets with
+adjustable rules. It runs on pretend money by default and only places real
+orders when switched to live mode. See [btcbot/README.md](btcbot/README.md).
 
 ## What exists so far: the recorder
 

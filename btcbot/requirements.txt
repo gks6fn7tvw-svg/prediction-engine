@@ -1,0 +1,4 @@
+requests>=2.28
+certbot>=5.4      # only for the locked (https) website link on the server
+cryptography>=41
+PyYAML>=6

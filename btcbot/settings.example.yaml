@@ -1,0 +1,121 @@
+# ============================================================
+#  Kalshi 15-minute bot settings
+#  Copy this file to settings.yaml, change any number, save,
+#  then restart the bot. Prices are in dollars: 0.70 = 70 cents.
+#  "null" means the setting is off.
+# ============================================================
+
+# paper = pretend money (safe, the default). live = REAL money.
+mode: paper
+# For live mode you must also change the line below to exactly:
+#   live_confirm: "I accept real-money risk"
+live_confirm: ""
+
+# Which Kalshi markets to watch. KXBTC15M = Bitcoin 15-minute Up/Down.
+# Others: KXETH15M (Ethereum), KXSOL15M (Solana), KXXRP15M (XRP).
+markets:
+  - KXBTC15M
+
+# Pretend starting money for paper mode, in dollars.
+paper_balance: 11.00
+
+# ---- How much of your Kalshi it can use ----
+# Money tied up in open trades never goes above this % of your balance.
+balance_share_pct: 50
+
+# ---- Size and limits ----
+size:
+  mode: contracts      # contracts = a fixed number | percent = % of balance | dollars = fixed $
+  value: 1             # 1 contract per trade (or 9 for 9%, or 2.00 for $2)
+  max_contracts: 1     # never more than this many per trade (0 = no cap)
+daily_loss_limit:
+  mode: dollars        # dollars or percent (of the day's starting balance)
+  value: 5             # stop new trades for the day after losing $5
+max_trades_per_day: 0  # 0 = no cap
+day_timezone: Pacific/Honolulu   # when "today" starts and ends, and log times
+
+# ---- Plays: the rules for when to buy ----
+# Each play buys at most once per market. Add more by copying a block.
+plays:
+  - name: main
+    enabled: true
+
+    # What it buys: favorite | underdog | up | down | pick (the side our chance says wins)
+    buy: favorite
+    min_price: 0.70        # only buy if it costs at least 70c
+    max_price: 0.85        # and at most 85c
+    slippage_cents: 0      # pay up to this many cents more than the price you see
+    subaccount: 0          # real money only: Kalshi subaccount for this play (0 = main account)
+    pretend: false         # true = this play always uses pretend money, even when the bot uses real money
+    max_buys_per_market: 1 # more than 1 = buy again (same side) while the rules still pass
+    seconds_between_buys: 60
+
+    # When it may act (minutes left before the market closes)
+    act_from_minutes_left: 8
+    act_until_minutes_left: 7
+
+    # How it gets out. null = hold to the end and get $1 per contract if it wins.
+    take_profit: null      # e.g. 0.95 = sell as soon as someone will pay 95c
+    stop_loss: null        # e.g. 0.50 = sell if what you could get drops to 50c
+
+    # Extra conditions (all off when null)
+    conditions:
+      max_spread_cents: null          # skip if buy price minus sell price is more than this
+      min_contracts_at_price: null    # skip if fewer contracts are offered at that price
+      favorite_rising_seconds: null   # the side must be higher than it was this many seconds ago
+      btc_distance_min_dollars: null  # price must be this many $ past the target (uses Coinbase)
+      min_score: null                 # 1-10: only buy if the live score for that side is at least this
+      levels: null                    # e.g. [2, 3]: only buy when that side is level 2 or 3 (null = any)
+
+  # Second play (optional). Off until you set enabled: true.
+  - name: second
+    enabled: false
+    buy: favorite
+    min_price: 0.88
+    max_price: 0.95
+    slippage_cents: 0
+    act_from_minutes_left: 1
+    act_until_minutes_left: 0
+    take_profit: null
+    stop_loss: null
+    conditions:
+      max_spread_cents: 3
+      min_contracts_at_price: null
+      favorite_rising_seconds: null
+      btc_distance_min_dollars: null
+
+# How often it checks prices, in seconds. Fast is used when a play's
+# window is open or a trade has take profit / stop loss. Slow the rest of
+# the time, which keeps the free server's internet use tiny.
+polling:
+  fast_seconds: 1
+  slow_seconds: 15
+
+# Where it keeps its trade log, memory and log file.
+files:
+  folder: data
+
+# Goal mode: bet sizes worked out automatically to grow the money toward a goal.
+# Each play bets 1 contract until its record proves an edge (30+ bets), then the
+# share of its money that grows it fastest (Kelly): careful = 1/4, normal = 1/2,
+# bold = all of it. New bets pause at the goal or below stop_below (0 = never).
+goal:
+  enabled: false
+  target: 100
+  boldness: normal
+  stop_below: 0
+  max_bet_pct: 25
+
+# Last-minute watch: never trades. Kalshi settles on the average of Bitcoin's index over the
+# final 60 seconds; the bot keeps its own running average (median of Coinbase, Kraken and
+# Bitstamp) and writes down what two ideas WOULD have done, then checks them after the close.
+last_minute:
+  enabled: true
+  guard_seconds: 90           # guard: in the last 90 seconds...
+  guard_margin_dollars: 20    # ...if the average heads $20+ to the wrong side of a bet, "would sell"
+  follow_seconds: 60          # follow: in the last 60 seconds...
+  follow_margin_dollars: 30   # ...if the average is $30+ past the target...
+  follow_max_cents: 85        # ...and that side costs 85c or less, "would buy 1"
+  crowd_seconds: 90           # copy the crowd: in the last 90 seconds...
+  crowd_cents: 50             # ...if a bet you hold falls to 50c (others selling it), "would sell"
+  score: true                 # live 1-10 score for Up and Down on the website (5 = Kalshi's price is fair)
